@@ -17,6 +17,15 @@ use crate::wnd::{editkeys, editor, formula, image, link, menu, table, tree};
 /// `dwData` of every test command ('NODT').
 pub const MAGIC: usize = 0x4E4F_4454;
 
+thread_local! {
+    static LAST_COMMAND: std::cell::Cell<(u16, u16)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Records the last `WM_COMMAND` (id, code) for the `lastcmd` query.
+pub fn note_command(id: u16, code: u16) {
+    LAST_COMMAND.with(|last| last.set((id, code)));
+}
+
 /// True when the process was started with `NODI_TEST_HOOKS=1`.
 pub fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -45,6 +54,8 @@ fn run(app: &mut App, line: &str) -> String {
     let editor = app.active_editor();
     match (command, editor) {
         ("state", _) => app.active_state().unwrap_or("").to_owned(),
+        ("accel", _) => format!("{:?}", app.accel),
+        ("lastcmd", _) => LAST_COMMAND.with(|last| format!("{:?}", last.get())),
         ("tabs", _) => {
             let titles: Vec<&str> = app.tabs.iter().map(|tab| tab.title.as_str()).collect();
             format!(

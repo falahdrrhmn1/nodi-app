@@ -597,9 +597,13 @@ pub unsafe extern "system" fn wndproc(
             let code = win::hiword(wparam);
             let child = lparam as HWND;
             if let Some(app) = app_mut(hwnd) {
+                if crate::testhook::enabled() {
+                    crate::testhook::note_command(id, code);
+                }
                 if code == editor::EN_CHANGE_NOTIFY && app.tab_index(child).is_some() {
                     app::on_editor_change(app, child);
-                } else if code == 0 {
+                } else if code == 0 || (code == 1 && child.is_null()) {
+                    // 0 = menu / toolbar button, 1 = accelerator (shortcut).
                     menu::on_command(app, id);
                 }
             }
