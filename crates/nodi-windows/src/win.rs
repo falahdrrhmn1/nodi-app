@@ -34,6 +34,11 @@ pub fn x_from_lparam(lparam: LPARAM) -> i32 {
     (lparam as i32) as i16 as i32
 }
 
+/// High word of a mouse `LPARAM`, sign extended as Windows does.
+pub fn y_from_lparam(lparam: LPARAM) -> i32 {
+    ((lparam as i32) >> 16) as i16 as i32
+}
+
 pub fn rect_width(rect: &RECT) -> i32 {
     rect.right - rect.left
 }

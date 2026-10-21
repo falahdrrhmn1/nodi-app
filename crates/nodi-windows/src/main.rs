@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod testhook;
 mod win;
 mod wnd;
 

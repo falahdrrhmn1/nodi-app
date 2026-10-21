@@ -46,6 +46,11 @@ Write `scripts/e2e.ps1` that drives the real exe through Win32 messages (Add-Typ
 - Test B (nested): needs tree commands — use WM_COMMAND with the Notes menu ids on the selected item (select via TVM_SELECTITEM): create A, child B under A, child C under B, rename B via TVM_EDITLABEL... (or a debug-only command that renames the selected node) → restart → read tree.json and assert C.parent == B.id and B.parent == A.id and B.title is new.
 Print PASS/FAIL per test. All four must PASS.
 
+## RESUME NOTES (orchestrator, after run 1 was killed for low system RAM)
+- Run 1 left ~3.3k lines of uncommitted work in the tree. KEEP it and continue from it; do not start over. Check `git diff` first.
+- Laptop has ~8 GB RAM and little free memory. ALWAYS set `$env:CARGO_BUILD_JOBS='1'` and iterate e2e against the DEBUG exe (`target\debug\nodi.exe`, add `-Exe` param to e2e.ps1). Build release only once at the end.
+- Run 1 e2e: all 4 FAIL — "the editor does not hold the typed text: ''". Likely cause to check first: cross-process `SendMessage` only marshals pointers for a few system messages; RichEdit messages >= WM_USER (EM_EXSETSEL, EM_GETCHARFORMAT, EM_GETTEXTEX, ...) are NOT marshaled, so pointers from the test process are garbage in nodi.exe. Also verify the script finds the VISIBLE `RICHEDIT50W` of the active tab. Preferred fix: a test channel compiled only when env `NODI_TEST_HOOKS=1` is set at startup — `WM_COPYDATA` commands (e.g. `type:<text>`, `select:<a>:<b>`, `cmd:<id>`, `get-text`, `get-bold:<a>:<b>`, `get-status`) handled inside nodi.exe, replies written to a file in the temp data dir. Use `WM_SETTEXT`/`WM_GETTEXT`-class messages only where Windows marshals them.
+
 ## Done when
 - `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (whole workspace) all clean.
 - `cargo build --release` ok and `scripts/e2e.ps1` prints PASS for A, B, C, E against the release exe.

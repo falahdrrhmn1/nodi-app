@@ -160,6 +160,7 @@ fn session_round_trip() {
             width: 1024,
             height: 720,
         }),
+        expanded: vec![note_b.clone()],
     };
     data.save_session(&session).expect("save session");
     let loaded = data.load_session().expect("load session");
@@ -234,4 +235,43 @@ fn recover_leftovers_recovers_same_named_files_twice_without_overwriting() {
     assert_ne!(first[0], second[0], "recovered names must not collide");
     assert_eq!(fs::read(&first[0]).expect("read"), b"one");
     assert_eq!(fs::read(&second[0]).expect("read"), b"two");
+}
+
+#[test]
+fn purging_note_files_moves_them_to_recovery_instead_of_deleting() {
+    let (_tmp, data) = fresh("purge-files");
+    let id = NoteId::generate();
+    data.save_note(&id, b"first", "first").expect("save 1");
+    data.save_note(&id, b"second", "second").expect("save 2");
+    assert!(data.note_prev_path(&id).is_file(), "prev exists");
+
+    let purged = data
+        .purge_note_files(&id)
+        .expect("purge")
+        .expect("a purged directory");
+    assert!(purged.starts_with(data.recovery_dir()));
+    let name = purged.file_name().expect("name").to_string_lossy();
+    assert!(
+        name.starts_with(&format!("purged-{id}-")),
+        "bad name {name}"
+    );
+
+    assert!(!data.note_path(&id).exists());
+    assert!(!data.note_txt_path(&id).exists());
+    assert!(!data.note_prev_path(&id).exists());
+    assert_eq!(
+        fs::read(purged.join(format!("{id}.rtf"))).expect("rtf"),
+        b"second"
+    );
+    assert_eq!(
+        fs::read(purged.join(format!("{id}.txt"))).expect("txt"),
+        b"second"
+    );
+    assert_eq!(
+        fs::read(purged.join(format!("{id}.rtf.prev"))).expect("prev"),
+        b"first"
+    );
+
+    // A second purge of the same (now file-less) note is a no-op.
+    assert!(data.purge_note_files(&id).expect("purge again").is_none());
 }

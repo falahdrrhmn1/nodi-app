@@ -17,6 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     InvalidateRect, LineTo, MoveToEx, ScreenToClient, SelectObject, UpdateWindow, COLOR_3DFACE,
     COLOR_3DSHADOW, HBRUSH, HDC, PAINTSTRUCT, PS_SOLID,
 };
+use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
@@ -36,11 +37,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, TranslateAcceleratorW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HTCLIENT, IDI_APPLICATION, MB_ICONERROR, MB_OK,
     MINMAXINFO, MSG, SIZE_MINIMIZED, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WNDCLASSEXW,
-    WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
+    SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_CREATE,
+    WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_QUERYENDSESSION,
+    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN,
+    WS_OVERLAPPEDWINDOW,
 };
+
+use nodi_core::autosave::SaveResult;
 
 use crate::app::{self, App};
 use crate::win;
@@ -239,7 +243,7 @@ unsafe fn center_window(hwnd: HWND) {
     );
 }
 
-unsafe fn app_mut<'a>(hwnd: HWND) -> Option<&'a mut App> {
+pub(crate) unsafe fn app_mut<'a>(hwnd: HWND) -> Option<&'a mut App> {
     let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
     if pointer.is_null() {
         None
@@ -258,27 +262,35 @@ unsafe fn create_ui(app: &mut App) -> bool {
 
     app.toolbar = toolbar::create(app);
     app.sidebar_title = tree::create_header(app);
-    app.tree = tree::create(app);
+    app.tree_view = tree::create(app);
     app.tabctrl = tabs::create(app);
     app.status = status::create(app);
 
     if app.toolbar.is_null()
         || app.sidebar_title.is_null()
-        || app.tree.is_null()
+        || app.tree_view.is_null()
         || app.tabctrl.is_null()
         || app.status.is_null()
     {
         return false;
     }
 
-    tree::populate(app.tree);
+    tree::create_images(app);
+    tree::install_subclass(app);
     app::apply_fonts(app);
     toolbar::refresh_height(app);
-    app::new_tab(app);
+
+    // Resolve the data dir, repair leftovers, load/repair the tree and restore
+    // the previous session before the first real layout pass.
+    if !app.startup() {
+        return false;
+    }
+
     layout(app);
     // Pane geometry only exists after the first layout pass, so set the static
     // labels afterwards; otherwise `SB_SETPARTS` drops texts written earlier.
     status::init(app);
+    app.refresh_active_ui();
     true
 }
 
@@ -363,7 +375,7 @@ pub fn layout(app: &mut App) {
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
         SetWindowPos(
-            app.tree,
+            app.tree_view,
             ptr::null_mut(),
             0,
             top + header_height,
@@ -555,6 +567,56 @@ pub unsafe extern "system" fn wndproc(
             0
         }
 
+        WM_TIMER => {
+            if let Some(app) = app_mut(hwnd) {
+                app.on_timer(wparam);
+            }
+            0
+        }
+
+        app::WM_APP_SAVE_RESULT => {
+            let raw = lparam as *mut SaveResult;
+            if !raw.is_null() {
+                // SAFETY: the writer thread boxed this `SaveResult` for us.
+                let result = *Box::from_raw(raw);
+                if let Some(app) = app_mut(hwnd) {
+                    app.on_save_result(result);
+                }
+            }
+            0
+        }
+
+        WM_COPYDATA if crate::testhook::enabled() => {
+            let data = lparam as *const COPYDATASTRUCT;
+            match app_mut(hwnd) {
+                Some(app) => LRESULT::from(crate::testhook::handle(app, data)),
+                None => 0,
+            }
+        }
+
+        WM_CONTEXTMENU => {
+            let mut handled = false;
+            if let Some(app) = app_mut(hwnd) {
+                if wparam as HWND == app.tree_view {
+                    let screen = if lparam == -1 {
+                        None
+                    } else {
+                        Some(POINT {
+                            x: win::x_from_lparam(lparam),
+                            y: win::y_from_lparam(lparam),
+                        })
+                    };
+                    tree::show_context_menu(app, screen);
+                    handled = true;
+                }
+            }
+            if handled {
+                0
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+
         WM_NOTIFY => {
             let header = lparam as *const NMHDR;
             if header.is_null() {
@@ -562,6 +624,9 @@ pub unsafe extern "system" fn wndproc(
             }
             let header = &*header;
             if let Some(app) = app_mut(hwnd) {
+                if tree::handle_notify(app, header) {
+                    return 0;
+                }
                 if header.hwndFrom == app.tabctrl && header.code == TCN_SELCHANGE {
                     app::on_tab_selchange(app);
                 } else if header.code == editor::EN_SELCHANGE_NOTIFY
@@ -674,10 +739,24 @@ pub unsafe extern "system" fn wndproc(
             0
         }
 
+        WM_QUERYENDSESSION => {
+            if let Some(app) = app_mut(hwnd) {
+                app.flush_for_session_end();
+            }
+            1
+        }
+
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                if let Some(app) = app_mut(hwnd) {
+                    app.flush_for_session_end();
+                }
+            }
+            0
+        }
+
         WM_CLOSE => {
-            let allowed = app_mut(hwnd)
-                .map(|app| app::close_requested(app))
-                .unwrap_or(true);
+            let allowed = app_mut(hwnd).map(|app| app.maybe_close()).unwrap_or(true);
             if allowed {
                 DestroyWindow(hwnd);
             }

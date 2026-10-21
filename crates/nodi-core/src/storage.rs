@@ -48,6 +48,10 @@ pub struct DataDir {
 impl DataDir {
     /// Resolves the data directory: `NODI_DATA_DIR` if set, else
     /// `<exe_dir>\data`. Never AppData.
+    ///
+    /// Exception: an exe running straight out of a Cargo `target\<profile>`
+    /// folder uses `<workspace>\data`, because `cargo clean` deletes `target`
+    /// and would take the notes with it.
     pub fn resolve() -> Self {
         if let Some(dir) = std::env::var_os("NODI_DATA_DIR") {
             if !dir.is_empty() {
@@ -58,7 +62,7 @@ impl DataDir {
             .ok()
             .and_then(|exe| exe.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from("."));
-        Self::at(exe_dir.join("data"))
+        Self::at(data_dir_for_exe_dir(&exe_dir))
     }
 
     /// Uses an explicit directory (tests, portable mode, restores).
@@ -234,6 +238,46 @@ impl DataDir {
         Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// Moves every content file of a permanently deleted (purged) note into
+    /// `recovery/purged-<id>-<ts>/`. Nothing is ever deleted: if the move
+    /// fails the file is copied, leaving the original in place. Returns the
+    /// recovery directory when at least one file existed.
+    pub fn purge_note_files(&self, id: &NoteId) -> io::Result<Option<PathBuf>> {
+        let candidates = [
+            self.note_path(id),
+            self.note_txt_path(id),
+            self.note_prev_path(id),
+        ];
+        if candidates.iter().all(|path| !path.exists()) {
+            return Ok(None);
+        }
+        self.ensure_layout()?;
+
+        let ts = now_secs();
+        let mut dest = self.recovery_dir().join(format!("purged-{id}-{ts}"));
+        let mut attempt = 1usize;
+        while dest.exists() {
+            dest = self
+                .recovery_dir()
+                .join(format!("purged-{id}-{ts}-{attempt}"));
+            attempt += 1;
+        }
+        fs::create_dir_all(&dest)?;
+
+        for path in candidates {
+            if !path.exists() {
+                continue;
+            }
+            let name = path.file_name().map(OsString::from).unwrap_or_default();
+            let target = dest.join(name);
+            if fs::rename(&path, &target).is_err() {
+                // Locked or on another volume: keep the original and copy it.
+                fs::copy(&path, &target)?;
+            }
+        }
+        Ok(Some(dest))
+    }
+
     /// Writes note content and its search sidecar. The RTF is written first
     /// (authoritative) and keeps one previous generation; the sidecar is
     /// derived data and is rewritten afterwards.
@@ -345,6 +389,20 @@ impl DataDir {
     }
 }
 
+/// `<exe_dir>\data`, except for `<workspace>\target\<profile>` where it is
+/// `<workspace>\data` (see [`DataDir::resolve`]).
+fn data_dir_for_exe_dir(exe_dir: &Path) -> PathBuf {
+    let in_target = exe_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "target"));
+    if let Some(workspace) = in_target.and_then(Path::parent) {
+        if workspace.join("Cargo.toml").is_file() {
+            return workspace.join("data");
+        }
+    }
+    exe_dir.join("data")
+}
+
 /// Adds a suffix to a file name (`notes/a.rtf` + `.prev` → `notes/a.rtf.prev`).
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name: OsString = path.file_name().map(OsString::from).unwrap_or_default();
@@ -393,6 +451,9 @@ pub struct Session {
     pub sidebar_width: i32,
     #[serde(default)]
     pub window: Option<WindowRect>,
+    /// Tree items the user expanded.
+    #[serde(default)]
+    pub expanded: Vec<NoteId>,
 }
 
 fn default_sidebar_width() -> i32 {
@@ -406,6 +467,7 @@ impl Default for Session {
             active: 0,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             window: None,
+            expanded: Vec::new(),
         }
     }
 }
@@ -439,6 +501,26 @@ mod tests {
         }
 
         assert_eq!(resolved.root(), wanted.as_path());
+    }
+
+    #[test]
+    fn cargo_target_exe_uses_workspace_data_dir() {
+        let root = std::env::temp_dir().join(format!("nodi-ws-{}", NoteId::generate()));
+        let release = root.join("target").join("release");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        assert_eq!(data_dir_for_exe_dir(&release), root.join("data"));
+
+        let portable = root.join("dist").join("Nodi");
+        assert_eq!(data_dir_for_exe_dir(&portable), portable.join("data"));
+
+        // A folder merely named `target` outside a Cargo workspace is portable.
+        let lone = std::env::temp_dir()
+            .join(format!("nodi-lone-{}", NoteId::generate()))
+            .join("target")
+            .join("debug");
+        assert_eq!(data_dir_for_exe_dir(&lone), lone.join("data"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

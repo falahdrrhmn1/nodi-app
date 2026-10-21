@@ -45,7 +45,9 @@ pub fn create(app: &App) -> HWND {
 
 pub fn init(app: &App) {
     set(app, PART_MESSAGE, "Ready");
-    set(app, PART_STATE, "Saved");
+    // The real state comes from the active tab (`App::refresh_active_ui`);
+    // never claim "Saved" before a save was acknowledged.
+    set(app, PART_STATE, "");
     set(app, PART_CARET, "Ln 1, Col 1");
     set(app, PART_ENCODING, "UTF-8");
     set(app, PART_MODE, "Rich Text");
@@ -72,8 +74,10 @@ pub fn set_message(app: &App, text: &str) {
     set(app, PART_MESSAGE, text);
 }
 
-pub fn set_save_state(app: &App, dirty: bool) {
-    set(app, PART_STATE, if dirty { "Modified" } else { "Saved" });
+/// Part 2 shows exactly one of `Modified`, `Saving...`, `Saved`,
+/// `Save Failed` for the active tab.
+pub fn set_save_state(app: &App, state: &str) {
+    set(app, PART_STATE, state);
 }
 
 pub fn clear_caret(app: &App) {

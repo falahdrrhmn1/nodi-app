@@ -106,12 +106,9 @@ pub fn create(app: &App) -> HWND {
             iString: 0,
         };
 
-        let mut save = icon(STD_FILESAVE, IDM_FILE_SAVE);
-        save.fsState = 0; // saving arrives in Phase 3 -> disabled, like the menu item
-
         let buttons = [
             icon(STD_FILENEW, IDM_FILE_NEW),
-            save,
+            icon(STD_FILESAVE, IDM_FILE_SAVE),
             separator,
             icon(STD_CUT, IDM_EDIT_CUT),
             icon(STD_COPY, IDM_EDIT_COPY),

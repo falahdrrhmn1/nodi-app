@@ -1,22 +1,64 @@
-//! Notes Explorer sidebar (TreeView) and its caption for Phase 1.
+//! Notes Explorer: the `TreeView` mirror of `Tree`, its shell-stock icon list,
+//! the rename/expand/drag notifications and the node context menu.
 
 use std::ptr;
 
-use windows_sys::Win32::Foundation::HWND;
+use nodi_core::{NodeKind, NoteId};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows_sys::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_LEFT, SS_NOPREFIX};
 use windows_sys::Win32::UI::Controls::{
-    HTREEITEM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW, TVI_LAST, TVI_ROOT,
-    TVM_EXPAND, TVM_INSERTITEMW, TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT,
-    TVS_SHOWSELALWAYS, WC_TREEVIEWW,
+    ImageList_BeginDrag, ImageList_Create, ImageList_DragEnter, ImageList_DragLeave,
+    ImageList_DragMove, ImageList_EndDrag, ImageList_ReplaceIcon, ILC_COLOR32, ILC_MASK, NMHDR,
+    NMTREEVIEWW, NMTVDISPINFOW, NMTVKEYDOWN, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET,
+    TVHITTESTINFO, TVHT_ONITEM, TVIF_IMAGE, TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW,
+    TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_EDITLABELW,
+    TVM_EXPAND, TVM_GETITEMRECT, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETIMAGELIST,
+    TVM_SETITEMW, TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW, TVN_ITEMEXPANDEDW,
+    TVN_KEYDOWN, TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES,
+    TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEWW,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, SetFocus, VK_APPS, VK_DELETE, VK_RETURN,
+};
+use windows_sys::Win32::UI::Shell::{
+    DefSubclassProc, ExtractIconExW, SHGetStockIconInfo, SetWindowSubclass, SHGSI_ICON,
+    SHGSI_SMALLICON, SHSTOCKICONID, SHSTOCKICONINFO, SIID_APPLICATION, SIID_DOCASSOC,
+    SIID_DOCNOASSOC, SIID_FOLDER, SIID_HELP, SIID_INFO, SIID_SHIELD, SIID_SOFTWARE, SIID_WARNING,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, SendMessageW, SetWindowTextW, WS_CHILD, WS_EX_CLIENTEDGE, WS_VISIBLE,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyIcon, DestroyMenu, GetCursorPos,
+    SendMessageW, SetMenuDefaultItem, SetWindowTextW, TrackPopupMenu, HICON, HMENU, MF_SEPARATOR,
+    MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_MOUSEMOVE, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_VISIBLE,
 };
 
 use crate::app::App;
 use crate::win;
+use crate::wnd::menu;
 
-const TVE_EXPAND_VALUE: u32 = 0x0002;
+/// The 8 built-in "Change Icon" choices: key → label. The order fixes the image
+/// list indices.
+pub const CATALOG: [(&str, &str); 8] = [
+    ("folder", "Folder"),
+    ("note", "Note"),
+    ("star", "Star"),
+    ("book", "Book"),
+    ("flag", "Flag"),
+    ("code", "Code"),
+    ("bulb", "Idea"),
+    ("warning", "Warning"),
+];
+
+/// Subclass id used for the drag handling on the tree.
+const SUBCLASS_ID: usize = 0x4E4F4449; // 'NODI'
+
+pub fn catalog() -> Vec<(&'static str, String)> {
+    CATALOG
+        .iter()
+        .map(|(key, label)| (*key, (*label).to_owned()))
+        .collect()
+}
 
 pub fn create(app: &App) -> HWND {
     let style = WS_CHILD
@@ -74,47 +116,722 @@ pub fn create_header(app: &App) -> HWND {
     }
 }
 
-/// Static demo content so the Phase 1 layout is visible.
-pub fn populate(tree: HWND) {
-    let all_notes = insert(tree, TVI_ROOT, "All Notes");
-    insert(tree, all_notes, "Welcome to Nodi");
-    insert(tree, all_notes, "Project Ideas");
-    insert(tree, all_notes, "Meeting Notes");
-    insert(tree, TVI_ROOT, "Trash");
+// --------------------------------------------------------------------- icons
 
-    // SAFETY: `tree` is the live TreeView; `all_notes` is its root item.
-    unsafe {
-        SendMessageW(tree, TVM_EXPAND, TVE_EXPAND_VALUE as usize, all_notes);
+/// Builds the shared image list from shell stock icons / `imageres.dll` and
+/// attaches it to the tree. Every catalog entry always yields one image, so the
+/// indices stay stable even when a shell icon is unavailable.
+pub fn create_images(app: &mut App) {
+    let list = unsafe { ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, CATALOG.len() as i32, 4) };
+    if list == 0 {
+        app.icon_keys = CATALOG.iter().map(|(key, _)| *key).collect();
+        return;
+    }
+
+    let fallback = stock_icon(SIID_APPLICATION);
+    for (key, _) in CATALOG.iter() {
+        let loaded = load_icon(key);
+        let use_icon = if loaded.is_null() { fallback } else { loaded };
+        if !use_icon.is_null() {
+            // SAFETY: `list` is our image list, `use_icon` a live icon.
+            unsafe {
+                ImageList_ReplaceIcon(list, -1, use_icon);
+            }
+        }
+        if !loaded.is_null() {
+            // SAFETY: the image list copied the icon.
+            unsafe {
+                DestroyIcon(loaded);
+            }
+        }
+    }
+    if !fallback.is_null() {
+        // SAFETY: the image list copied the icon.
+        unsafe {
+            DestroyIcon(fallback);
+        }
+    }
+
+    app.icon_keys = CATALOG.iter().map(|(key, _)| *key).collect();
+    app.images = list;
+    if !app.tree_view.is_null() {
+        // SAFETY: `tree_view` is our TreeView, `list` stays alive until destroy.
+        unsafe {
+            SendMessageW(app.tree_view, TVM_SETIMAGELIST, TVSIL_NORMAL as usize, list);
+        }
     }
 }
 
-fn insert(tree: HWND, parent: HTREEITEM, text: &str) -> HTREEITEM {
-    let mut buffer = win::wide(text);
+fn load_icon(key: &str) -> HICON {
+    match key {
+        "folder" => stock_icon(SIID_FOLDER),
+        "note" => stock_icon(SIID_DOCNOASSOC),
+        // No star/book/flag/code/bulb glyph exists as a stock icon; these come
+        // from `imageres.dll` resource ids. `extract` falls back to a distinct
+        // stock icon when the resource cannot be loaded.
+        "star" => extract("imageres.dll", 204, SIID_DOCASSOC),
+        "book" => extract("imageres.dll", 97, SIID_HELP),
+        "flag" => extract("imageres.dll", 57, SIID_SHIELD),
+        "code" => extract("imageres.dll", 76, SIID_SOFTWARE),
+        "bulb" => extract("imageres.dll", 206, SIID_INFO),
+        "warning" => extract("imageres.dll", 219, SIID_WARNING),
+        _ => ptr::null_mut(),
+    }
+}
+
+fn stock_icon(siid: SHSTOCKICONID) -> HICON {
+    let mut info: SHSTOCKICONINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
+    // SAFETY: `info` is a valid, fully initialised struct for the call.
+    let hr = unsafe { SHGetStockIconInfo(siid, SHGSI_ICON | SHGSI_SMALLICON, &mut info) };
+    if hr >= 0 {
+        info.hIcon
+    } else {
+        ptr::null_mut()
+    }
+}
+
+/// Extracts icon resource `resource` (a resource id, so it is passed negated)
+/// from `module`, falling back to a stock icon.
+fn extract(module: &str, resource: i32, fallback: SHSTOCKICONID) -> HICON {
+    let wide = win::wide(module);
+    let mut large: HICON = ptr::null_mut();
+    let mut small: HICON = ptr::null_mut();
+    // SAFETY: the string buffer outlives the call; both out pointers are valid.
+    let count = unsafe { ExtractIconExW(wide.as_ptr(), -resource, &mut large, &mut small, 1) };
+    if count == 0 {
+        return stock_icon(fallback);
+    }
+    if !small.is_null() {
+        if !large.is_null() {
+            // SAFETY: a handle `ExtractIconExW` gave us.
+            unsafe {
+                DestroyIcon(large);
+            }
+        }
+        small
+    } else {
+        large
+    }
+}
+
+// ------------------------------------------------------------------- rebuild
+
+struct Pending {
+    id: NoteId,
+    title: String,
+    kind: NodeKind,
+    icon: Option<String>,
+    has_children: bool,
+}
+
+/// Rebuilds the whole TreeView from the model, restoring selection, expansion
+/// and icons.
+pub fn rebuild(app: &mut App) {
+    if app.tree_view.is_null() {
+        return;
+    }
+    app.suppress_select += 1;
+    // SAFETY: `tree_view` is our TreeView; TVI_ROOT deletes every item.
+    unsafe {
+        SendMessageW(app.tree_view, TVM_DELETEITEM, TVI_ROOT as usize, 0);
+    }
+    app.tree_items.clear();
+    app.item_for.clear();
+
+    for info in child_infos(app, None) {
+        insert_subtree(app, TVI_ROOT, info, 0);
+    }
+
+    if let Some(id) = app.selected.clone() {
+        select_item(app, &id);
+    }
+    app.suppress_select -= 1;
+}
+
+fn child_infos(app: &App, parent: Option<&NoteId>) -> Vec<Pending> {
+    app.tree
+        .children(parent)
+        .into_iter()
+        .map(|node| Pending {
+            id: node.id.clone(),
+            title: node.title.clone(),
+            kind: node.kind,
+            icon: node.icon.clone(),
+            has_children: !app.tree.children(Some(&node.id)).is_empty(),
+        })
+        .collect()
+}
+
+fn insert_subtree(app: &mut App, parent_item: isize, info: Pending, depth: usize) {
+    if depth > 512 {
+        return;
+    }
+    let handle = insert_item(app, parent_item, &info);
+    if handle == 0 {
+        return;
+    }
+    for child in child_infos(app, Some(&info.id)) {
+        insert_subtree(app, handle, child, depth + 1);
+    }
+    if app.expanded.contains(&info.id) {
+        // SAFETY: `handle` is a live item of our TreeView.
+        unsafe {
+            SendMessageW(app.tree_view, TVM_EXPAND, TVE_EXPAND as usize, handle);
+        }
+    }
+}
+
+fn insert_item(app: &mut App, parent_item: isize, info: &Pending) -> isize {
+    let mut text = win::wide(&info.title);
+    let image = icon_index_for(app, info.kind, info.icon.as_deref());
     let item = TVITEMW {
-        mask: TVIF_TEXT,
+        mask: TVIF_TEXT | TVIF_IMAGE | TVIF_SELECTEDIMAGE,
         hItem: 0,
         state: 0,
         stateMask: 0,
-        pszText: buffer.as_mut_ptr(),
-        cchTextMax: buffer.len() as i32,
-        iImage: 0,
-        iSelectedImage: 0,
-        cChildren: 0,
+        pszText: text.as_mut_ptr(),
+        cchTextMax: text.len() as i32,
+        iImage: image,
+        iSelectedImage: image,
+        cChildren: i32::from(info.has_children),
         lParam: 0,
     };
     let insert = TVINSERTSTRUCTW {
-        hParent: parent,
+        hParent: parent_item,
         hInsertAfter: TVI_LAST,
         Anonymous: TVINSERTSTRUCTW_0 { item },
     };
-
-    // SAFETY: `item`/`insert` and `buffer` live for the duration of the call.
-    unsafe {
+    // SAFETY: `insert` and `text` live for the duration of the call.
+    let handle = unsafe {
         SendMessageW(
-            tree,
+            app.tree_view,
             TVM_INSERTITEMW,
             0,
             &insert as *const TVINSERTSTRUCTW as isize,
-        ) as HTREEITEM
+        )
+    } as isize;
+    if handle != 0 {
+        app.tree_items.insert(handle, info.id.clone());
+        app.item_for.insert(info.id.clone(), handle);
     }
+    handle
+}
+
+fn icon_index_for(app: &App, kind: NodeKind, icon: Option<&str>) -> i32 {
+    if let Some(key) = icon {
+        if let Some(position) = app.icon_keys.iter().position(|candidate| *candidate == key) {
+            return position as i32;
+        }
+    }
+    let wanted = match kind {
+        NodeKind::Folder => "folder",
+        NodeKind::Note => "note",
+    };
+    app.icon_keys
+        .iter()
+        .position(|candidate| *candidate == wanted)
+        .unwrap_or(0) as i32
+}
+
+// ------------------------------------------------------------------ item ops
+
+fn item_of(app: &App, id: &NoteId) -> Option<isize> {
+    app.item_for.get(id).copied()
+}
+
+/// Selects an item without letting the change open a note (programmatic).
+pub fn select_item(app: &mut App, id: &NoteId) -> bool {
+    let Some(item) = item_of(app, id) else {
+        return false;
+    };
+    app.suppress_select += 1;
+    // SAFETY: `item` is a live item of our TreeView.
+    unsafe {
+        SendMessageW(app.tree_view, TVM_SELECTITEM, TVGN_CARET as usize, item);
+    }
+    app.suppress_select -= 1;
+    app.selected = Some(id.clone());
+    true
+}
+
+pub fn set_item_text(app: &App, id: &NoteId, title: &str) {
+    let Some(item) = item_of(app, id) else {
+        return;
+    };
+    let mut text = win::wide(title);
+    let mut update = TVITEMW {
+        mask: TVIF_TEXT,
+        hItem: item,
+        pszText: text.as_mut_ptr(),
+        cchTextMax: text.len() as i32,
+        ..TVITEMW::default()
+    };
+    // SAFETY: `update`/`text` live for the duration of the call.
+    unsafe {
+        SendMessageW(
+            app.tree_view,
+            TVM_SETITEMW,
+            0,
+            &mut update as *mut TVITEMW as isize,
+        );
+    }
+}
+
+pub fn set_item_icon(app: &App, id: &NoteId, image: i32) {
+    let Some(item) = item_of(app, id) else {
+        return;
+    };
+    let mut update = TVITEMW {
+        mask: TVIF_IMAGE | TVIF_SELECTEDIMAGE,
+        hItem: item,
+        iImage: image,
+        iSelectedImage: image,
+        ..TVITEMW::default()
+    };
+    // SAFETY: `update` lives for the duration of the call.
+    unsafe {
+        SendMessageW(
+            app.tree_view,
+            TVM_SETITEMW,
+            0,
+            &mut update as *mut TVITEMW as isize,
+        );
+    }
+}
+
+pub fn expand_item(app: &App, id: &NoteId) {
+    let Some(item) = item_of(app, id) else {
+        return;
+    };
+    // SAFETY: `item` is a live item of our TreeView.
+    unsafe {
+        SendMessageW(app.tree_view, TVM_EXPAND, TVE_EXPAND as usize, item);
+    }
+}
+
+/// Starts the inline label edit for the selected (or context) node.
+pub fn begin_rename(app: &mut App) {
+    let Some(id) = app.context_note.clone().or_else(|| app.selected.clone()) else {
+        return;
+    };
+    let Some(item) = item_of(app, &id) else {
+        return;
+    };
+    // SAFETY: `item` is a live item of our TreeView.
+    unsafe {
+        SendMessageW(app.tree_view, TVM_EDITLABELW, 0, item);
+    }
+}
+
+// ------------------------------------------------------------------ hit test
+
+fn item_note(app: &App, item: isize) -> Option<NoteId> {
+    if item == 0 {
+        return None;
+    }
+    app.tree_items.get(&item).cloned()
+}
+
+fn is_note(app: &App, id: &NoteId) -> bool {
+    app.tree
+        .get(id)
+        .is_some_and(|node| node.kind == NodeKind::Note && !node.trashed)
+}
+
+fn hit_test(app: &App, client: POINT) -> Option<NoteId> {
+    let mut info = TVHITTESTINFO {
+        pt: client,
+        flags: 0,
+        hItem: 0,
+    };
+    // SAFETY: `info` lives for the duration of the call.
+    let item = unsafe {
+        SendMessageW(
+            app.tree_view,
+            TVM_HITTEST,
+            0,
+            &mut info as *mut TVHITTESTINFO as isize,
+        )
+    } as isize;
+    if item != 0 && info.flags & TVHT_ONITEM != 0 {
+        item_note(app, item)
+    } else {
+        None
+    }
+}
+
+// --------------------------------------------------------------- notifications
+
+/// Handles a `WM_NOTIFY` that came from the TreeView. Returns true when the
+/// notification belonged to the tree.
+pub fn handle_notify(app: &mut App, header: &NMHDR) -> bool {
+    if header.hwndFrom != app.tree_view {
+        return false;
+    }
+    match header.code {
+        TVN_SELCHANGEDW => {
+            let info = header as *const NMHDR as *const NMTREEVIEWW;
+            // SAFETY: the TreeView sent an NMTREEVIEWW for this code.
+            let item = unsafe { (*info).itemNew.hItem };
+            if let Some(id) = item_note(app, item) {
+                app.selected = Some(id.clone());
+                if app.suppress_select == 0 && is_note(app, &id) {
+                    app.open_note(id);
+                }
+            }
+        }
+        TVN_ITEMEXPANDEDW => {
+            let info = header as *const NMHDR as *const NMTREEVIEWW;
+            // SAFETY: the TreeView sent an NMTREEVIEWW for this code.
+            let (item, state) = unsafe { ((*info).itemNew.hItem, (*info).itemNew.state) };
+            if let Some(id) = item_note(app, item) {
+                if state & TVIS_EXPANDED != 0 {
+                    app.expanded.insert(id);
+                } else {
+                    app.expanded.remove(&id);
+                }
+                app.save_session_now();
+            }
+        }
+        TVN_BEGINLABELEDITW => return true,
+        TVN_ENDLABELEDITW => {
+            let info = header as *const NMHDR as *const NMTVDISPINFOW;
+            // SAFETY: the TreeView sent an NMTVDISPINFOW for this code.
+            let (item, text) = unsafe { ((*info).item.hItem, (*info).item.pszText) };
+            if text.is_null() {
+                return true;
+            }
+            if let Some(id) = item_note(app, item) {
+                // SAFETY: `text` is a NUL-terminated buffer owned by the control.
+                let title = unsafe { read_wide(text) };
+                if !title.trim().is_empty() {
+                    app.rename_node(id, title);
+                }
+            }
+        }
+        TVN_BEGINDRAGW => {
+            let info = header as *const NMHDR as *const NMTREEVIEWW;
+            // SAFETY: the TreeView sent an NMTREEVIEWW for this code.
+            let (item, point) = unsafe { ((*info).itemNew.hItem, (*info).ptDrag) };
+            begin_drag(app, item, point);
+        }
+        TVN_KEYDOWN => {
+            let info = header as *const NMHDR as *const NMTVKEYDOWN;
+            // SAFETY: the TreeView sent an NMTVKEYDOWN for this code.
+            let key = unsafe { (*info).wVKey };
+            match key {
+                VK_RETURN => {
+                    if let Some(id) = app.selected.clone() {
+                        if is_note(app, &id) {
+                            app.open_note(id);
+                        }
+                    }
+                }
+                VK_DELETE => {
+                    if let Some(id) = app.context_note.clone().or_else(|| app.selected.clone()) {
+                        app.trash_node(id);
+                    }
+                }
+                VK_APPS => show_context_menu(app, None),
+                _ => {}
+            }
+        }
+        NM_RCLICK => {
+            show_context_menu(app, Some(cursor_pos()));
+        }
+        NM_DBLCLK => {
+            if let Some(id) = app.context_note.clone().or_else(|| app.selected.clone()) {
+                if is_note(app, &id) {
+                    app.open_note(id);
+                }
+            }
+        }
+        _ => return true,
+    }
+    true
+}
+
+// -------------------------------------------------------------- drag & drop
+
+pub fn install_subclass(app: &App) {
+    if app.tree_view.is_null() {
+        return;
+    }
+    // SAFETY: our TreeView; the frame handle travels as the reference data.
+    unsafe {
+        SetWindowSubclass(
+            app.tree_view,
+            Some(tree_subclass),
+            SUBCLASS_ID,
+            app.hwnd as usize,
+        );
+    }
+}
+
+unsafe extern "system" fn tree_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    refdata: usize,
+) -> LRESULT {
+    let frame = refdata as HWND;
+    match msg {
+        WM_MOUSEMOVE => {
+            if let Some(app) = crate::wnd::app_mut(frame) {
+                if app.dragging {
+                    on_drag_move(app, lparam);
+                    return 0;
+                }
+            }
+        }
+        WM_LBUTTONUP => {
+            if let Some(app) = crate::wnd::app_mut(frame) {
+                if app.dragging {
+                    on_drop(app, lparam);
+                    return 0;
+                }
+            }
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+fn begin_drag(app: &mut App, item: isize, point: POINT) {
+    let Some(id) = item_note(app, item) else {
+        return;
+    };
+    let Some(node) = app.tree.get(&id) else {
+        return;
+    };
+    if app.images == 0 {
+        return;
+    }
+    let index = icon_index_for(app, node.kind, node.icon.as_deref());
+    app.drag_source = Some(id);
+    app.dragging = true;
+    // SAFETY: `images`/`tree_view` belong to us; the drag lives until drop.
+    unsafe {
+        ImageList_BeginDrag(app.images, index, 8, 8);
+        ImageList_DragEnter(app.tree_view, point.x, point.y);
+        SetCapture(app.tree_view);
+    }
+}
+
+fn on_drag_move(_app: &App, lparam: LPARAM) {
+    let x = win::x_from_lparam(lparam);
+    let y = win::y_from_lparam(lparam);
+    // SAFETY: a drag image is in progress; coordinates are tree client coords.
+    unsafe {
+        ImageList_DragMove(x, y);
+    }
+}
+
+fn on_drop(app: &mut App, lparam: LPARAM) {
+    let point = POINT {
+        x: win::x_from_lparam(lparam),
+        y: win::y_from_lparam(lparam),
+    };
+    // SAFETY: matching the BeginDrag/DragEnter from `begin_drag`.
+    unsafe {
+        ImageList_DragLeave(app.tree_view);
+        ImageList_EndDrag();
+        ReleaseCapture();
+    }
+    app.dragging = false;
+    if let Some(source) = app.drag_source.take() {
+        if let Some(target) = hit_test(app, point) {
+            if target != source {
+                app.move_node(source, target);
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------- context menu
+
+/// Shows the node context menu. `screen` is the click position in screen
+/// coordinates, or `None` for a keyboard invocation (under the selected item).
+pub fn show_context_menu(app: &mut App, screen: Option<POINT>) {
+    if app.tree_view.is_null() {
+        return;
+    }
+
+    let target = match screen {
+        Some(point) => {
+            let mut client = point;
+            // SAFETY: the tree window is alive.
+            unsafe {
+                ScreenToClient(app.tree_view, &mut client);
+            }
+            match hit_test(app, client) {
+                Some(id) => {
+                    select_item(app, &id);
+                    Some(id)
+                }
+                None => {
+                    app.selected = None;
+                    None
+                }
+            }
+        }
+        None => {
+            let id = app.selected.clone();
+            if let Some(id) = &id {
+                select_item(app, id);
+            }
+            id
+        }
+    };
+
+    let position = screen
+        .or_else(|| item_screen_pos(app, target.as_ref()))
+        .unwrap_or(POINT { x: 0, y: 0 });
+
+    app.context_note = target;
+    let menu = build_menu(app);
+    if menu.is_null() {
+        app.context_note = None;
+        return;
+    }
+    // SAFETY: `menu` is a popup we own; `hwnd` is our frame window.
+    let command = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN,
+            position.x,
+            position.y,
+            0,
+            app.hwnd,
+            ptr::null(),
+        )
+    };
+    // SAFETY: the popup is no longer needed.
+    unsafe {
+        DestroyMenu(menu);
+    }
+    if command != 0 {
+        crate::app::context_command(app, command as u16);
+    } else {
+        app.context_note = None;
+    }
+}
+
+fn build_menu(app: &App) -> HMENU {
+    // SAFETY: every call below creates/edits a menu we own.
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return menu;
+        }
+        let kind = app
+            .context_note
+            .as_ref()
+            .and_then(|id| app.tree.get(id))
+            .map(|node| node.kind);
+        match kind {
+            None => {
+                append(menu, menu::IDM_NOTES_NEW, "New Note");
+                append(menu, menu::IDM_NOTES_NEW_FOLDER, "New Folder");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(menu, menu::IDM_VIEW_EXPAND_ALL, "Expand All");
+                append(menu, menu::IDM_VIEW_COLLAPSE_ALL, "Collapse All");
+            }
+            Some(NodeKind::Note) => {
+                append(menu, menu::IDM_NOTES_OPEN, "Open");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(menu, menu::IDM_NOTES_NEW_CHILD, "New Child Note");
+                append(menu, menu::IDM_NOTES_NEW_SIBLING, "New Sibling Note");
+                append(menu, menu::IDM_NOTES_NEW_FOLDER, "New Folder (child)");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(menu, menu::IDM_NOTES_RENAME, "Rename");
+                append(menu, menu::IDM_NOTES_ICON, "Change Icon...");
+                append(menu, menu::IDM_NOTES_DUPLICATE, "Duplicate");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(menu, menu::IDM_NOTES_TRASH, "Move to Trash");
+                append(menu, menu::IDM_NOTES_PROPERTIES, "Properties");
+                SetMenuDefaultItem(menu, menu::IDM_NOTES_OPEN as u32, 0);
+            }
+            Some(NodeKind::Folder) => {
+                append(menu, menu::IDM_NOTES_NEW, "New Note");
+                append(menu, menu::IDM_NOTES_NEW_FOLDER, "New Subfolder");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(menu, menu::IDM_NOTES_RENAME, "Rename");
+                append(menu, menu::IDM_NOTES_ICON, "Change Icon...");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(menu, menu::IDM_NOTES_TRASH, "Move to Trash");
+                append(menu, menu::IDM_NOTES_PROPERTIES, "Properties");
+            }
+        }
+        menu
+    }
+}
+
+unsafe fn append(menu: HMENU, id: u16, label: &str) {
+    let text = win::wide(label);
+    AppendMenuW(menu, MF_STRING, id as usize, text.as_ptr());
+}
+
+fn item_screen_pos(app: &App, id: Option<&NoteId>) -> Option<POINT> {
+    let item = id.and_then(|id| item_of(app, id))?;
+    // `left` must be TRUE to receive the full row rectangle.
+    let mut rect = RECT {
+        left: 1,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: `rect` is valid for the call; `item` is a live item.
+    let ok = unsafe {
+        SendMessageW(
+            app.tree_view,
+            TVM_GETITEMRECT,
+            item as usize,
+            &mut rect as *mut RECT as isize,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let mut point = POINT {
+        x: rect.left + 12,
+        y: rect.bottom,
+    };
+    // SAFETY: the tree window is alive.
+    unsafe {
+        ClientToScreen(app.tree_view, &mut point);
+    }
+    Some(point)
+}
+
+/// Focuses the tree (used when the user closes the last editor).
+pub fn focus_tree(app: &App) {
+    if !app.tree_view.is_null() {
+        // SAFETY: our own TreeView window.
+        unsafe {
+            SetFocus(app.tree_view);
+        }
+    }
+}
+
+fn cursor_pos() -> POINT {
+    let mut point = POINT { x: 0, y: 0 };
+    // SAFETY: `point` is a valid out parameter.
+    unsafe {
+        GetCursorPos(&mut point);
+    }
+    point
+}
+
+unsafe fn read_wide(pointer: *const u16) -> String {
+    let mut length = 0usize;
+    while *pointer.add(length) != 0 {
+        length += 1;
+        if length > 4096 {
+            break;
+        }
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length))
 }

@@ -1,8 +1,8 @@
 //! Rich Edit (`RICHEDIT50W`, msftedit.dll) wrapper.
 //!
 //! `windows-sys` does not bind `richedit.h`, so the Rich Edit message numbers,
-//! `CHARFORMAT2W` and `CHARRANGE` are declared here with the values from the
-//! Windows SDK.
+//! `CHARFORMAT2W`, `CHARRANGE`, `EDITSTREAM` and `GETTEXTEX` are declared here
+//! with the values from the Windows SDK.
 
 use std::mem::size_of;
 use std::ptr;
@@ -15,7 +15,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_PASTE, WS_CHILD, WS_TABSTOP, WS_VSCROLL,
 };
 
-use crate::app::{self, App};
+use crate::app::App;
 use crate::win;
 use crate::wnd::menu;
 use crate::wnd::status;
@@ -34,14 +34,22 @@ pub const EM_EXLINEFROMCHAR: u32 = WM_USER + 54;
 pub const EM_EXSETSEL: u32 = WM_USER + 55;
 pub const EM_SETUNDOLIMIT: u32 = WM_USER + 82;
 pub const EM_REDO: u32 = WM_USER + 84;
+pub const EM_STREAMIN: u32 = WM_USER + 73;
+pub const EM_STREAMOUT: u32 = WM_USER + 74;
+pub const EM_GETTEXTEX: u32 = WM_USER + 94;
 pub const EM_SETTYPOGRAPHYOPTIONS: u32 = WM_USER + 202;
 /// Rich Edit keeps the Edit-control value for undo (`EM_UNDO`); there is no
 /// `WM_USER`-based variant, unlike [`EM_REDO`].
 pub const EM_UNDO: u32 = 0x00C7;
 
-/// Standard edit-control message, also honoured by Rich Edit.
+/// Standard edit-control messages, also honoured by Rich Edit.
 const EM_LINEINDEX_MSG: u32 = 0x00BB;
 const EM_SETMODIFY: u32 = 0x00B9;
+const EM_GETFIRSTVISIBLELINE: u32 = 0x00CE;
+const EM_LINESCROLL: u32 = 0x00B6;
+const EM_EMPTYUNDOBUFFER: u32 = 0x00CD;
+const WM_GETTEXTLENGTH: u32 = 0x000E;
+const WM_SETTEXT: u32 = 0x000C;
 
 pub const SCF_SELECTION: usize = 0x0001;
 pub const SCF_ALL: usize = 0x0004;
@@ -63,6 +71,12 @@ pub const CFE_STRIKEOUT: u32 = 0x0000_0008;
 pub const ENM_CHANGE: usize = 0x0000_0001;
 pub const ENM_SELCHANGE: usize = 0x0008_0000;
 pub const ENM_LINK: usize = 0x0400_0000;
+
+/// `SF_RTF` for `EM_STREAMIN`/`EM_STREAMOUT`.
+const SF_RTF: usize = 0x0002;
+
+/// `CP_UTF16` used by `EM_GETTEXTEX` for the plain-text sidecar.
+const CP_UTF16: u32 = 1200;
 
 const TM_RICHTEXT: usize = 0x0002;
 const TO_ADVANCEDTYPOGRAPHY: usize = 0x0001;
@@ -123,6 +137,79 @@ impl Default for CharFormat2W {
 
 const _: () = assert!(size_of::<CharFormat2W>() == 116);
 
+/// `EDITSTREAM` from `richedit.h`.
+///
+/// `richedit.h` wraps its structures in `#pragma pack(4)`, so on x64 the
+/// callback pointer sits at offset 12, not 16. With natural alignment Rich Edit
+/// reads a garbage callback address and `EM_STREAMOUT` never returns.
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+pub struct EditStream {
+    pub dw_cookie: usize,
+    pub dw_error: u32,
+    pub pfn_callback: Option<unsafe extern "system" fn(usize, *mut u8, i32, *mut i32) -> u32>,
+}
+
+const _: () = assert!(size_of::<EditStream>() == 20);
+
+/// `GETTEXTEX` from `richedit.h` (also `pack(4)`).
+#[repr(C, packed(4))]
+struct GetTextEx {
+    cb: u32,
+    flags: u32,
+    codepage: u32,
+    lp_default_char: *const u8,
+    lp_used_def_char: *mut i32,
+}
+
+const _: () = assert!(size_of::<GetTextEx>() == 28);
+
+/// Reads from a byte slice for `EM_STREAMIN`.
+struct StreamReader {
+    data: *const u8,
+    len: usize,
+    pos: usize,
+}
+
+// SAFETY: `StreamReader` only lives on the thread that runs the synchronous
+// `SendMessageW` it is passed to, so it is never shared across threads.
+unsafe impl Send for StreamReader {}
+
+unsafe extern "system" fn stream_in_callback(
+    cookie: usize,
+    buffer: *mut u8,
+    count: i32,
+    written: *mut i32,
+) -> u32 {
+    // SAFETY: `cookie` is the `StreamReader` passed in the `EDITSTREAM`.
+    let reader = &mut *(cookie as *mut StreamReader);
+    let want = count.max(0) as usize;
+    let remaining = reader.len.saturating_sub(reader.pos);
+    let take = want.min(remaining);
+    if take > 0 {
+        ptr::copy_nonoverlapping(reader.data.add(reader.pos), buffer, take);
+        reader.pos += take;
+    }
+    *written = take as i32;
+    0
+}
+
+unsafe extern "system" fn stream_out_callback(
+    cookie: usize,
+    buffer: *mut u8,
+    count: i32,
+    written: *mut i32,
+) -> u32 {
+    // SAFETY: `cookie` is the `Vec<u8>` passed in the `EDITSTREAM`.
+    let sink = &mut *(cookie as *mut Vec<u8>);
+    let length = count.max(0) as usize;
+    if length > 0 {
+        sink.extend_from_slice(std::slice::from_raw_parts(buffer, length));
+    }
+    *written = count;
+    0
+}
+
 /// Creates a Rich Edit child for a new tab. Returns `None` if Windows refused
 /// to create the window (e.g. msftedit.dll failed to load).
 pub fn create(app: &App) -> Option<HWND> {
@@ -163,7 +250,7 @@ pub fn create(app: &App) -> Option<HWND> {
             window,
             EM_SETEVENTMASK,
             0,
-            (ENM_CHANGE | ENM_SELCHANGE | ENM_LINK) as isize,
+            (ENM_SELCHANGE | ENM_LINK) as isize,
         );
         apply_default_format(window);
 
@@ -205,9 +292,159 @@ fn apply_default_format(window: HWND) {
     }
 }
 
-pub fn line_col(editor: HWND) -> (i32, i32) {
+/// Enables the `EN_CHANGE` notification. It stays disabled while the initial
+/// RTF is streamed in (streaming fires `EN_CHANGE` too), so a freshly opened
+/// note is never marked dirty by its own load.
+pub fn set_change_events(editor: HWND, enabled: bool) {
+    let mask = if enabled {
+        ENM_CHANGE | ENM_SELCHANGE | ENM_LINK
+    } else {
+        ENM_SELCHANGE | ENM_LINK
+    };
+    // SAFETY: `editor` is a live Rich Edit control.
+    unsafe {
+        SendMessageW(editor, EM_SETEVENTMASK, 0, mask as isize);
+    }
+}
+
+/// Clears the editor (a missing note file is an empty note).
+pub fn clear(editor: HWND) {
+    let empty = win::wide("");
+    // SAFETY: `empty` is NUL terminated; `editor` is our control.
+    unsafe {
+        SendMessageW(editor, WM_SETTEXT, 0, empty.as_ptr() as isize);
+        SendMessageW(editor, EM_SETMODIFY, 0, 0);
+        SendMessageW(editor, EM_EMPTYUNDOBUFFER, 0, 0);
+    }
+}
+
+/// Streams RTF bytes into the editor. Returns false when Rich Edit reported a
+/// parse error (the caller then offers the `.prev` generation).
+pub fn load_rtf(editor: HWND, bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        clear(editor);
+        return true;
+    }
+    let mut reader = StreamReader {
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+        pos: 0,
+    };
+    let mut stream = EditStream {
+        dw_cookie: &mut reader as *mut StreamReader as usize,
+        dw_error: 0,
+        pfn_callback: Some(stream_in_callback),
+    };
+
+    // SAFETY: `stream` and `reader` outlive the synchronous call; the callback
+    // only touches them from this thread.
+    let inserted = unsafe {
+        SendMessageW(
+            editor,
+            EM_STREAMIN,
+            SF_RTF,
+            &mut stream as *mut EditStream as isize,
+        )
+    };
+
+    // SAFETY: the control is alive and owned by us.
+    unsafe {
+        SendMessageW(editor, EM_SETMODIFY, 0, 0);
+        SendMessageW(editor, EM_EMPTYUNDOBUFFER, 0, 0);
+    }
+
+    inserted != 0 && stream.dw_error == 0
+}
+
+/// Streams the whole document out as RTF. `None` when Rich Edit failed.
+pub fn stream_out_rtf(editor: HWND) -> Option<Vec<u8>> {
+    let mut sink: Vec<u8> = Vec::new();
+    let mut stream = EditStream {
+        dw_cookie: &mut sink as *mut Vec<u8> as usize,
+        dw_error: 0,
+        pfn_callback: Some(stream_out_callback),
+    };
+    // SAFETY: `stream` and `sink` outlive the synchronous call.
+    let written = unsafe {
+        SendMessageW(
+            editor,
+            EM_STREAMOUT,
+            SF_RTF,
+            &mut stream as *mut EditStream as isize,
+        )
+    };
+    if written != 0 && stream.dw_error == 0 {
+        Some(sink)
+    } else {
+        None
+    }
+}
+
+/// Plain text (without RTF markup) for the search sidecar.
+pub fn plain_text(editor: HWND) -> String {
+    // SAFETY: `editor` is a live Rich Edit control.
+    let length = unsafe { SendMessageW(editor, WM_GETTEXTLENGTH, 0, 0) } as usize;
+    let capacity = length + 2;
+    let mut buffer = vec![0u8; capacity * 2];
+    let mut request = GetTextEx {
+        cb: (capacity * 2) as u32,
+        flags: 0,
+        codepage: CP_UTF16,
+        lp_default_char: ptr::null(),
+        lp_used_def_char: ptr::null_mut(),
+    };
+
+    // SAFETY: `request` and `buffer` are valid for the synchronous call.
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_GETTEXTEX,
+            &mut request as *mut GetTextEx as usize,
+            buffer.as_mut_ptr() as isize,
+        );
+    }
+
+    let units: Vec<u16> = buffer
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Character format of the current selection (`dw_mask` says which fields are
+/// uniform across it).
+pub fn selection_format(editor: HWND) -> CharFormat2W {
+    let mut format = CharFormat2W {
+        cb_size: size_of::<CharFormat2W>() as u32,
+        ..CharFormat2W::default()
+    };
+    // SAFETY: `format` is a valid `CHARFORMAT2W` for the call.
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_GETCHARFORMAT,
+            SCF_SELECTION,
+            &mut format as *mut CharFormat2W as isize,
+        );
+    }
+    format
+}
+
+/// Number of embedded objects (images, …): each one is a U+FFFC in the text.
+pub fn object_count(editor: HWND) -> usize {
+    plain_text(editor)
+        .chars()
+        .filter(|ch| *ch == '\u{FFFC}')
+        .count()
+}
+
+/// Current selection as `(from, to)` character offsets.
+pub fn selection(editor: HWND) -> (i32, i32) {
     let mut range = CharRange::default();
-    // SAFETY: `range` is a valid CHARRANGE for the duration of the calls.
+    // SAFETY: `range` is a valid `CHARRANGE` for the call.
     unsafe {
         SendMessageW(
             editor,
@@ -215,10 +452,58 @@ pub fn line_col(editor: HWND) -> (i32, i32) {
             0,
             &mut range as *mut CharRange as isize,
         );
-        let line = SendMessageW(editor, EM_EXLINEFROMCHAR, 0, range.cp_min as isize) as i32;
+    }
+    (range.cp_min, range.cp_max)
+}
+
+/// Restores a selection/caret position.
+pub fn set_selection(editor: HWND, from: i32, to: i32) {
+    let range = CharRange {
+        cp_min: from,
+        cp_max: to,
+    };
+    // SAFETY: `range` is a valid `CHARRANGE` for the call.
+    unsafe {
+        SendMessageW(editor, EM_EXSETSEL, 0, &range as *const CharRange as isize);
+    }
+}
+
+/// First visible line (used for the session file).
+pub fn first_visible_line(editor: HWND) -> u32 {
+    // SAFETY: standard edit message on our control.
+    let line = unsafe { SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0) };
+    line.max(0) as u32
+}
+
+/// Scrolls so that `line` becomes the first visible line.
+pub fn scroll_to_line(editor: HWND, line: u32) {
+    let current = first_visible_line(editor) as i32;
+    let delta = line as i32 - current;
+    if delta == 0 {
+        return;
+    }
+    // SAFETY: standard edit message on our control.
+    unsafe {
+        SendMessageW(editor, EM_LINESCROLL, 0, delta as isize);
+    }
+}
+
+/// Clears the modified flag (a streamed-in document is not dirty).
+pub fn set_modified(editor: HWND, modified: bool) {
+    // SAFETY: standard edit message on our control.
+    unsafe {
+        SendMessageW(editor, EM_SETMODIFY, modified as usize, 0);
+    }
+}
+
+pub fn line_col(editor: HWND) -> (i32, i32) {
+    let (caret, _) = selection(editor);
+    // SAFETY: `editor` is a live Rich Edit control.
+    unsafe {
+        let line = SendMessageW(editor, EM_EXLINEFROMCHAR, 0, caret as isize) as i32;
         let line = line.max(0);
         let line_start = SendMessageW(editor, EM_LINEINDEX_MSG, line as usize, 0) as i32;
-        let column = range.cp_min - line_start.max(0) + 1;
+        let column = caret - line_start.max(0) + 1;
         (line + 1, column.max(1))
     }
 }
@@ -261,6 +546,9 @@ pub fn command(app: &mut App, id: u16) {
     }
 
     status::update_caret(app);
+    if let Some(index) = app.active {
+        app.refresh_tab_ui(index);
+    }
 }
 
 /// Toggles bold/italic/underline/strikethrough on the current selection (or on
@@ -308,5 +596,5 @@ pub fn toggle_effect(app: &mut App, id: u16) {
         SetFocus(editor);
     }
 
-    app::mark_dirty(app, editor);
+    app.mark_dirty(editor);
 }

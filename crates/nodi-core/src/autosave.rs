@@ -9,6 +9,7 @@
 //! The writer never blocks on the UI: results are delivered through the
 //! callback given to [`Writer::spawn`] (the shell wraps it in `PostMessageW`).
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -142,11 +143,31 @@ impl Pending {
 
     /// Writes everything queued, in a stable order, reporting one result per
     /// written job.
-    fn flush(&mut self, data: &DataDir, notify: &(dyn Fn(SaveResult) + Send)) {
+    ///
+    /// `last_written` remembers the highest sequence number that reached the
+    /// disk per note. A request older than that is dropped: it was already
+    /// superseded, and writing it would roll the note back. This can happen
+    /// when two submissions arrive in separate drain passes.
+    fn flush(
+        &mut self,
+        data: &DataDir,
+        notify: &(dyn Fn(SaveResult) + Send),
+        last_written: &mut HashMap<NoteId, u64>,
+    ) {
         for request in self.notes.drain(..) {
+            if last_written
+                .get(&request.note)
+                .is_some_and(|seq| request.seq < *seq)
+            {
+                continue;
+            }
             let result = data
                 .save_note(&request.note, &request.rtf, &request.txt)
                 .map_err(|err| err.to_string());
+            if result.is_ok() {
+                let highest = last_written.entry(request.note.clone()).or_insert(0);
+                *highest = (*highest).max(request.seq);
+            }
             notify(SaveResult {
                 target: Target::Note(request.note),
                 seq: request.seq,
@@ -189,6 +210,7 @@ fn run(data: DataDir, rx: Receiver<Message>, notify: Box<dyn Fn(SaveResult) + Se
     const MAX_BATCH: usize = 100_000;
 
     let mut pending = Pending::default();
+    let mut last_written: HashMap<NoteId, u64> = HashMap::new();
     loop {
         let first = match rx.recv() {
             Ok(message) => message,
@@ -216,7 +238,7 @@ fn run(data: DataDir, rx: Receiver<Message>, notify: Box<dyn Fn(SaveResult) + Se
         }
 
         if !pending.is_empty() {
-            pending.flush(&data, notify.as_ref());
+            pending.flush(&data, notify.as_ref(), &mut last_written);
         }
         for waiter in waiters {
             let _ = waiter.send(());
