@@ -17,7 +17,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::app::{self, App};
 use crate::win;
-use crate::wnd::{dialogs, editor, find, format, image, link, status, table};
+use crate::wnd::{dialogs, editor, find, format, image, link, status, table, toolbar};
 
 pub const IDM_FILE_NEW: u16 = 100;
 pub const IDM_FILE_SAVE: u16 = 101;
@@ -58,6 +58,9 @@ pub const IDM_FORMAT_JUSTIFY: u16 = 219;
 pub const IDM_FORMAT_CLEAR: u16 = 220;
 pub const IDM_FORMAT_INDENT: u16 = 221;
 pub const IDM_FORMAT_OUTDENT: u16 = 222;
+pub const IDM_FORMAT_H4: u16 = 223;
+pub const IDM_TOOLBAR_COLOR: u16 = 224;
+pub const IDM_TOOLBAR_HIGHLIGHT: u16 = 225;
 
 pub const IDM_TABLE_ROW_ABOVE: u16 = 230;
 pub const IDM_TABLE_ROW_BELOW: u16 = 231;
@@ -112,6 +115,7 @@ pub const IDM_NOTES_MOVE_UP: u16 = 181;
 pub const IDM_NOTES_MOVE_DOWN: u16 = 182;
 pub const IDM_NOTES_COPY_LINK: u16 = 183;
 pub const IDM_NOTES_MOVE_ROOT: u16 = 184;
+pub const IDM_NOTES_TRASH_EMPTY: u16 = 185;
 
 pub const IDM_TOOLS_BACKUP: u16 = 190;
 pub const IDM_TOOLS_OPEN_DATA: u16 = 191;
@@ -150,7 +154,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Shift+C", "Code block"),
     ("Ctrl+Shift+H", "Highlight"),
     ("Ctrl+] / Ctrl+[", "Bigger / smaller text"),
-    ("Ctrl+Alt+1 / 2 / 3", "Heading 1 / 2 / 3"),
+    ("Ctrl+Alt+1 / 2 / 3 / 4", "Heading 1 / 2 / 3 / 4"),
     ("Ctrl+Alt+0", "Normal text"),
     ("Ctrl+Shift+8 / 7", "Bulleted / numbered list"),
     (
@@ -175,8 +179,13 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ),
     ("Ctrl+Shift+M", "Show the note as Markdown (read-only)"),
     ("Double-click a formula", "Edit the formula"),
+    ("Double-click a picture", "Picture size"),
     ("F2", "Rename note"),
-    ("Del (in the tree)", "Move note to Trash"),
+    ("Del (in the tree)", "Move note to Trash (asks first)"),
+    (
+        "Click \"Trash (N)\"",
+        "Open the Trash (right-click: Empty Trash)",
+    ),
     ("Alt+Up / Alt+Down", "Move note up / down"),
     ("F1", "This list"),
 ];
@@ -296,6 +305,7 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_FORMAT_H1, "Heading &1\tCtrl+Alt+1"),
             Item::Cmd(IDM_FORMAT_H2, "Heading &2\tCtrl+Alt+2"),
             Item::Cmd(IDM_FORMAT_H3, "Heading &3\tCtrl+Alt+3"),
+            Item::Cmd(IDM_FORMAT_H4, "Heading &4\tCtrl+Alt+4"),
             Item::Cmd(IDM_FORMAT_NORMAL, "&Normal Text\tCtrl+Alt+0"),
             Item::Sep,
             Item::Cmd(IDM_FORMAT_BULLETS, "Bulleted &List\tCtrl+Shift+8"),
@@ -329,6 +339,7 @@ pub fn create_menu() -> HMENU {
             Item::Sep,
             Item::Cmd(IDM_NOTES_TRASH, "Move to &Trash\tDel"),
             Item::Cmd(IDM_NOTES_TRASH_VIEW, "Tr&ash..."),
+            Item::Cmd(IDM_NOTES_TRASH_EMPTY, "&Empty Trash..."),
             Item::Cmd(IDM_NOTES_PROPERTIES, "&Properties"),
         ]);
         attach(bar, notes, "&Notes");
@@ -423,6 +434,7 @@ pub fn create_accel() -> HACCEL {
         accel(ctrl_alt, key(b'1'), IDM_FORMAT_H1),
         accel(ctrl_alt, key(b'2'), IDM_FORMAT_H2),
         accel(ctrl_alt, key(b'3'), IDM_FORMAT_H3),
+        accel(ctrl_alt, key(b'4'), IDM_FORMAT_H4),
         accel(ctrl_alt, key(b'0'), IDM_FORMAT_NORMAL),
         accel(ctrl_shift, key(b'8'), IDM_FORMAT_BULLETS),
         accel(ctrl_shift, key(b'7'), IDM_FORMAT_NUMBERS),
@@ -514,7 +526,10 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_FORMAT_H1 => with_editor(app, |editor| format::heading(editor, 1)),
         IDM_FORMAT_H2 => with_editor(app, |editor| format::heading(editor, 2)),
         IDM_FORMAT_H3 => with_editor(app, |editor| format::heading(editor, 3)),
+        IDM_FORMAT_H4 => with_editor(app, |editor| format::heading(editor, 4)),
         IDM_FORMAT_NORMAL => with_editor(app, |editor| format::heading(editor, 0)),
+        IDM_TOOLBAR_COLOR => toolbar::show_palette(app, false),
+        IDM_TOOLBAR_HIGHLIGHT => toolbar::show_palette(app, true),
         IDM_FORMAT_BULLETS => with_editor(app, |editor| format::toggle_list(editor, false)),
         IDM_FORMAT_NUMBERS => with_editor(app, |editor| format::toggle_list(editor, true)),
         IDM_FORMAT_INDENT => with_editor(app, |editor| {
@@ -587,6 +602,7 @@ pub fn on_command(app: &mut App, id: u16) {
             for tab in &app.tabs {
                 editor::set_word_wrap(tab.editor, app.word_wrap);
             }
+            toolbar::sync_word_wrap(app);
         }
         IDM_VIEW_ZOOM_IN => app::zoom(app, Some(true)),
         IDM_VIEW_ZOOM_OUT => app::zoom(app, Some(false)),
@@ -628,6 +644,7 @@ pub fn on_command(app: &mut App, id: u16) {
             }
         }
         IDM_NOTES_TRASH_VIEW => app::show_trash(app),
+        IDM_NOTES_TRASH_EMPTY => app.empty_trash(),
         IDM_NOTES_PROPERTIES => app::show_properties(app),
         IDM_TOOLS_BACKUP => app.backup_now(),
         IDM_TOOLS_OPEN_DATA => app.open_data_folder(),
@@ -641,7 +658,10 @@ pub fn on_command(app: &mut App, id: u16) {
 
 /// Runs an editor command on the active tab and marks it dirty (formatting
 /// changes do not always raise `EN_CHANGE`).
-fn with_editor(app: &mut App, command: impl FnOnce(windows_sys::Win32::Foundation::HWND)) {
+pub(crate) fn with_editor(
+    app: &mut App,
+    command: impl FnOnce(windows_sys::Win32::Foundation::HWND),
+) {
     let Some(editor) = app.active_editor() else {
         status::set_message(app, "No note open");
         return;
@@ -652,6 +672,7 @@ fn with_editor(app: &mut App, command: impl FnOnce(windows_sys::Win32::Foundatio
     unsafe {
         windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor);
     }
+    toolbar::sync_format(app);
 }
 
 fn editor_result(
@@ -670,6 +691,7 @@ fn editor_result(
     unsafe {
         windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor);
     }
+    toolbar::sync_format(app);
 }
 
 pub fn set_checked(app: &App, id: u16, checked: bool) {

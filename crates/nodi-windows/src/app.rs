@@ -107,6 +107,12 @@ pub struct App {
     pub hcursor_we: HCURSOR,
 
     pub toolbar: HWND,
+    pub formatbar: HWND,
+    pub style_combo: HWND,
+    pub font_combo: HWND,
+    pub size_combo: HWND,
+    /// >0 while the combos are updated from the editor (no commands back).
+    pub suppress_combo: u32,
     pub sidebar_title: HWND,
     pub tree_view: HWND,
     pub tabctrl: HWND,
@@ -119,6 +125,10 @@ pub struct App {
     pub restored_window: bool,
 
     pub toolbar_height: i32,
+    pub formatbar_height: i32,
+    /// The "Trash (N)" pseudo-item at the bottom of the tree, and its icon.
+    pub trash_item: isize,
+    pub trash_image: i32,
     /// New notes whose first (empty) file write is still queued.
     pub pending_new: HashSet<NoteId>,
     /// View > Word Wrap, applied to every editor.
@@ -161,6 +171,11 @@ impl App {
             // takes no pointers we own and returns a shared handle.
             hcursor_we: unsafe { LoadCursorW(ptr::null_mut(), IDC_SIZEWE) },
             toolbar: ptr::null_mut(),
+            formatbar: ptr::null_mut(),
+            style_combo: ptr::null_mut(),
+            font_combo: ptr::null_mut(),
+            size_combo: ptr::null_mut(),
+            suppress_combo: 0,
             sidebar_title: ptr::null_mut(),
             tree_view: ptr::null_mut(),
             tabctrl: ptr::null_mut(),
@@ -171,6 +186,9 @@ impl App {
             splitter_drag: false,
             restored_window: false,
             toolbar_height: 0,
+            formatbar_height: 0,
+            trash_item: 0,
+            trash_image: 0,
             pending_new: HashSet::new(),
             word_wrap: true,
             zoom: 100,
@@ -489,6 +507,9 @@ impl App {
         }
         let _ = loaded;
 
+        // Rich Edit's default tab stop is 0.5"; Nodi uses half of that for the
+        // whole document (new paragraphs inherit it).
+        crate::wnd::format::apply_document_tabs(editor);
         editor::set_modified(editor, false);
         if let Some((from, to)) = selection {
             editor::set_selection(editor, from, to);
@@ -555,6 +576,7 @@ impl App {
 
         tabs::set_cur(self, index);
         status::update_caret(self);
+        crate::wnd::toolbar::sync_format(self);
         status::set_message(self, "Ready");
         self.refresh_tab_ui(index);
 
@@ -1058,6 +1080,31 @@ impl App {
     }
 
     pub fn trash_node(&mut self, id: NoteId) {
+        let title = self
+            .tree
+            .get(&id)
+            .map(|node| node.title.clone())
+            .unwrap_or_default();
+        let sub_notes = self
+            .tree
+            .descendants(&id)
+            .into_iter()
+            .filter(|child| {
+                self.tree
+                    .get(child)
+                    .is_some_and(|node| node.kind == NodeKind::Note)
+            })
+            .count();
+        let question = if sub_notes == 0 {
+            format!("Move \"{title}\" to the Trash?")
+        } else if sub_notes == 1 {
+            format!("Move \"{title}\" (and its 1 sub-note) to the Trash?")
+        } else {
+            format!("Move \"{title}\" (and its {sub_notes} sub-notes) to the Trash?")
+        };
+        if !dialogs::ask_yes_no(self.hwnd, &question) {
+            return;
+        }
         let ids = self.subtree_ids(&id);
         for index in (0..self.tabs.len()).rev() {
             if ids.contains(&self.tabs[index].note) {
@@ -1094,6 +1141,31 @@ impl App {
         self.tree_save();
         self.rebuild_tree();
         status::set_message(self, "Deleted permanently (files kept in recovery/)");
+    }
+
+    /// "Empty Trash...": purges every trashed item after one confirmation.
+    pub fn empty_trash(&mut self) {
+        let entries = self.trashed_roots();
+        if entries.is_empty() {
+            dialogs::info(self.hwnd, "The Trash is empty.");
+            return;
+        }
+        let question = format!(
+            "Permanently delete all {} item(s) in the Trash?\n\n\
+             Their files are moved to data/recovery/ (nothing is deleted).",
+            entries.len()
+        );
+        if !dialogs::ask_yes_no(self.hwnd, &question) {
+            return;
+        }
+        let count = entries.len();
+        for (id, _) in entries {
+            self.purge_node(id);
+        }
+        status::set_message(
+            self,
+            &format!("Trash emptied ({count} item(s); files kept in recovery/)"),
+        );
     }
 
     pub fn duplicate_node(&mut self, id: NoteId) {
@@ -1308,7 +1380,16 @@ pub fn apply_fonts(app: &App) {
     // SAFETY: all handles are null (skipped) or child windows created by this
     // process; `WM_SETFONT` only stores the handle.
     unsafe {
-        for control in [app.tree_view, app.tabctrl, app.status, app.toolbar] {
+        for control in [
+            app.tree_view,
+            app.tabctrl,
+            app.status,
+            app.toolbar,
+            app.formatbar,
+            app.style_combo,
+            app.font_combo,
+            app.size_combo,
+        ] {
             if !control.is_null() {
                 SendMessageW(control, WM_SETFONT, app.ui_font as usize, 1);
             }

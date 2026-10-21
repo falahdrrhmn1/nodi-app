@@ -515,6 +515,7 @@ pub const EM_SETPARAFORMAT: u32 = WM_USER + 71;
 pub const PFM_STARTINDENT: u32 = 0x0000_0001;
 pub const PFM_OFFSET: u32 = 0x0000_0004;
 pub const PFM_ALIGNMENT: u32 = 0x0000_0008;
+pub const PFM_TABSTOPS: u32 = 0x0000_0010;
 pub const PFM_NUMBERING: u32 = 0x0000_0020;
 pub const PFM_SPACEBEFORE: u32 = 0x0000_0040;
 pub const PFM_SPACEAFTER: u32 = 0x0000_0080;
@@ -959,4 +960,5 @@ pub fn toggle_effect(app: &mut App, id: u16) {
     }
 
     app.mark_dirty(editor);
+    crate::wnd::toolbar::sync_format(app);
 }

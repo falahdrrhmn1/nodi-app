@@ -1,49 +1,87 @@
-//! Toolbar with the standard system image list plus text buttons for B/I/U.
+//! Toolbars. The top bar holds the file/edit commands; the format bar below it
+//! is Word-like: a style combobox (Normal, Heading 1–4), a font-name combobox,
+//! a font-size combobox, text/highlight colour palettes, alignment, lists and
+//! the insert commands. Tooltips name the shortcut of every button.
 
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::{
+    ClientToScreen, EnumFontFamiliesExW, GetDC, ReleaseDC, DEFAULT_CHARSET, LOGFONTW, TEXTMETRICW,
+};
 use windows_sys::Win32::UI::Controls::{
-    BTNS_AUTOSIZE, BTNS_BUTTON, BTNS_SEP, BTNS_SHOWTEXT, CCS_NODIVIDER, CCS_NOPARENTALIGN,
-    CCS_NORESIZE, IDB_STD_SMALL_COLOR, I_IMAGENONE, NMTTDISPINFOW, STD_COPY, STD_CUT, STD_FILENEW,
-    STD_FILESAVE, STD_FIND, STD_PASTE, STD_REDOW, STD_UNDO, TBBUTTON, TBSTATE_ENABLED,
-    TBSTYLE_EX_MIXEDBUTTONS, TBSTYLE_FLAT, TBSTYLE_LIST, TBSTYLE_TOOLTIPS, TB_ADDBUTTONSW,
-    TB_ADDSTRINGW, TB_AUTOSIZE, TB_BUTTONSTRUCTSIZE, TB_LOADIMAGES, TB_SETEXTENDEDSTYLE,
+    BTNS_AUTOSIZE, BTNS_BUTTON, BTNS_CHECK, BTNS_DROPDOWN, BTNS_SEP, BTNS_SHOWTEXT, CCS_NODIVIDER,
+    CCS_NOPARENTALIGN, CCS_NORESIZE, IDB_STD_SMALL_COLOR, I_IMAGENONE, NMTTDISPINFOW, STD_COPY,
+    STD_CUT, STD_FILENEW, STD_FILESAVE, STD_FIND, STD_PASTE, STD_REDOW, STD_UNDO, TBBUTTON,
+    TBSTATE_CHECKED, TBSTATE_ENABLED, TBSTYLE_EX_DRAWDDARROWS, TBSTYLE_EX_MIXEDBUTTONS,
+    TBSTYLE_FLAT, TBSTYLE_LIST, TBSTYLE_TOOLTIPS, TB_ADDBUTTONSW, TB_ADDSTRINGW, TB_AUTOSIZE,
+    TB_BUTTONSTRUCTSIZE, TB_GETRECT, TB_LOADIMAGES, TB_SETEXTENDEDSTYLE, TB_SETSTATE,
     TOOLBARCLASSNAMEW,
 };
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetWindowRect, SendMessageW, WS_CHILD, WS_VISIBLE,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, GetCursorPos, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, SendMessageW, SetWindowPos, TrackPopupMenu, HMENU,
+    MF_SEPARATOR, MF_STRING, SWP_NOACTIVATE, SWP_NOZORDER, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_TOPALIGN, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::app::App;
+use crate::win;
 use crate::wnd::menu::*;
+use crate::wnd::{editor, format};
 
 /// `HINST_COMMCTRL`, absent from windows-sys.
 const HINST_COMMCTRL: isize = -1;
 
-/// Text buttons, in order: (label, command).
-const TEXT_BUTTONS: [(&str, u16); 13] = [
-    ("B", IDM_FORMAT_BOLD),
-    ("I", IDM_FORMAT_ITALIC),
-    ("U", IDM_FORMAT_UNDERLINE),
-    ("S", IDM_FORMAT_STRIKEOUT),
-    ("H1", IDM_FORMAT_H1),
-    ("H2", IDM_FORMAT_H2),
-    ("\u{2022} List", IDM_FORMAT_BULLETS),
-    ("1. List", IDM_FORMAT_NUMBERS),
-    ("Image", IDM_INSERT_IMAGE),
-    ("Table", IDM_INSERT_TABLE),
-    ("Link", IDM_INSERT_LINK),
-    ("Code", IDM_INSERT_CODE_BLOCK),
-    ("\u{2211} Formula", IDM_INSERT_FORMULA),
-];
-
-/// A separator goes in front of these text buttons.
-const GROUP_STARTS: [u16; 2] = [IDM_FORMAT_H1, IDM_INSERT_IMAGE];
-
 /// `TTN_GETDISPINFOW` (`TTN_FIRST - 10`).
 pub const TTN_GETDISPINFOW: u32 = 0u32.wrapping_sub(530);
+
+/// The separator that reserves room for the three comboboxes.
+const COMBO_SEP_ID: u16 = 1999;
+/// Width reserved for the combos, in 96-DPI pixels.
+const COMBO_AREA: i32 = 272;
+
+/// Internal palette command ids (never reach `menu::on_command`).
+const PALETTE_BASE: u16 = 3200;
+const PALETTE_MORE: u16 = 3300;
+const PALETTE_NONE: u16 = 3301;
+
+/// Control ids of the three format comboboxes. They are children of the format
+/// bar, so their `WM_COMMAND` is forwarded to the frame by a subclass shim.
+pub const STYLE_COMBO_ID: u16 = 1200;
+pub const FONT_COMBO_ID: u16 = 1201;
+pub const SIZE_COMBO_ID: u16 = 1202;
+
+/// Colours offered by the text-colour palette.
+const TEXT_COLOURS: [(&str, u32); 10] = [
+    ("Black", 0x0000_0000),
+    ("Dark grey", 0x0044_4444),
+    ("Red", 0x0025_2525),
+    ("Orange", 0x002A_6BEC),
+    ("Yellow", 0x0000_C8F0),
+    ("Green", 0x0034_8A2D),
+    ("Teal", 0x0090_7F2D),
+    ("Blue", 0x00C0_5A2D),
+    ("Purple", 0x00A0_3D80),
+    ("Pink", 0x0060_5DE8),
+];
+
+/// Colours offered by the highlight palette.
+const HIGHLIGHT_COLOURS: [(&str, u32); 10] = [
+    ("Yellow", 0x0070_EEFF),
+    ("Green", 0x0070_EEC8),
+    ("Cyan", 0x00F0_ECE0),
+    ("Blue", 0x00FF_D3C8),
+    ("Pink", 0x00E8_C8FF),
+    ("Red", 0x00C8_C8FF),
+    ("Orange", 0x0060_D0FF),
+    ("Purple", 0x00F0_C8E0),
+    ("Grey", 0x00E0_E0E0),
+    ("White", 0x00FF_FFFF),
+];
 
 /// Tooltip text for a toolbar command.
 fn tip(command: u16) -> &'static str {
@@ -63,6 +101,13 @@ fn tip(command: u16) -> &'static str {
         IDM_FORMAT_H2 => "Heading 2 (Ctrl+Alt+2)",
         IDM_FORMAT_BULLETS => "Bulleted list (Ctrl+Shift+8)",
         IDM_FORMAT_NUMBERS => "Numbered list (Ctrl+Shift+7)",
+        IDM_TOOLBAR_COLOR => "Text colour — pick from the palette",
+        IDM_TOOLBAR_HIGHLIGHT => "Highlight — pick from the palette (Ctrl+Shift+H = yellow)",
+        IDM_FORMAT_LEFT => "Align left (Ctrl+L)",
+        IDM_FORMAT_CENTER => "Align center (Ctrl+E)",
+        IDM_FORMAT_RIGHT => "Align right (Ctrl+R)",
+        IDM_FORMAT_JUSTIFY => "Justify (Ctrl+J)",
+        IDM_VIEW_WORD_WRAP => "Word wrap (View > Word Wrap)",
         IDM_INSERT_IMAGE => "Insert image (Ctrl+Shift+I) — or paste a screenshot",
         IDM_INSERT_TABLE => "Insert table (Ctrl+Shift+T)",
         IDM_INSERT_LINK => "Insert link (Ctrl+K)",
@@ -87,7 +132,56 @@ pub unsafe fn tooltip(lparam: isize) {
     info.lpszText = info.szText.as_mut_ptr();
 }
 
-pub fn create(app: &App) -> HWND {
+// --------------------------------------------------------------- construction
+
+struct Buttons {
+    list: Vec<TBBUTTON>,
+    /// First index of the bar's text strings in the toolbar string pool.
+    first_text: i32,
+}
+
+impl Buttons {
+    fn icon(&mut self, bitmap: u32, command: u16) {
+        self.list.push(TBBUTTON {
+            iBitmap: bitmap as i32,
+            idCommand: command as i32,
+            fsState: TBSTATE_ENABLED as u8,
+            fsStyle: (BTNS_BUTTON | BTNS_AUTOSIZE) as u8,
+            bReserved: [0; 6],
+            dwData: 0,
+            iString: 0,
+        });
+    }
+
+    fn text(&mut self, index: i32, command: u16, style: u32, checked: bool) {
+        let state = TBSTATE_ENABLED | if checked { TBSTATE_CHECKED } else { 0 };
+        self.list.push(TBBUTTON {
+            iBitmap: I_IMAGENONE,
+            idCommand: command as i32,
+            fsState: state as u8,
+            fsStyle: (BTNS_BUTTON | BTNS_AUTOSIZE | BTNS_SHOWTEXT | style) as u8,
+            bReserved: [0; 6],
+            dwData: 0,
+            iString: (self.first_text + index) as isize,
+        });
+    }
+
+    /// A separator; `width` sets the reserved space in pixels.
+    fn separator(&mut self, id: u16, width: i32) {
+        self.list.push(TBBUTTON {
+            iBitmap: width,
+            idCommand: id as i32,
+            fsState: 0,
+            fsStyle: BTNS_SEP as u8,
+            bReserved: [0; 6],
+            dwData: 0,
+            iString: 0,
+        });
+    }
+}
+
+/// Creates one toolbar window with the given labels and buttons.
+fn create_bar(app: &App, labels: &[&str], fill: impl FnOnce(&mut Buttons)) -> HWND {
     let style = WS_CHILD
         | WS_VISIBLE
         | TBSTYLE_FLAT
@@ -96,7 +190,7 @@ pub fn create(app: &App) -> HWND {
         | (CCS_NODIVIDER | CCS_NOPARENTALIGN | CCS_NORESIZE) as u32;
 
     // SAFETY: constant class name and parent handles owned by `app`.
-    let toolbar = unsafe {
+    let bar = unsafe {
         CreateWindowExW(
             0,
             TOOLBARCLASSNAMEW,
@@ -112,107 +206,773 @@ pub fn create(app: &App) -> HWND {
             ptr::null(),
         )
     };
-    if toolbar.is_null() {
-        return toolbar;
+    if bar.is_null() {
+        return bar;
     }
 
-    // SAFETY: `toolbar` is a live toolbar control; every message below is a
+    // SAFETY: `bar` is a live toolbar control; every message below is a
     // documented toolbar message with stack/static arguments.
     unsafe {
-        SendMessageW(toolbar, TB_BUTTONSTRUCTSIZE, size_of::<TBBUTTON>(), 0);
+        SendMessageW(bar, TB_BUTTONSTRUCTSIZE, size_of::<TBBUTTON>(), 0);
         SendMessageW(
-            toolbar,
+            bar,
             TB_SETEXTENDEDSTYLE,
             0,
-            TBSTYLE_EX_MIXEDBUTTONS as isize,
+            (TBSTYLE_EX_MIXEDBUTTONS | TBSTYLE_EX_DRAWDDARROWS) as isize,
         );
         SendMessageW(
-            toolbar,
+            bar,
             TB_LOADIMAGES,
             IDB_STD_SMALL_COLOR as usize,
             HINST_COMMCTRL,
         );
 
         let mut strings = Vec::new();
-        for label in TEXT_BUTTONS.iter().map(|(label, _)| *label) {
+        for label in labels {
             strings.extend(label.encode_utf16());
             strings.push(0);
         }
         strings.push(0);
-        let first_text = SendMessageW(toolbar, TB_ADDSTRINGW, 0, strings.as_ptr() as isize) as i32;
+        let first_text = SendMessageW(bar, TB_ADDSTRINGW, 0, strings.as_ptr() as isize) as i32;
 
-        let icon = |bitmap: u32, command: u16| TBBUTTON {
-            iBitmap: bitmap as i32,
-            idCommand: command as i32,
-            fsState: TBSTATE_ENABLED as u8,
-            fsStyle: (BTNS_BUTTON | BTNS_AUTOSIZE) as u8,
-            bReserved: [0; 6],
-            dwData: 0,
-            iString: 0,
+        let mut buttons = Buttons {
+            list: Vec::new(),
+            first_text,
         };
-        let text = |index: i32, command: u16| TBBUTTON {
-            iBitmap: I_IMAGENONE,
-            idCommand: command as i32,
-            fsState: TBSTATE_ENABLED as u8,
-            fsStyle: (BTNS_BUTTON | BTNS_AUTOSIZE | BTNS_SHOWTEXT) as u8,
-            bReserved: [0; 6],
-            dwData: 0,
-            iString: (first_text + index) as isize,
-        };
-        let separator = TBBUTTON {
-            iBitmap: 0,
-            idCommand: 0,
-            fsState: 0,
-            fsStyle: BTNS_SEP as u8,
-            bReserved: [0; 6],
-            dwData: 0,
-            iString: 0,
-        };
-
-        let mut buttons = vec![
-            icon(STD_FILENEW, IDM_FILE_NEW),
-            icon(STD_FILESAVE, IDM_FILE_SAVE),
-            separator,
-            icon(STD_CUT, IDM_EDIT_CUT),
-            icon(STD_COPY, IDM_EDIT_COPY),
-            icon(STD_PASTE, IDM_EDIT_PASTE),
-            separator,
-            icon(STD_UNDO, IDM_EDIT_UNDO),
-            icon(STD_REDOW, IDM_EDIT_REDO),
-            separator,
-        ];
-        for (index, (_, command)) in TEXT_BUTTONS.iter().enumerate() {
-            if GROUP_STARTS.contains(command) {
-                buttons.push(separator);
-            }
-            buttons.push(text(index as i32, *command));
-        }
-        buttons.push(separator);
-        buttons.push(icon(STD_FIND, IDM_SEARCH_FIND));
+        fill(&mut buttons);
         SendMessageW(
-            toolbar,
+            bar,
             TB_ADDBUTTONSW,
-            buttons.len(),
-            buttons.as_ptr() as isize,
+            buttons.list.len(),
+            buttons.list.as_ptr() as isize,
         );
-        SendMessageW(toolbar, TB_AUTOSIZE, 0, 0);
+        SendMessageW(bar, TB_AUTOSIZE, 0, 0);
     }
-
-    toolbar
+    bar
 }
 
-/// Recomputes the toolbar height after a font/DPI change.
+/// Main toolbar: file/edit commands, word wrap and find.
+fn create_main(app: &App) -> HWND {
+    const LABELS: [&str; 1] = ["Wrap"];
+    create_bar(app, &LABELS, |buttons| {
+        buttons.icon(STD_FILENEW, IDM_FILE_NEW);
+        buttons.icon(STD_FILESAVE, IDM_FILE_SAVE);
+        buttons.separator(0, 0);
+        buttons.icon(STD_CUT, IDM_EDIT_CUT);
+        buttons.icon(STD_COPY, IDM_EDIT_COPY);
+        buttons.icon(STD_PASTE, IDM_EDIT_PASTE);
+        buttons.separator(0, 0);
+        buttons.icon(STD_UNDO, IDM_EDIT_UNDO);
+        buttons.icon(STD_REDOW, IDM_EDIT_REDO);
+        buttons.separator(0, 0);
+        buttons.text(0, IDM_VIEW_WORD_WRAP, BTNS_CHECK, app.word_wrap);
+        buttons.separator(0, 0);
+        buttons.icon(STD_FIND, IDM_SEARCH_FIND);
+    })
+}
+
+/// Format bar: style/font/size combos, colour palettes, alignment, lists and
+/// the insert commands.
+fn create_format(app: &App) -> HWND {
+    const LABELS: [&str; 17] = [
+        "B",
+        "I",
+        "U",
+        "S",
+        "Colour",
+        "Highlight",
+        "Left",
+        "Center",
+        "Right",
+        "Justify",
+        "\u{2022}",
+        "1.",
+        "Img",
+        "Table",
+        "Link",
+        "Code",
+        "f(x)",
+    ];
+    create_bar(app, &LABELS, |buttons| {
+        buttons.separator(COMBO_SEP_ID, app.scale(COMBO_AREA));
+        buttons.text(0, IDM_FORMAT_BOLD, 0, false);
+        buttons.text(1, IDM_FORMAT_ITALIC, 0, false);
+        buttons.text(2, IDM_FORMAT_UNDERLINE, 0, false);
+        buttons.text(3, IDM_FORMAT_STRIKEOUT, 0, false);
+        buttons.separator(0, 0);
+        buttons.text(4, IDM_TOOLBAR_COLOR, BTNS_DROPDOWN, false);
+        buttons.text(5, IDM_TOOLBAR_HIGHLIGHT, BTNS_DROPDOWN, false);
+        buttons.separator(0, 0);
+        buttons.text(6, IDM_FORMAT_LEFT, 0, false);
+        buttons.text(7, IDM_FORMAT_CENTER, 0, false);
+        buttons.text(8, IDM_FORMAT_RIGHT, 0, false);
+        buttons.text(9, IDM_FORMAT_JUSTIFY, 0, false);
+        buttons.separator(0, 0);
+        buttons.text(10, IDM_FORMAT_BULLETS, 0, false);
+        buttons.text(11, IDM_FORMAT_NUMBERS, 0, false);
+        buttons.separator(0, 0);
+        buttons.text(12, IDM_INSERT_IMAGE, 0, false);
+        buttons.text(13, IDM_INSERT_TABLE, 0, false);
+        buttons.text(14, IDM_INSERT_LINK, 0, false);
+        buttons.text(15, IDM_INSERT_CODE_BLOCK, 0, false);
+        buttons.text(16, IDM_INSERT_FORMULA, 0, false);
+    })
+}
+
+fn create_combo(app: &App, parent: HWND, id: u16, style: u32) -> HWND {
+    let class = win::wide("COMBOBOX");
+    // SAFETY: constant class name, live parent, no pointer arguments.
+    let combo = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            ptr::null(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | style,
+            0,
+            0,
+            10,
+            200,
+            parent,
+            id as isize as windows_sys::Win32::UI::WindowsAndMessaging::HMENU,
+            app.hinstance,
+            ptr::null(),
+        )
+    };
+    if !combo.is_null() && !app.ui_font.is_null() {
+        // SAFETY: our own combo and font.
+        unsafe {
+            SendMessageW(
+                combo,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_SETFONT,
+                app.ui_font as usize,
+                1,
+            );
+        }
+    }
+    combo
+}
+
+fn combo_add(combo: HWND, text: &str) {
+    let wide = win::wide(text);
+    // SAFETY: `wide` outlives the call; `combo` is our control.
+    unsafe {
+        SendMessageW(
+            combo,
+            windows_sys::Win32::UI::WindowsAndMessaging::CB_ADDSTRING,
+            0,
+            wide.as_ptr() as isize,
+        );
+    }
+}
+
+fn combo_select_text(combo: HWND, text: &str) -> bool {
+    let wide = win::wide(text);
+    // SAFETY: `wide` outlives the call; `combo` is our control.
+    let index = unsafe {
+        SendMessageW(
+            combo,
+            windows_sys::Win32::UI::WindowsAndMessaging::CB_FINDSTRINGEXACT,
+            0,
+            wide.as_ptr() as isize,
+        )
+    };
+    if index < 0 {
+        return false;
+    }
+    // SAFETY: plain combo message.
+    unsafe {
+        SendMessageW(
+            combo,
+            windows_sys::Win32::UI::WindowsAndMessaging::CB_SETCURSEL,
+            index as usize,
+            0,
+        );
+    }
+    true
+}
+
+fn create_combos(app: &mut App, bar: HWND) {
+    // SAFETY: the combos are created as children of our format bar.
+    let style_combo = create_combo(
+        app,
+        bar,
+        STYLE_COMBO_ID,
+        windows_sys::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST as u32
+            | windows_sys::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS as u32,
+    );
+    let font_combo = create_combo(
+        app,
+        bar,
+        FONT_COMBO_ID,
+        windows_sys::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST as u32
+            | windows_sys::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS as u32,
+    );
+    let size_combo = create_combo(
+        app,
+        bar,
+        SIZE_COMBO_ID,
+        windows_sys::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST as u32
+            | windows_sys::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS as u32,
+    );
+
+    app.style_combo = style_combo;
+    app.font_combo = font_combo;
+    app.size_combo = size_combo;
+
+    if !style_combo.is_null() {
+        for label in ["Normal", "Heading 1", "Heading 2", "Heading 3", "Heading 4"] {
+            combo_add(style_combo, label);
+        }
+        // SAFETY: plain combo message.
+        unsafe {
+            SendMessageW(
+                style_combo,
+                windows_sys::Win32::UI::WindowsAndMessaging::CB_SETCURSEL,
+                0,
+                0,
+            );
+        }
+    }
+    if !font_combo.is_null() {
+        for face in installed_fonts(bar) {
+            combo_add(font_combo, &face);
+        }
+        combo_select_text(font_combo, format::BODY_FONT);
+    }
+    if !size_combo.is_null() {
+        for points in 8..=72 {
+            combo_add(size_combo, &points.to_string());
+        }
+        combo_select_text(size_combo, "11");
+    }
+}
+
+/// Family names of every installed font (sorted, no vertical `@` faces).
+fn installed_fonts(window: HWND) -> Vec<String> {
+    unsafe extern "system" fn collect(
+        logfont: *const LOGFONTW,
+        _metrics: *const TEXTMETRICW,
+        _kind: u32,
+        data: LPARAM,
+    ) -> i32 {
+        // SAFETY: `data` is the `BTreeSet` passed by `installed_fonts`.
+        let names = &mut *(data as *mut BTreeSet<String>);
+        if logfont.is_null() || names.len() > 4096 {
+            return 0;
+        }
+        // SAFETY: the callback receives a valid LOGFONTW.
+        let face = &(*logfont).lfFaceName;
+        let end = face
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(face.len());
+        let name = String::from_utf16_lossy(&face[..end]);
+        if !name.is_empty() && !name.starts_with('@') {
+            names.insert(name);
+        }
+        1
+    }
+
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    // SAFETY: the DC is released after the enumeration; `names` outlives it.
+    unsafe {
+        let dc = GetDC(window);
+        if !dc.is_null() {
+            let mut filter: LOGFONTW = std::mem::zeroed();
+            filter.lfCharSet = DEFAULT_CHARSET;
+            EnumFontFamiliesExW(
+                dc,
+                &filter,
+                Some(collect),
+                &mut names as *mut BTreeSet<String> as LPARAM,
+                0,
+            );
+            ReleaseDC(window, dc);
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// Creates both toolbars.
+pub fn create(app: &mut App) {
+    app.toolbar = create_main(app);
+    app.formatbar = create_format(app);
+    if !app.formatbar.is_null() {
+        create_combos(app, app.formatbar);
+        // The bar's buttons and combos send `WM_COMMAND`/`WM_NOTIFY` to their
+        // parent (the bar); route them to the frame, which owns the commands.
+        // SAFETY: the bar is alive and the subclass outlives this call.
+        unsafe {
+            SetWindowSubclass(app.formatbar, Some(forward_to_parent), 1, app.hwnd as usize);
+        }
+    }
+}
+
+/// Subclass procedure that relays the format bar's notifications upward.
+unsafe extern "system" fn forward_to_parent(
+    hwnd: HWND,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+    _id: usize,
+    data: usize,
+) -> isize {
+    if (msg == windows_sys::Win32::UI::WindowsAndMessaging::WM_COMMAND
+        || msg == windows_sys::Win32::UI::WindowsAndMessaging::WM_NOTIFY)
+        && data != 0
+    {
+        return SendMessageW(data as HWND, msg, wparam, lparam);
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+/// True when `window` is one of the three format comboboxes.
+pub fn is_format_combo(app: &App, window: HWND) -> bool {
+    !window.is_null()
+        && (window == app.style_combo || window == app.font_combo || window == app.size_combo)
+}
+
+// ------------------------------------------------------------------- geometry
+
+/// Places the comboboxes over the separator that reserves their space.
+pub fn relayout(app: &mut App) {
+    if app.formatbar.is_null() || app.style_combo.is_null() {
+        return;
+    }
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    // SAFETY: `rect` is a valid out parameter; the bar is ours.
+    let ok = unsafe {
+        SendMessageW(
+            app.formatbar,
+            TB_GETRECT,
+            COMBO_SEP_ID as usize,
+            &mut rect as *mut RECT as isize,
+        )
+    };
+    if ok == 0 {
+        return;
+    }
+    let top = rect.top + app.scale(1);
+    // The window height is the height of the dropped-down list; only the top
+    // part of a closed combobox is visible.
+    let height = app.scale(260);
+    let place = |combo: HWND, offset: i32, width: i32| {
+        if combo.is_null() {
+            return;
+        }
+        // SAFETY: `combo` is our child of the format bar.
+        unsafe {
+            SetWindowPos(
+                combo,
+                ptr::null_mut(),
+                rect.left + app.scale(offset),
+                top,
+                app.scale(width),
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    };
+    place(app.style_combo, 2, 88);
+    place(app.font_combo, 94, 118);
+    place(app.size_combo, 216, 50);
+}
+
+/// Recomputes the toolbar heights after a font/DPI change.
 pub fn refresh_height(app: &mut App) {
+    // SAFETY: the bars are live toolbar windows.
+    unsafe {
+        for (bar, minimum) in [(app.toolbar, 28), (app.formatbar, 32)] {
+            if bar.is_null() {
+                continue;
+            }
+            SendMessageW(bar, TB_AUTOSIZE, 0, 0);
+            let mut rect: RECT = std::mem::zeroed();
+            if GetWindowRect(bar, &mut rect) != 0 {
+                let height = (rect.bottom - rect.top).max(app.scale(minimum));
+                if bar == app.toolbar {
+                    app.toolbar_height = height;
+                } else {
+                    app.formatbar_height = height;
+                }
+            }
+        }
+    }
+    relayout(app);
+}
+
+// -------------------------------------------------------------------- syncing
+
+fn combo_text(combo: HWND) -> String {
+    if combo.is_null() {
+        return String::new();
+    }
+    // SAFETY: `combo` is our control; the buffer is NUL terminated by the call.
+    unsafe {
+        let length = GetWindowTextLengthW(combo);
+        let mut buffer = vec![0u16; (length + 1).max(1) as usize];
+        GetWindowTextW(combo, buffer.as_mut_ptr(), buffer.len() as i32);
+        let end = buffer
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..end])
+    }
+}
+
+/// Mirrors the formatting at the caret in the comboboxes. Called on
+/// `EN_SELCHANGE` and after every formatting command.
+pub fn sync_format(app: &mut App) {
+    if app.suppress_combo > 0 {
+        return;
+    }
+    let Some(editor) = app.active_editor() else {
+        return;
+    };
+    app.suppress_combo += 1;
+    let level = format::heading_level_at(editor);
+    if !app.style_combo.is_null() {
+        // SAFETY: plain combo message.
+        unsafe {
+            SendMessageW(
+                app.style_combo,
+                windows_sys::Win32::UI::WindowsAndMessaging::CB_SETCURSEL,
+                level.min(4),
+                0,
+            );
+        }
+    }
+    let current = editor::selection_format(editor);
+    if !app.font_combo.is_null() {
+        let name = if current.dw_mask & editor::CFM_FACE != 0 {
+            format::face_name(&current)
+        } else {
+            format::BODY_FONT.to_owned()
+        };
+        if !combo_select_text(app.font_combo, &name) {
+            combo_add(app.font_combo, &name);
+            combo_select_text(app.font_combo, &name);
+        }
+    }
+    if !app.size_combo.is_null() {
+        let points = if current.dw_mask & editor::CFM_SIZE != 0 {
+            (current.y_height + 10) / 20
+        } else {
+            11
+        };
+        let points = points.clamp(8, 72);
+        // SAFETY: plain combo message.
+        unsafe {
+            SendMessageW(
+                app.size_combo,
+                windows_sys::Win32::UI::WindowsAndMessaging::CB_SETCURSEL,
+                (points - 8) as usize,
+                0,
+            );
+        }
+    }
+    app.suppress_combo -= 1;
+}
+
+/// Mirrors `View > Word Wrap` in the toolbar button's checked state.
+pub fn sync_word_wrap(app: &mut App) {
     if app.toolbar.is_null() {
         return;
     }
-    // SAFETY: `toolbar` is a live toolbar window.
+    let state = TBSTATE_ENABLED | if app.word_wrap { TBSTATE_CHECKED } else { 0 };
+    // SAFETY: plain toolbar message on our own bar.
     unsafe {
-        SendMessageW(app.toolbar, TB_AUTOSIZE, 0, 0);
-        let mut rect: RECT = std::mem::zeroed();
-        if GetWindowRect(app.toolbar, &mut rect) != 0 {
-            let height = rect.bottom - rect.top;
-            app.toolbar_height = height.max(app.scale(28));
+        SendMessageW(
+            app.toolbar,
+            TB_SETSTATE,
+            IDM_VIEW_WORD_WRAP as usize,
+            state as isize,
+        );
+    }
+}
+
+/// Text currently shown by the style combobox (test hook and debugging).
+pub fn style_text(app: &mut App) -> String {
+    sync_format(app);
+    combo_text(app.style_combo)
+}
+
+/// Font name currently shown by the font combobox.
+pub fn font_text(app: &mut App) -> String {
+    sync_format(app);
+    combo_text(app.font_combo)
+}
+
+/// Font size currently shown by the size combobox.
+pub fn size_text(app: &mut App) -> String {
+    sync_format(app);
+    combo_text(app.size_combo)
+}
+
+/// Applies style `level` (0 = Normal, 1..=4 = Heading).
+pub fn apply_style(app: &mut App, level: usize) {
+    let Some(editor) = app.active_editor() else {
+        return;
+    };
+    format::heading(editor, level);
+    app.mark_dirty(editor);
+    // SAFETY: focusing our own editor.
+    unsafe {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor);
+    }
+    sync_format(app);
+}
+
+fn apply_face(app: &mut App, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    let Some(editor) = app.active_editor() else {
+        return;
+    };
+    let mut format = editor::CharFormat2W {
+        dw_mask: editor::CFM_FACE,
+        ..editor::CharFormat2W::default()
+    };
+    for (slot, unit) in format
+        .sz_face_name
+        .iter_mut()
+        .zip(name.encode_utf16().take(31))
+    {
+        *slot = unit;
+    }
+    editor::set_selection_format(editor, &format);
+    app.mark_dirty(editor);
+    // SAFETY: focusing our own editor.
+    unsafe {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor);
+    }
+    sync_format(app);
+}
+
+fn apply_size(app: &mut App, points: i32) {
+    let Some(editor) = app.active_editor() else {
+        return;
+    };
+    let format = editor::CharFormat2W {
+        dw_mask: editor::CFM_SIZE,
+        y_height: points.clamp(8, 72) * 20,
+        ..editor::CharFormat2W::default()
+    };
+    editor::set_selection_format(editor, &format);
+    app.mark_dirty(editor);
+    // SAFETY: focusing our own editor.
+    unsafe {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor);
+    }
+    sync_format(app);
+}
+
+/// `CBN_SELCHANGE` from one of the format comboboxes.
+pub fn on_combo(app: &mut App, combo: HWND) {
+    if app.suppress_combo > 0 {
+        return;
+    }
+    if combo == app.style_combo {
+        // SAFETY: plain combo message.
+        let index = unsafe {
+            SendMessageW(
+                app.style_combo,
+                windows_sys::Win32::UI::WindowsAndMessaging::CB_GETCURSEL,
+                0,
+                0,
+            )
+        };
+        if index >= 0 {
+            apply_style(app, index as usize);
         }
+    } else if combo == app.font_combo {
+        apply_face(app, &combo_text(app.font_combo));
+    } else if combo == app.size_combo {
+        if let Ok(points) = combo_text(app.size_combo).parse::<i32>() {
+            apply_size(app, points);
+        }
+    }
+}
+
+// -------------------------------------------------------------------- palettes
+
+/// Screen rectangle of a toolbar button (both bars are searched).
+fn button_rect(app: &App, command: u16) -> Option<RECT> {
+    for bar in [app.formatbar, app.toolbar] {
+        if bar.is_null() {
+            continue;
+        }
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        // SAFETY: `rect` is a valid out parameter; `bar` is ours.
+        let ok = unsafe {
+            SendMessageW(
+                bar,
+                TB_GETRECT,
+                command as usize,
+                &mut rect as *mut RECT as isize,
+            )
+        };
+        if ok == 0 {
+            continue;
+        }
+        let mut top_left = POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        let mut bottom_right = POINT {
+            x: rect.right,
+            y: rect.bottom,
+        };
+        // SAFETY: both points are valid; `bar` is alive.
+        unsafe {
+            ClientToScreen(bar, &mut top_left);
+            ClientToScreen(bar, &mut bottom_right);
+        }
+        return Some(RECT {
+            left: top_left.x,
+            top: top_left.y,
+            right: bottom_right.x,
+            bottom: bottom_right.y,
+        });
+    }
+    None
+}
+
+fn show_palette_at(app: &App, highlight: bool, colours: &[(&str, u32)]) -> Option<u16> {
+    // SAFETY: we create and destroy the popup in this function.
+    let menu: HMENU = unsafe { CreatePopupMenu() };
+    if menu.is_null() {
+        return None;
+    }
+    // SAFETY: `menu` is ours; labels are static strings.
+    unsafe {
+        for (index, (label, _)) in colours.iter().enumerate() {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                (PALETTE_BASE + index as u16) as usize,
+                win::wide(label).as_ptr(),
+            );
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            PALETTE_MORE as usize,
+            win::wide("More...").as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            PALETTE_NONE as usize,
+            win::wide("None").as_ptr(),
+        );
+    }
+
+    let command_id = if highlight {
+        IDM_TOOLBAR_HIGHLIGHT
+    } else {
+        IDM_TOOLBAR_COLOR
+    };
+    let point = button_rect(app, command_id)
+        .map(|rect| POINT {
+            x: rect.left,
+            y: rect.bottom + 2,
+        })
+        .unwrap_or_else(|| {
+            let mut cursor = POINT { x: 0, y: 0 };
+            // SAFETY: `cursor` is a valid out parameter.
+            unsafe {
+                GetCursorPos(&mut cursor);
+            }
+            cursor
+        });
+    // SAFETY: `menu` is our popup; `hwnd` is our frame window.
+    let command = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+            point.x,
+            point.y,
+            0,
+            app.hwnd,
+            ptr::null(),
+        )
+    } as u16;
+    // SAFETY: the popup is no longer needed.
+    unsafe {
+        DestroyMenu(menu);
+    }
+    if command == 0 {
+        None
+    } else {
+        Some(command)
+    }
+}
+
+/// Shows the text-colour or highlight palette (toolbar button or its arrow).
+pub fn show_palette(app: &mut App, highlight: bool) {
+    let Some(editor) = app.active_editor() else {
+        return;
+    };
+    let colours = if highlight {
+        &HIGHLIGHT_COLOURS[..]
+    } else {
+        &TEXT_COLOURS[..]
+    };
+    let Some(command) = show_palette_at(app, highlight, colours) else {
+        // SAFETY: focusing our own editor.
+        unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor);
+        }
+        return;
+    };
+    let index = command.wrapping_sub(PALETTE_BASE) as usize;
+    let mut changed = false;
+    if index < colours.len() {
+        let colour = colours[index].1;
+        if highlight {
+            format::set_highlight(editor, Some(colour));
+        } else {
+            format::set_text_color(editor, Some(colour));
+        }
+        changed = true;
+    } else if command == PALETTE_MORE {
+        if highlight {
+            format::choose_highlight_color(editor, app.hwnd);
+        } else {
+            format::choose_text_color(editor, app.hwnd);
+        }
+        changed = true;
+    } else if command == PALETTE_NONE {
+        if highlight {
+            format::set_highlight(editor, None);
+        } else {
+            format::set_text_color(editor, None);
+        }
+        changed = true;
+    }
+    if changed {
+        app.mark_dirty(editor);
+    }
+    // SAFETY: focusing our own editor.
+    unsafe {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor);
+    }
+    sync_format(app);
+}
+
+/// `TBN_DROPDOWN` from a palette button's arrow.
+///
+/// # Safety
+/// `lparam` must be the `NMTOOLBARW` pointer of a `TBN_DROPDOWN`.
+pub unsafe fn on_dropdown(app: &mut App, lparam: isize) {
+    let info = &*(lparam as *const windows_sys::Win32::UI::Controls::NMTOOLBARW);
+    let command = info.tbButton.idCommand as u16;
+    if command == IDM_TOOLBAR_COLOR {
+        show_palette(app, false);
+    } else if command == IDM_TOOLBAR_HIGHLIGHT {
+        show_palette(app, true);
     }
 }

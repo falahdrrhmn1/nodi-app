@@ -297,13 +297,14 @@ unsafe fn create_ui(app: &mut App) -> bool {
     app.sidebar_width = app.scale(240);
     app::recreate_fonts(app);
 
-    app.toolbar = toolbar::create(app);
+    toolbar::create(app);
     app.sidebar_title = tree::create_header(app);
     app.tree_view = tree::create(app);
     app.tabctrl = tabs::create(app);
     app.status = status::create(app);
 
     if app.toolbar.is_null()
+        || app.formatbar.is_null()
         || app.sidebar_title.is_null()
         || app.tree_view.is_null()
         || app.tabctrl.is_null()
@@ -384,12 +385,26 @@ pub fn layout(app: &mut App) {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
             ShowWindow(app.toolbar, SW_SHOW);
-            top = toolbar_height;
-        } else {
-            ShowWindow(
-                app.toolbar,
-                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+
+            let format_height = app.formatbar_height.max(app.scale(32));
+            SetWindowPos(
+                app.formatbar,
+                ptr::null_mut(),
+                0,
+                toolbar_height,
+                width,
+                format_height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            ShowWindow(app.formatbar, SW_SHOW);
+            toolbar::relayout(app);
+            top = toolbar_height + format_height;
+        } else {
+            for bar in [app.toolbar, app.formatbar] {
+                if !bar.is_null() {
+                    ShowWindow(bar, windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                }
+            }
         }
 
         let content_height = (bottom - top).max(0);
@@ -602,6 +617,10 @@ pub unsafe extern "system" fn wndproc(
                 }
                 if code == editor::EN_CHANGE_NOTIFY && app.tab_index(child).is_some() {
                     app::on_editor_change(app, child);
+                } else if code == windows_sys::Win32::UI::WindowsAndMessaging::CBN_SELCHANGE as u16
+                    && toolbar::is_format_combo(app, child)
+                {
+                    toolbar::on_combo(app, child);
                 } else if code == 0 || (code == 1 && child.is_null()) {
                     // 0 = menu / toolbar button, 1 = accelerator (shortcut).
                     menu::on_command(app, id);
@@ -683,10 +702,14 @@ pub unsafe extern "system" fn wndproc(
                     && app.tab_index(header.hwndFrom).is_some()
                 {
                     status::update_caret(app);
+                    toolbar::sync_format(app);
                 } else if header.code == link::EN_LINK && app.tab_index(header.hwndFrom).is_some() {
                     // SAFETY: Rich Edit sends an ENLINK for EN_LINK.
                     let info = &*(lparam as *const link::EnLink);
                     return LRESULT::from(link::on_link(app, info));
+                } else if header.code == windows_sys::Win32::UI::Controls::TBN_DROPDOWN {
+                    // SAFETY: a `TBN_DROPDOWN` carries an `NMTOOLBARW`.
+                    toolbar::on_dropdown(app, lparam);
                 } else if header.code == toolbar::TTN_GETDISPINFOW {
                     toolbar::tooltip(lparam);
                 }

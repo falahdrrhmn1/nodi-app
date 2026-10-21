@@ -12,7 +12,7 @@ use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR};
 
 use crate::app::App;
-use crate::wnd::{editkeys, editor, formula, image, link, menu, table, tree};
+use crate::wnd::{editkeys, editor, format, formula, image, link, menu, table, toolbar, tree};
 
 /// `dwData` of every test command ('NODT').
 pub const MAGIC: usize = 0x4E4F_4454;
@@ -183,6 +183,58 @@ fn run(app: &mut App, line: &str) -> String {
                 );
             }
             format!("{} {}", point.x, point.y)
+        }
+        ("tabpos", Some(window)) => {
+            // Client x of character `n` in pixels and in twips. A tab stop every
+            // 360 twips puts the first tab-indented character 360 twips in.
+            let index: usize = rest.trim().parse().unwrap_or(0);
+            let mut point = windows_sys::Win32::Foundation::POINTL { x: 0, y: 0 };
+            // SAFETY: `point` is a valid out parameter.
+            unsafe {
+                SendMessageW(
+                    window,
+                    0x00D6,
+                    &mut point as *mut _ as usize,
+                    index as isize,
+                );
+            }
+            let dpi = format::editor_dpi(window).max(1);
+            let twips = (point.x as i64 * 1440 / dpi as i64) as i32;
+            format!("px={} twips={twips}", point.x)
+        }
+        ("style", _) => toolbar::style_text(app),
+        ("style-set", _) => match rest.trim().parse::<usize>() {
+            Ok(level) if level <= 4 => {
+                toolbar::apply_style(app, level);
+                "ok".to_owned()
+            }
+            _ => "usage: style-set 0..4".to_owned(),
+        },
+        ("fontname", _) => toolbar::font_text(app),
+        ("fontsize", _) => toolbar::size_text(app),
+        ("trashitem", _) => tree::trash_label(app),
+        ("combos", _) => {
+            // Screen rects of the format combos: "WxH+X+Y" each, space separated.
+            let mut parts = Vec::new();
+            for combo in [app.style_combo, app.font_combo, app.size_combo] {
+                let mut rect = windows_sys::Win32::Foundation::RECT::default();
+                // SAFETY: `rect` is a valid out parameter; `combo` is ours.
+                let ok = unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(combo, &mut rect)
+                };
+                if ok == 0 {
+                    parts.push("none".to_owned());
+                } else {
+                    parts.push(format!(
+                        "{}x{}+{}+{}",
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        rect.left,
+                        rect.top
+                    ));
+                }
+            }
+            parts.join(" ")
         }
         ("sel", Some(window)) => {
             let (from, to) = editor::selection(window);

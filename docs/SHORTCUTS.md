@@ -37,6 +37,11 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 
 ## Formatting
 
+The format bar (below the main toolbar) has **style** (Normal, Heading 1–4),
+**font name** and **font size** (8–72 pt) lists that show the formatting at the
+caret, plus text colour and highlight palettes, the four alignments, lists and
+the insert commands.
+
 | Keys | Action |
 |---|---|
 | Ctrl+B / Ctrl+I / Ctrl+U | Bold / Italic / Underline |
@@ -45,8 +50,8 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 | Ctrl+Shift+C | Code block (keeps indentation, Tab inserts a tab) |
 | Ctrl+Shift+H | Highlight |
 | Ctrl+] / Ctrl+[ | Bigger / smaller text |
-| Ctrl+Alt+1 / 2 / 3 | Heading 1 / 2 / 3 (Enter after a heading continues with normal text) |
-| Ctrl+Alt+0 | Normal text |
+| Ctrl+Alt+1 / 2 / 3 / 4 | Heading 1 / 2 / 3 / 4 (Enter after a heading continues with normal text) |
+| Ctrl+Alt+0 | Normal text (also "Normal" in the style list) |
 | Ctrl+Shift+8 / Ctrl+Shift+7 | Bulleted / numbered list |
 | Ctrl+L / E / R / J | Align left / center / right / justify (also aligns pictures) |
 | Ctrl+Space | Clear character formatting |
@@ -61,6 +66,7 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 | Ctrl+Shift+T | Insert table |
 | Alt+= | Insert formula (LaTeX) |
 | Double-click a formula | Edit the formula |
+| Double-click a picture | Open Image > Size... |
 
 ## Search and view
 
@@ -77,7 +83,11 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 ## Mouse
 
 - Right-click a note in the tree: New Child/Sibling Note, Rename, Change Icon,
-  Duplicate, Move to Trash, Properties.
+  Duplicate, Move to Trash, Properties. Moving to the Trash asks first and
+  mentions how many sub-notes go with it.
+- **Trash (N)** sits at the bottom of the tree: click it (or press Enter) to
+  open the Trash; right-click it for Open Trash and Empty Trash... (files are
+  still kept in `data/recovery/`).
 - Drag a note onto another note to make it a child; drop on empty space to move
   it to the top level.
 - Right-click inside a note: clipboard commands plus picture (size, 25–100 %,

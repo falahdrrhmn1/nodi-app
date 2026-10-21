@@ -19,7 +19,7 @@ use crate::wnd::editor::{
     self, CharFormat2W, ParaFormat2, CFE_BOLD, CFE_ITALIC, CFE_STRIKEOUT, CFE_UNDERLINE, CFM_BOLD,
     CFM_FACE, CFM_ITALIC, CFM_SIZE, CFM_STRIKEOUT, CFM_UNDERLINE, PFM_ALIGNMENT, PFM_NUMBERING,
     PFM_NUMBERINGSTART, PFM_NUMBERINGSTYLE, PFM_NUMBERINGTAB, PFM_OFFSET, PFM_SPACEAFTER,
-    PFM_SPACEBEFORE, PFM_STARTINDENT,
+    PFM_SPACEBEFORE, PFM_STARTINDENT, PFM_TABSTOPS,
 };
 
 pub const BODY_FONT: &str = "Segoe UI";
@@ -27,8 +27,12 @@ pub const CODE_FONT: &str = "Consolas";
 /// Twips (1/20 pt).
 pub const BODY_SIZE: i32 = 220;
 const CODE_SIZE: i32 = 200;
-/// Heading sizes in twips for levels 1..=3.
-pub const HEADING_SIZES: [i32; 3] = [400, 320, 260];
+/// Heading sizes in twips for levels 1..=4.
+pub const HEADING_SIZES: [i32; 4] = [400, 320, 280, 250];
+/// Default tab stop for body text: half of Rich Edit's 720-twip (0.5") stop.
+pub const TAB_STOP_TWIPS: i32 = 360;
+/// A tab inside a code block lines up with four characters of the code font.
+pub const CODE_TAB_TWIPS: i32 = 480;
 
 const CFM_COLOR: u32 = 0x4000_0000;
 const CFE_AUTOCOLOR: u32 = 0x4000_0000;
@@ -90,7 +94,7 @@ fn on_paragraphs(editor: HWND, body: impl FnOnce(HWND)) {
     editor::set_selection(editor, from, to);
 }
 
-/// Heading level (1..=3) of the text at the caret, 0 for body text.
+/// Heading level (1..=4) of the text at the caret, 0 for body text.
 pub fn heading_level_at(editor: HWND) -> usize {
     let format = editor::selection_format(editor);
     if format.dw_mask & CFM_SIZE == 0 || format.dw_effects & CFE_BOLD == 0 {
@@ -102,11 +106,11 @@ pub fn heading_level_at(editor: HWND) -> usize {
         .map_or(0, |index| index + 1)
 }
 
-/// `level` 1..=3 makes a heading, 0 turns the paragraph back into body text.
+/// `level` 1..=4 makes a heading, 0 turns the paragraph back into body text.
 pub fn heading(editor: HWND, level: usize) {
     on_paragraphs(editor, |editor| {
         let (size, bold) = match level {
-            1..=3 => (HEADING_SIZES[level - 1], CFE_BOLD),
+            1..=4 => (HEADING_SIZES[level - 1], CFE_BOLD),
             _ => (BODY_SIZE, 0),
         };
         let mut format = CharFormat2W {
@@ -194,6 +198,40 @@ pub fn toggle_highlight(editor: HWND) {
     editor::set_selection_format(editor, &format);
 }
 
+/// Applies a text colour (`None` restores the automatic colour).
+pub fn set_text_color(editor: HWND, colour: Option<u32>) {
+    let format = CharFormat2W {
+        dw_mask: CFM_COLOR,
+        dw_effects: if colour.is_none() { CFE_AUTOCOLOR } else { 0 },
+        cr_text_color: colour.unwrap_or(0),
+        ..CharFormat2W::default()
+    };
+    editor::set_selection_format(editor, &format);
+}
+
+/// Applies a highlight colour (`None` removes the highlight).
+pub fn set_highlight(editor: HWND, colour: Option<u32>) {
+    let format = CharFormat2W {
+        dw_mask: CFM_BACKCOLOR,
+        dw_effects: if colour.is_none() {
+            CFE_AUTOBACKCOLOR
+        } else {
+            0
+        },
+        cr_back_color: colour.unwrap_or(0),
+        ..CharFormat2W::default()
+    };
+    editor::set_selection_format(editor, &format);
+}
+
+/// Asks for a custom highlight colour with the standard colour dialog.
+pub fn choose_highlight_color(editor: HWND, owner: HWND) {
+    let current = editor::selection_format(editor);
+    if let Some(colour) = choose_color(owner, current.cr_back_color) {
+        set_highlight(editor, Some(colour));
+    }
+}
+
 /// Removes character formatting (Word's Ctrl+Space).
 pub fn clear_formatting(editor: HWND) {
     let mut format = CharFormat2W {
@@ -248,25 +286,27 @@ pub fn step_font_size(editor: HWND, larger: bool) {
 
 /// Format > Text Color...
 pub fn choose_text_color(editor: HWND, owner: HWND) {
-    static mut CUSTOM: [u32; 16] = [0x00FF_FFFF; 16];
     let current = editor::selection_format(editor);
+    if let Some(colour) = choose_color(owner, current.cr_text_color) {
+        set_text_color(editor, Some(colour));
+    }
+}
+
+/// The standard colour dialog. Returns the picked `COLORREF`.
+fn choose_color(owner: HWND, initial: u32) -> Option<u32> {
+    static mut CUSTOM: [u32; 16] = [0x00FF_FFFF; 16];
     let mut dialog: CHOOSECOLORW = unsafe { std::mem::zeroed() };
     dialog.lStructSize = size_of::<CHOOSECOLORW>() as u32;
     dialog.hwndOwner = owner;
-    dialog.rgbResult = current.cr_text_color;
+    dialog.rgbResult = initial;
     // The UI thread is the only user of `CUSTOM`; the dialog is modal.
     dialog.lpCustColors = std::ptr::addr_of_mut!(CUSTOM) as *mut u32;
     dialog.Flags = CC_RGBINIT | CC_FULLOPEN;
     // SAFETY: `dialog` is fully initialised for the call.
     if unsafe { ChooseColorW(&mut dialog) } == 0 {
-        return;
+        return None;
     }
-    let format = CharFormat2W {
-        dw_mask: CFM_COLOR,
-        cr_text_color: dialog.rgbResult,
-        ..CharFormat2W::default()
-    };
-    editor::set_selection_format(editor, &format);
+    Some(dialog.rgbResult)
 }
 
 /// Format > Font... (the standard Windows font dialog).
@@ -340,25 +380,67 @@ pub fn choose_font(editor: HWND, owner: HWND) {
 /// with its device context's DPI, so that is the DPI used here too.
 pub fn full_width_twips(editor: HWND) -> i32 {
     let mut rect = unsafe { std::mem::zeroed() };
-    // SAFETY: `rect` is a valid out parameter; the DC is released right away.
-    let (ok, dpi) = unsafe {
-        let ok = GetClientRect(editor, &mut rect);
-        let dc = GetDC(editor);
-        let dpi = if dc.is_null() {
-            GetDpiForWindow(editor) as i32
-        } else {
-            let value = GetDeviceCaps(dc, LOGPIXELSX as i32);
-            ReleaseDC(editor, dc);
-            value
-        };
-        (ok, dpi)
-    };
-    let dpi = if dpi <= 0 { 96 } else { dpi };
+    // SAFETY: `rect` is a valid out parameter.
+    let ok = unsafe { GetClientRect(editor, &mut rect) };
+    let dpi = editor_dpi(editor);
     if ok == 0 || rect.right <= 0 {
         return 9000;
     }
     // Leave room for the margins and the vertical scrollbar.
     (win::mul_div(rect.right, 1440, dpi) - 900).clamp(3000, 20000)
+}
+
+/// DPI of the device context Rich Edit lays text out with (falls back to the
+/// window DPI when no DC is available).
+pub fn editor_dpi(editor: HWND) -> i32 {
+    // SAFETY: the DC is released right away.
+    let dpi = unsafe {
+        let dc = GetDC(editor);
+        if dc.is_null() {
+            GetDpiForWindow(editor) as i32
+        } else {
+            let value = GetDeviceCaps(dc, LOGPIXELSX as i32);
+            ReleaseDC(editor, dc);
+            value
+        }
+    };
+    if dpi <= 0 {
+        96
+    } else {
+        dpi
+    }
+}
+
+/// Every paragraph of the document gets [`TAB_STOP_TWIPS`] tab stops, so a tab
+/// is half as wide as Rich Edit's 0.5" default. New paragraphs inherit the
+/// paragraph format of the one they were split from.
+pub fn apply_document_tabs(editor: HWND) {
+    let (from, to) = editor::selection(editor);
+    editor::set_selection(editor, 0, -1);
+    set_tab_stops(editor, TAB_STOP_TWIPS);
+    editor::set_selection(editor, from, to);
+}
+
+/// Sets the tab stops of the selected paragraphs to `step` twips apart.
+pub fn set_tab_stops(editor: HWND, step: i32) {
+    let mut format = ParaFormat2 {
+        dw_mask: PFM_TABSTOPS,
+        c_tab_count: 32,
+        ..ParaFormat2::default()
+    };
+    for (index, tab) in format.rgx_tabs.iter_mut().enumerate() {
+        *tab = step * (index as i32 + 1);
+    }
+    editor::set_para_format(editor, &format);
+}
+
+/// RTF paragraph properties for the code-block tab stops (4 characters).
+pub fn code_tab_stops_rtf() -> String {
+    let mut out = String::new();
+    for step in 1..=12 {
+        out.push_str(&format!("\\tx{}", CODE_TAB_TWIPS * step));
+    }
+    out
 }
 
 /// Inserts plain text at the selection. Inside a table cell (a code block)
@@ -458,11 +540,12 @@ pub fn insert_code_block(editor: HWND) {
     let (br, bg, bb) = CODE_BLOCK_BACK;
     let (lr, lg, lb) = CODE_BLOCK_BORDER;
     let border = "\\brdrs\\brdrw10\\brdrcf2";
+    let tabs = code_tab_stops_rtf();
     let rtf = format!(
         "{{\\rtf1\\ansi\\uc1\\deff0{{\\fonttbl{{\\f0\\fnil {BODY_FONT};}}{{\\f1\\fmodern {CODE_FONT};}}}}\
          {{\\colortbl ;\\red{br}\\green{bg}\\blue{bb};\\red{lr}\\green{lg}\\blue{lb};}}\
          \\trowd\\trgaph144\\trleft0\\clcbpat1\\clbrdrt{border}\\clbrdrl{border}\\clbrdrb{border}\\clbrdrr{border}\\cellx{width}\
-         \\pard\\intbl\\f1\\fs20 {body}\\cell\\row}}",
+         \\pard\\intbl\\f1\\fs20{tabs} {body}\\cell\\row}}",
         width = full_width_twips(editor),
         body = rtf_escape(code.trim_end_matches('\r')),
     );

@@ -13,10 +13,11 @@ use windows_sys::Win32::UI::Controls::{
     NMTREEVIEWW, NMTVDISPINFOW, NMTVKEYDOWN, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET,
     TVHITTESTINFO, TVHT_ONITEM, TVIF_CHILDREN, TVIF_IMAGE, TVIF_SELECTEDIMAGE, TVIF_TEXT,
     TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM,
-    TVM_EDITLABELW, TVM_EXPAND, TVM_GETITEMRECT, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM,
-    TVM_SETIMAGELIST, TVM_SETITEMW, TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW,
-    TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS,
-    TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEWW,
+    TVM_EDITLABELW, TVM_EXPAND, TVM_GETEDITCONTROL, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM,
+    TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETIMAGELIST, TVM_SETITEMW, TVN_BEGINDRAGW,
+    TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW, TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVN_SELCHANGEDW,
+    TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    WC_TREEVIEWW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_APPS, VK_DELETE, VK_RETURN,
@@ -24,13 +25,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, ExtractIconExW, SHGetStockIconInfo, SetWindowSubclass, SHGSI_ICON,
     SHGSI_SMALLICON, SHSTOCKICONID, SHSTOCKICONINFO, SIID_APPLICATION, SIID_DOCASSOC,
-    SIID_DOCNOASSOC, SIID_FOLDER, SIID_HELP, SIID_INFO, SIID_SHIELD, SIID_SOFTWARE, SIID_WARNING,
+    SIID_DOCNOASSOC, SIID_FOLDER, SIID_HELP, SIID_INFO, SIID_RECYCLER, SIID_SHIELD, SIID_SOFTWARE,
+    SIID_WARNING,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyIcon, DestroyMenu, GetCursorPos,
-    SendMessageW, SetMenuDefaultItem, SetWindowTextW, TrackPopupMenu, HICON, HMENU, MF_SEPARATOR,
-    MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_MOUSEMOVE, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_VISIBLE,
+    PostMessageW, SendMessageW, SetMenuDefaultItem, SetWindowTextW, TrackPopupMenu, HICON, HMENU,
+    MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WS_CHILD, WS_EX_CLIENTEDGE, WS_VISIBLE,
 };
 
 use crate::app::App;
@@ -122,7 +124,8 @@ pub fn create_header(app: &App) -> HWND {
 /// attaches it to the tree. Every catalog entry always yields one image, so the
 /// indices stay stable even when a shell icon is unavailable.
 pub fn create_images(app: &mut App) {
-    let list = unsafe { ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, CATALOG.len() as i32, 4) };
+    let list =
+        unsafe { ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, CATALOG.len() as i32 + 1, 4) };
     if list == 0 {
         app.icon_keys = CATALOG.iter().map(|(key, _)| *key).collect();
         return;
@@ -151,6 +154,21 @@ pub fn create_images(app: &mut App) {
             DestroyIcon(fallback);
         }
     }
+
+    // One more image for the permanent "Trash (N)" pseudo-item.
+    let recycle = stock_icon(SIID_RECYCLER);
+    let trash_image = if recycle.is_null() {
+        0
+    } else {
+        // SAFETY: `list` is our image list and `recycle` a live icon.
+        let index = unsafe { ImageList_ReplaceIcon(list, -1, recycle) };
+        // SAFETY: the image list copied the icon.
+        unsafe {
+            DestroyIcon(recycle);
+        }
+        index.max(0)
+    };
+    app.trash_image = trash_image;
 
     app.icon_keys = CATALOG.iter().map(|(key, _)| *key).collect();
     app.images = list;
@@ -238,15 +256,90 @@ pub fn rebuild(app: &mut App) {
     }
     app.tree_items.clear();
     app.item_for.clear();
+    app.trash_item = 0;
 
     for info in child_infos(app, None) {
         insert_subtree(app, TVI_ROOT, info, 0);
     }
+    insert_trash_item(app);
 
     if let Some(id) = app.selected.clone() {
         select_item(app, &id);
     }
     app.suppress_select -= 1;
+}
+
+/// Adds the permanent "Trash (N)" pseudo-item at the bottom of the tree. It is
+/// not a note: it has no entry in `tree_items`, so every node command ignores
+/// it, and dragging it is impossible.
+fn insert_trash_item(app: &mut App) {
+    let count = app.trashed_roots().len();
+    let label = format!("Trash ({count})");
+    let mut text = win::wide(&label);
+    let item = TVITEMW {
+        mask: TVIF_TEXT | TVIF_IMAGE | TVIF_SELECTEDIMAGE,
+        hItem: 0,
+        state: 0,
+        stateMask: 0,
+        pszText: text.as_mut_ptr(),
+        cchTextMax: text.len() as i32,
+        iImage: app.trash_image,
+        iSelectedImage: app.trash_image,
+        cChildren: 0,
+        lParam: 0,
+    };
+    let insert = TVINSERTSTRUCTW {
+        hParent: TVI_ROOT,
+        hInsertAfter: TVI_LAST,
+        Anonymous: TVINSERTSTRUCTW_0 { item },
+    };
+    // SAFETY: `insert` and `text` live for the duration of the call.
+    let handle = unsafe {
+        SendMessageW(
+            app.tree_view,
+            TVM_INSERTITEMW,
+            0,
+            &insert as *const TVINSERTSTRUCTW as isize,
+        )
+    } as isize;
+    app.trash_item = handle;
+}
+
+/// Text of the permanent Trash pseudo-item (empty when it does not exist).
+pub fn trash_label(app: &App) -> String {
+    if app.trash_item == 0 || app.tree_view.is_null() {
+        return String::new();
+    }
+    let mut buffer = [0u16; 64];
+    let mut item = TVITEMW {
+        mask: TVIF_TEXT,
+        hItem: app.trash_item,
+        state: 0,
+        stateMask: 0,
+        pszText: buffer.as_mut_ptr(),
+        cchTextMax: buffer.len() as i32,
+        iImage: 0,
+        iSelectedImage: 0,
+        cChildren: 0,
+        lParam: 0,
+    };
+    // SAFETY: `item` and `buffer` outlive the call; `tree_view` is ours.
+    let ok = unsafe {
+        SendMessageW(
+            app.tree_view,
+            TVM_GETITEMW,
+            0,
+            &mut item as *mut TVITEMW as isize,
+        )
+    };
+    if ok == 0 {
+        return String::new();
+    }
+    let end = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
 }
 
 fn child_infos(app: &App, parent: Option<&NoteId>) -> Vec<Pending> {
@@ -464,10 +557,41 @@ pub fn begin_rename(app: &mut App) {
     let Some(item) = item_of(app, &id) else {
         return;
     };
+    if app.tree_view.is_null() {
+        return;
+    }
+    // `TVM_EDITLABELW` only starts the edit when the TreeView itself has the
+    // focus; without this the edit box appears but every keystroke goes to the
+    // tree (and beeps). Rename arrives from the context menu, F2 and the Notes
+    // menu, where focus was still on the editor.
     // SAFETY: `item` is a live item of our TreeView.
     unsafe {
+        SetFocus(app.tree_view);
         SendMessageW(app.tree_view, TVM_EDITLABELW, 0, item);
     }
+}
+
+/// The item handle under the caret (0 when the tree has no selection).
+fn caret_item(app: &App) -> isize {
+    if app.tree_view.is_null() {
+        return 0;
+    }
+    // SAFETY: `TVGN_CARET` only reads the tree's selection.
+    unsafe { SendMessageW(app.tree_view, TVM_GETNEXTITEM, TVGN_CARET as usize, 0) as isize }
+}
+
+/// True while a node title is being edited inline.
+fn label_edit_open(app: &App) -> bool {
+    if app.tree_view.is_null() {
+        return false;
+    }
+    // SAFETY: `TVM_GETEDITCONTROL` only reads the tree state.
+    unsafe { SendMessageW(app.tree_view, TVM_GETEDITCONTROL, 0, 0) != 0 }
+}
+
+/// True when the tree's caret sits on the "Trash (N)" pseudo-item.
+pub fn trash_focused(app: &App) -> bool {
+    app.trash_item != 0 && caret_item(app) == app.trash_item
 }
 
 // ------------------------------------------------------------------ hit test
@@ -485,7 +609,8 @@ fn is_note(app: &App, id: &NoteId) -> bool {
         .is_some_and(|node| node.kind == NodeKind::Note && !node.trashed)
 }
 
-fn hit_test(app: &App, client: POINT) -> Option<NoteId> {
+/// Raw item handle at `client` (0 when the point is not on an item).
+fn hit_item(app: &App, client: POINT) -> isize {
     let mut info = TVHITTESTINFO {
         pt: client,
         flags: 0,
@@ -501,10 +626,14 @@ fn hit_test(app: &App, client: POINT) -> Option<NoteId> {
         )
     } as isize;
     if item != 0 && info.flags & TVHT_ONITEM != 0 {
-        item_note(app, item)
+        item
     } else {
-        None
+        0
     }
+}
+
+fn hit_test(app: &App, client: POINT) -> Option<NoteId> {
+    item_note(app, hit_item(app, client))
 }
 
 // --------------------------------------------------------------- notifications
@@ -520,6 +649,26 @@ pub fn handle_notify(app: &mut App, header: &NMHDR) -> bool {
             let info = header as *const NMHDR as *const NMTREEVIEWW;
             // SAFETY: the TreeView sent an NMTREEVIEWW for this code.
             let (item, action) = unsafe { ((*info).itemNew.hItem, (*info).action) };
+            if app.trash_item != 0 && item == app.trash_item {
+                // The pseudo-item is not a note: nothing may be renamed,
+                // trashed or duplicated through it.
+                app.selected = None;
+                const TVC_BYMOUSE: u32 = 1;
+                if app.suppress_select == 0 && action == TVC_BYMOUSE {
+                    // Post instead of running the modal Trash window inside a
+                    // notification handler.
+                    // SAFETY: posting to our own frame window.
+                    unsafe {
+                        PostMessageW(
+                            app.hwnd,
+                            windows_sys::Win32::UI::WindowsAndMessaging::WM_COMMAND,
+                            menu::IDM_NOTES_TRASH_VIEW as usize,
+                            0,
+                        );
+                    }
+                }
+                return true;
+            }
             if let Some(id) = item_note(app, item) {
                 app.selected = Some(id.clone());
                 // A click opens the note; arrow keys only move the selection
@@ -571,15 +720,29 @@ pub fn handle_notify(app: &mut App, header: &NMHDR) -> bool {
             let key = unsafe { (*info).wVKey };
             match key {
                 VK_RETURN => {
-                    if let Some(id) = app.selected.clone() {
+                    if trash_focused(app) {
+                        // Enter on the pseudo-item opens the Trash window.
+                        // SAFETY: posting to our own frame window.
+                        unsafe {
+                            PostMessageW(
+                                app.hwnd,
+                                windows_sys::Win32::UI::WindowsAndMessaging::WM_COMMAND,
+                                menu::IDM_NOTES_TRASH_VIEW as usize,
+                                0,
+                            );
+                        }
+                    } else if let Some(id) = app.selected.clone() {
                         if is_note(app, &id) {
                             app.open_note(id);
                         }
                     }
                 }
                 VK_DELETE => {
-                    if let Some(id) = app.context_note.clone().or_else(|| app.selected.clone()) {
-                        app.trash_node(id);
+                    if !trash_focused(app) {
+                        if let Some(id) = app.context_note.clone().or_else(|| app.selected.clone())
+                        {
+                            app.trash_node(id);
+                        }
                     }
                 }
                 VK_APPS => show_context_menu(app, None),
@@ -711,7 +874,13 @@ pub fn show_context_menu(app: &mut App, screen: Option<POINT>) {
     if app.tree_view.is_null() {
         return;
     }
+    // While a title is being edited, a right-click must not pop up the menu
+    // for the empty area (the label edit owns the input).
+    if label_edit_open(app) {
+        return;
+    }
 
+    let mut on_trash = false;
     let target = match screen {
         Some(point) => {
             let mut client = point;
@@ -719,23 +888,35 @@ pub fn show_context_menu(app: &mut App, screen: Option<POINT>) {
             unsafe {
                 ScreenToClient(app.tree_view, &mut client);
             }
-            match hit_test(app, client) {
-                Some(id) => {
-                    select_item(app, &id);
-                    Some(id)
-                }
-                None => {
-                    app.selected = None;
-                    None
+            let item = hit_item(app, client);
+            if app.trash_item != 0 && item == app.trash_item {
+                on_trash = true;
+                app.selected = None;
+                None
+            } else {
+                match item_note(app, item) {
+                    Some(id) => {
+                        select_item(app, &id);
+                        Some(id)
+                    }
+                    None => {
+                        app.selected = None;
+                        None
+                    }
                 }
             }
         }
         None => {
-            let id = app.selected.clone();
-            if let Some(id) = &id {
-                select_item(app, id);
+            if trash_focused(app) {
+                on_trash = true;
+                None
+            } else {
+                let id = app.selected.clone();
+                if let Some(id) = &id {
+                    select_item(app, id);
+                }
+                id
             }
-            id
         }
     };
 
@@ -744,7 +925,11 @@ pub fn show_context_menu(app: &mut App, screen: Option<POINT>) {
         .unwrap_or(POINT { x: 0, y: 0 });
 
     app.context_note = target;
-    let menu = build_menu(app);
+    let menu = if on_trash {
+        build_trash_menu()
+    } else {
+        build_menu(app)
+    };
     if menu.is_null() {
         app.context_note = None;
         return;
@@ -769,6 +954,20 @@ pub fn show_context_menu(app: &mut App, screen: Option<POINT>) {
         crate::app::context_command(app, command as u16);
     } else {
         app.context_note = None;
+    }
+}
+
+fn build_trash_menu() -> HMENU {
+    // SAFETY: every call below creates/edits a menu we own.
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return menu;
+        }
+        append(menu, menu::IDM_NOTES_TRASH_VIEW, "Open Trash");
+        append(menu, menu::IDM_NOTES_TRASH_EMPTY, "Empty Trash...");
+        SetMenuDefaultItem(menu, menu::IDM_NOTES_TRASH_VIEW as u32, 0);
+        menu
     }
 }
 

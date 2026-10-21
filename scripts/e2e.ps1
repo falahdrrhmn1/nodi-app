@@ -40,6 +40,13 @@ public static class NodiHook {
     static extern int GetClassNameW(IntPtr hwnd, StringBuilder name, int max);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr dialog, int id);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int command);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint to, bool on);
+    [DllImport("user32.dll")] static extern void SwitchToThisWindow(IntPtr hwnd, bool altTab);
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
 
     /// Clicks button `id` of a dialog (BM_CLICK), like a user would.
     public static bool Click(IntPtr dialog, int id) {
@@ -60,6 +67,39 @@ public static class NodiHook {
         } finally {
             Marshal.FreeHGlobal(memory);
         }
+    }
+
+    /// Sends a test command from a background thread so the caller can keep
+    /// answering a modal dialog the command opens. Returns the worker thread.
+    public static System.Threading.Thread SendAsync(IntPtr hwnd, string command) {
+        System.Threading.Thread thread = new System.Threading.Thread(() => { Send(hwnd, command); });
+        thread.IsBackground = true;
+        thread.Start();
+        return thread;
+    }
+
+    /// Brings a window to the foreground from a PowerShell thread. The
+    /// `AttachThreadInput` dance is the usual workaround for the foreground
+    /// lock; the return value is checked by comparing `GetForegroundWindow`.
+    public static bool Foreground(IntPtr hwnd) {
+        ShowWindow(hwnd, 9); // SW_RESTORE
+        // The "Alt trick": a synthetic Alt press ends the foreground lock.
+        keybd_event(0x12, 0, 0, UIntPtr.Zero);
+        IntPtr existing = GetForegroundWindow();
+        uint existingPid;
+        uint existingThread = existing == IntPtr.Zero ? 0 : GetWindowThreadProcessId(existing, out existingPid);
+        uint current = GetCurrentThreadId();
+        bool attached = existingThread != 0 && existingThread != current &&
+            AttachThreadInput(current, existingThread, true);
+        SetForegroundWindow(hwnd);
+        if (attached) AttachThreadInput(current, existingThread, false);
+        keybd_event(0x12, 0, 2, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(100);
+        if (GetForegroundWindow() != hwnd) {
+            SwitchToThisWindow(hwnd, false);
+            System.Threading.Thread.Sleep(150);
+        }
+        return GetForegroundWindow() == hwnd;
     }
 
     /// First visible #32770 dialog owned by the process, or zero.
@@ -265,6 +305,11 @@ Test-Case 'E' 'write failure shows Save Failed, never Saved' {
 
 function Get-Units($nodi) { (Invoke-Nodi $nodi 'units') -split ' ' }
 function Count-Unit($nodi, [string]$hex) { @(Get-Units $nodi | Where-Object { $_ -eq $hex }).Count }
+
+function Get-TabTwips($nodi, [int]$index) {
+    $raw = Invoke-Nodi $nodi "tabpos $index"
+    return [int]([regex]::Match($raw, 'twips=(-?\d+)').Groups[1].Value)
+}
 
 Test-Case 'F' 'Enter keeps indentation, Tab/Shift+Tab indent lines' {
     $data = New-DataDir 'F'
@@ -479,6 +524,123 @@ Test-Case 'O' 'long session: switching tabs while typing loses nothing' {
     }
     Assert ($missing.Count -eq 0) "lost tokens: $($missing -join ', ')"
     '(60 edits across 3 tabs)'
+}
+
+Test-Case 'P' 'Heading 4 and Normal via the format bar and markdown' {
+    $data = New-DataDir 'P'
+    $nodi = Start-Nodi $data
+    $combos = (Invoke-Nodi $nodi 'combos') -split ' '
+    Assert ($combos.Count -eq 3 -and $combos -notcontains 'none') "format combos missing: $($combos -join ' ')"
+    Assert ($combos[0] -match '^(\d+)x' -and [int]$Matches[1] -ge 80) "style combo not placed: $($combos -join ' ')"
+    Invoke-Nodi $nodi 'type Judul empat' | Out-Null
+    Invoke-Nodi $nodi 'cmd 223' | Out-Null            # Format > Heading 4
+    Assert ((Invoke-Nodi $nodi 'style') -eq 'Heading 4') "style combo shows '$(Invoke-Nodi $nodi 'style')'"
+    Assert ((Invoke-Nodi $nodi 'fmt 0 5') -match 'size=250') "H4 size wrong: $(Invoke-Nodi $nodi 'fmt 0 5')"
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $heading = (Invoke-Nodi $nodi 'markdown') -replace "`0", ''
+    Assert ((Invoke-Nodi $nodi 'style') -eq 'Heading 4') 'H4 style not shown after restart'
+    Invoke-Nodi $nodi 'style-set 0' | Out-Null        # combobox -> Normal
+    Assert ((Invoke-Nodi $nodi 'style') -eq 'Normal') "Normal not shown: '$(Invoke-Nodi $nodi 'style')'"
+    $plain = (Invoke-Nodi $nodi 'markdown') -replace "`0", ''
+    Stop-Nodi $nodi
+    Assert ($heading.Trim() -eq '#### Judul empat') "H4 markdown wrong: len=$($heading.Length) hex=$([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($heading)))"
+    Assert ($plain.Trim() -eq 'Judul empat') "Normal markdown wrong:`n$plain"
+    "(combos $($combos -join ' '))"
+}
+
+Test-Case 'Q' 'tab stops are 360 twips (480 in code blocks)' {
+    $data = New-DataDir 'Q'
+    $nodi = Start-Nodi $data
+    # Measure the distance between two stops, so the control's left inset and
+    # the paragraph indent cancel out. Text "\t\tX": stop 1 at index 1, stop 2 at index 2.
+    Invoke-Nodi $nodi 'type \t\tX' | Out-Null
+    $first = (Get-TabTwips $nodi 2) - (Get-TabTwips $nodi 1)
+    Assert ($first -ge 330 -and $first -le 390) "tab step is $first twips, expected 360"
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null            # new note
+    Invoke-Nodi $nodi 'cmd 205' | Out-Null            # code block
+    Invoke-Nodi $nodi 'type \tY' | Out-Null
+    $units = Get-Units $nodi
+    $tabIndex = [Array]::LastIndexOf($units, '0009')
+    $code = (Get-TabTwips $nodi ($tabIndex + 1)) - (Get-TabTwips $nodi $tabIndex)
+    Assert ($code -ge 450 -and $code -le 510) "code tab step is $code twips (units=$($units -join ' '))"
+    Stop-Nodi $nodi
+    "(body $first twips, code $code twips)"
+}
+
+Test-Case 'S' 'Trash asks for confirmation, counts sub-notes, Empty Trash purges' {
+    $data = New-DataDir 'S'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Induk' | Out-Null
+    Invoke-Nodi $nodi 'cmd 172' | Out-Null            # child note
+    Invoke-Nodi $nodi 'rename-selected Anak' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'trashitem') -eq 'Trash (0)') "initial pseudo-item: '$(Invoke-Nodi $nodi 'trashitem')'"
+    Invoke-Nodi $nodi 'select-title Induk' | Out-Null
+    # The hook blocks while the confirmation runs, so send from a worker thread
+    # and answer the dialog from the main one.
+    [NodiHook]::SendAsync($nodi.Hwnd, 'cmd 178') | Out-Null
+    Assert (Close-Dialog $nodi 6) 'no confirmation before moving to the Trash'
+    Start-Sleep -Milliseconds 150
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.ElapsedMilliseconds -lt 3000 -and (Invoke-Nodi $nodi 'trashitem') -ne 'Trash (1)') {
+        Start-Sleep -Milliseconds 25
+    }
+    Assert ((Invoke-Nodi $nodi 'trashitem') -eq 'Trash (1)') "pseudo-item after trash: '$(Invoke-Nodi $nodi 'trashitem')'"
+    $trashed = (Read-Tree $data).nodes | Where-Object title -eq 'Induk'
+    Assert ($null -ne $trashed -and $trashed.trashed) 'Induk is not marked trashed in tree.json'
+    [NodiHook]::SendAsync($nodi.Hwnd, 'cmd 185') | Out-Null   # Empty Trash...
+    Assert (Close-Dialog $nodi 6) 'no confirmation before emptying the Trash'
+    Start-Sleep -Milliseconds 150
+    $watch.Restart()
+    while ($watch.ElapsedMilliseconds -lt 3000 -and (Invoke-Nodi $nodi 'trashitem') -ne 'Trash (0)') {
+        Start-Sleep -Milliseconds 25
+    }
+    Assert ((Invoke-Nodi $nodi 'trashitem') -eq 'Trash (0)') "pseudo-item after emptying: '$(Invoke-Nodi $nodi 'trashitem')'"
+    Stop-Nodi $nodi
+    $remaining = (Read-Tree $data).nodes | Where-Object title -in 'Induk', 'Anak'
+    Assert ($null -eq $remaining) 'purged notes are still in tree.json'
+    $recovered = @(Get-ChildItem "$data\recovery" -ErrorAction SilentlyContinue)
+    Assert ($recovered.Count -gt 0) 'nothing was moved to data/recovery'
+    ''
+}
+
+Test-Case 'R' 'real keyboard: foreground window, Ctrl+A/B, Ctrl+N, F2 rename' {
+    $data = New-DataDir 'R'
+    $nodi = Start-Nodi $data
+    if (-not [NodiHook]::Foreground($nodi.Hwnd)) {
+        Stop-Nodi $nodi
+        return 'NOT TESTED: nodi.exe could not be brought to the foreground'
+    }
+    Add-Type -AssemblyName System.Windows.Forms
+    Start-Sleep -Milliseconds 250
+    # Releasing Alt alone (the foreground trick) enters menu-bar mode, which
+    # would eat the next key as a mnemonic; Esc leaves it, as a user would.
+    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    Start-Sleep -Milliseconds 100
+    [System.Windows.Forms.SendKeys]::SendWait('Kunci asli')
+    Start-Sleep -Milliseconds 250
+    $text = Invoke-Nodi $nodi 'text'
+    Assert ($text.Contains('Kunci asli')) "real keys did not reach the editor: '$text'"
+    [System.Windows.Forms.SendKeys]::SendWait('^a')
+    Start-Sleep -Milliseconds 150
+    [System.Windows.Forms.SendKeys]::SendWait('^b')
+    Start-Sleep -Milliseconds 250
+    $bold = Invoke-Nodi $nodi 'fmt 0 5'
+    Assert ($bold -match 'bold=1') "Ctrl+B did not bold the selection: $bold"
+    [System.Windows.Forms.SendKeys]::SendWait('^n')
+    Start-Sleep -Milliseconds 300
+    $tabs = Invoke-Nodi $nodi 'tabs'
+    Assert (@($tabs -split "`n")[1].Split('|').Count -eq 2) "Ctrl+N did not open a second tab: $tabs"
+    [System.Windows.Forms.SendKeys]::SendWait('{F2}')
+    Start-Sleep -Milliseconds 400
+    [System.Windows.Forms.SendKeys]::SendWait('Renamed{ENTER}')
+    Start-Sleep -Milliseconds 300
+    Stop-Nodi $nodi
+    $renamed = @((Read-Tree $data).nodes | Where-Object title -eq 'Renamed')
+    Assert ($renamed.Count -eq 1) "F2 rename did not reach tree.json: $((Read-Tree $data).nodes | ForEach-Object title)"
+    ''
 }
 
 # --------------------------------------------------------------------- report

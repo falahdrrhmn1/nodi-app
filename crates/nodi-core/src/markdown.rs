@@ -569,7 +569,7 @@ impl Writer {
         for inline in &paragraph.inlines {
             match inline {
                 Inline::Text(text, format, _) if !text.trim().is_empty() => {
-                    if !format.bold || format.size < 26 {
+                    if !format.bold || format.size <= 22 {
                         return None;
                     }
                     sizes.push(format.size);
@@ -583,8 +583,10 @@ impl Writer {
             1
         } else if size >= 32 {
             2
-        } else {
+        } else if size >= 28 {
             3
+        } else {
+            4
         })
     }
 

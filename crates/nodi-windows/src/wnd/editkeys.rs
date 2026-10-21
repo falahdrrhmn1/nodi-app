@@ -87,13 +87,21 @@ unsafe extern "system" fn subclass(
             }
         }
         WM_LBUTTONDBLCLK => {
-            // Double-clicking a formula opens it for editing.
+            // Double-clicking a formula opens it for editing; a picture opens
+            // the Image Size dialog.
             let result = DefSubclassProc(hwnd, msg, wparam, lparam);
             if crate::wnd::formula::selected_latex(hwnd).is_some() {
                 PostMessageW(
                     frame as HWND,
                     WM_COMMAND,
                     usize::from(crate::wnd::menu::IDM_INSERT_FORMULA),
+                    0,
+                );
+            } else if crate::wnd::image::pick_picture(hwnd).is_some() {
+                PostMessageW(
+                    frame as HWND,
+                    WM_COMMAND,
+                    usize::from(crate::wnd::menu::IDM_IMAGE_SIZE),
                     0,
                 );
             }
