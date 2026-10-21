@@ -11,12 +11,12 @@ use windows_sys::Win32::UI::Controls::{
     ImageList_BeginDrag, ImageList_Create, ImageList_DragEnter, ImageList_DragLeave,
     ImageList_DragMove, ImageList_EndDrag, ImageList_ReplaceIcon, ILC_COLOR32, ILC_MASK, NMHDR,
     NMTREEVIEWW, NMTVDISPINFOW, NMTVKEYDOWN, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET,
-    TVHITTESTINFO, TVHT_ONITEM, TVIF_IMAGE, TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW,
-    TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_EDITLABELW,
-    TVM_EXPAND, TVM_GETITEMRECT, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETIMAGELIST,
-    TVM_SETITEMW, TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW, TVN_ITEMEXPANDEDW,
-    TVN_KEYDOWN, TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES,
-    TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEWW,
+    TVHITTESTINFO, TVHT_ONITEM, TVIF_CHILDREN, TVIF_IMAGE, TVIF_SELECTEDIMAGE, TVIF_TEXT,
+    TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM,
+    TVM_EDITLABELW, TVM_EXPAND, TVM_GETITEMRECT, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM,
+    TVM_SETIMAGELIST, TVM_SETITEMW, TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW,
+    TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS,
+    TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEWW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_APPS, VK_DELETE, VK_RETURN,
@@ -338,6 +338,52 @@ fn icon_index_for(app: &App, kind: NodeKind, icon: Option<&str>) -> i32 {
 
 fn item_of(app: &App, id: &NoteId) -> Option<isize> {
     app.item_for.get(id).copied()
+}
+
+/// Adds one freshly created node (a last child) without rebuilding the tree.
+/// Returns false when its parent has no item, so the caller rebuilds.
+pub fn add_node(app: &mut App, id: &NoteId) -> bool {
+    let Some(node) = app.tree.get(id) else {
+        return false;
+    };
+    let parent_item = match &node.parent {
+        Some(parent) => match item_of(app, parent) {
+            Some(item) => item,
+            None => return false,
+        },
+        None => TVI_ROOT,
+    };
+    let info = Pending {
+        id: id.clone(),
+        title: node.title.clone(),
+        kind: node.kind,
+        icon: node.icon.clone(),
+        has_children: false,
+    };
+    let handle = insert_item(app, parent_item, &info);
+    if handle == 0 {
+        return false;
+    }
+    if parent_item != TVI_ROOT {
+        // The parent now has children: give it its expand button.
+        let mut update = TVITEMW {
+            mask: TVIF_CHILDREN,
+            hItem: parent_item,
+            cChildren: 1,
+            ..TVITEMW::default()
+        };
+        // SAFETY: `update` lives for the call; `parent_item` is ours.
+        unsafe {
+            SendMessageW(
+                app.tree_view,
+                TVM_SETITEMW,
+                0,
+                &mut update as *mut TVITEMW as isize,
+            );
+        }
+    }
+    select_item(app, id);
+    true
 }
 
 /// Selects an item without letting the change open a note (programmatic).

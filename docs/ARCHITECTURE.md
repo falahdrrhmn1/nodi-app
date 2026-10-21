@@ -1,77 +1,118 @@
-# Nodi Mark III — Architecture (binding spec)
+# Nodi Mark III — Architecture
 
-Native Windows note app. Rust + Win32 + Rich Edit (`msftedit.dll`, class `RICHEDIT50W`).
-NO Electron/Tauri/WebView/HTML/JS/localhost/npm. Ever.
+Native Windows note app: **Rust + Win32 + Microsoft Rich Edit** (`msftedit.dll`,
+class `RICHEDIT50W`). No Electron, Tauri, WebView, HTML/JS, localhost or npm.
 
-## Toolchain
-- `stable-x86_64-pc-windows-gnu` (pinned in `rust-toolchain.toml`). MSVC is not installed on this machine.
-- `CARGO_HOME=E:\Software\Rust\cargo`, `RUSTUP_HOME=E:\Software\Rust\rustup`, target dir = `E:\nodi-app\mark-3\target`.
-- Commands: `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`, `cargo build --release`.
+## Crates
 
-## Workspace layout
 ```
-mark-3/
-  Cargo.toml                 # [workspace] members = crates/*
-  crates/nodi-core/          # pure Rust, NO windows-sys. Reusable for Android later.
-    src/lib.rs
-    src/id.rs                # NoteId: 128-bit random hex string (from time + counter + RtlGenRandom-free: use std hash of time/pid/counter). Never reused.
-    src/tree.rs              # Tree model: nodes, kinds, move/reorder, cycle prevention, trash/restore
-    src/storage.rs           # Data dir layout, atomic write, load/save tree + note content
-    src/autosave.rs          # Writer thread + request/result types (no Win32; result delivered via callback)
-    src/backup.rs            # Snapshots + retention + restore
-    src/search.rs            # Title search, text search over plain-text sidecars
-    src/links.rs             # nodi://note/<id> parse/format
-    src/markdown.rs          # (Phase 5) export
-  crates/nodi-windows/       # Win32 UI, binary name `nodi` (nodi.exe)
-    src/main.rs              # entry, #![windows_subsystem = "windows"]
-    src/app.rs               # App state (open tabs, active note, dirty flags)
-    src/wnd/mod.rs           # main window proc, layout, splitter
-    src/wnd/menu.rs          # menu bar + accelerators
-    src/wnd/toolbar.rs
-    src/wnd/tree.rs          # TreeView wrapper + context menus
-    src/wnd/tabs.rs          # Tab control wrapper
-    src/wnd/editor.rs        # Rich Edit wrapper: stream in/out RTF, formatting, EN_CHANGE
-    src/wnd/status.rs        # Status bar
-    src/wnd/dialogs.rs       # rename/insert-table/link/formula dialogs (DLGTEMPLATE in memory or simple popup windows)
-    src/win.rs               # small safe helpers: wide strings, HWND wrappers. unsafe kept tiny + `// SAFETY:` comments
-    build.rs / res/          # app icon + manifest (Common Controls v6, PerMonitorV2 DPI aware) via embedded .rc compiled with windres? -> use `embed-resource` only if windres from the GNU toolchain works; otherwise embed manifest via linker args.
-```
+crates/nodi-core      pure Rust, no Win32 — reusable for a future Android app
+  id.rs               NoteId (32 hex chars, never reused)
+  tree.rs             notes tree: folders and notes (notes may have children),
+                      move with cycle checks, sibling order, trash/restore/purge
+  storage.rs          data-dir layout, atomic writes, note/tree/session files,
+                      leftover recovery
+  autosave.rs         single writer thread: coalesces saves per note, reports
+                      results back (the UI shows Saved only after an Ok)
+  backup.rs           timestamped snapshots (never overwritten), prune, restore
+  search.rs           title search, full-text search over .txt sidecars
+  links.rs            nodi://note/<id> and nodi-math:<LaTeX> links
+  image.rs            PNG/JPEG/GIF/BMP header sniffing, clipboard DIB → BMP
+  rtf.rs              targeted RTF patches (picture size, picture blob)
+  markdown.rs         note RTF → Markdown (+ list of what could not be kept)
+  math/parse.rs       LaTeX subset → syntax tree (with error positions)
+  math/layout.rs      TeX-like box layout; font metrics injected via a trait
+  math/mod.rs         grey+alpha PNG encoder (miniz_oxide)
 
-## Dependencies (keep minimal)
-- `windows-sys` (UI crate only).
-- `serde` + `serde_json` allowed for metadata (core).
-- Nothing else without a written reason in `docs/DEPENDENCIES.md`.
-
-## Data layout (portable)
-Data dir resolution order: env `NODI_DATA_DIR` → `<exe_dir>\data`. Never AppData. Dev script sets `NODI_DATA_DIR=E:\nodi-app\mark-3\data`.
-```
-data/
-  tree.json            # all node metadata (id, kind, title, icon, parent, order, trashed, created, modified)
-  session.json         # open tabs, active tab, cursor/scroll per tab, window placement, sidebar width
-  notes/<id>.rtf       # note content (RTF from Rich Edit EM_STREAMOUT SF_RTF). Images/tables live inside RTF.
-  notes/<id>.txt       # plain-text sidecar for search (written in same save transaction)
-  notes/<id>.rtf.prev  # previous good version (1 generation)
-  attachments/<id>/    # source files kept for re-edit (e.g. formula source, original images)
-  backups/<yyyymmdd-hhmmss>/   # full snapshot copies, retention: keep last 20
-  logs/nodi.log        # append-only, small, rotate at 1 MB
+crates/nodi-windows   Win32 shell, binary nodi.exe
+  main.rs, app.rs     App state: tabs, save state machine, session, commands
+  testhook.rs         WM_COPYDATA remote control for scripts/e2e.ps1
+                      (only when NODI_TEST_HOOKS=1 at startup)
+  wnd/mod.rs          frame window, layout, splitter, message loop
+  wnd/menu.rs         menus, accelerators, SHORTCUTS list, command dispatch
+  wnd/toolbar.rs      toolbar + tooltips
+  wnd/tree.rs         Notes Explorer TreeView, icons, drag & drop, context menu
+  wnd/tabs.rs         tab control
+  wnd/status.rs       status bar (message | save state | Ln/Col | UTF-8 | mode)
+  wnd/editor.rs       Rich Edit wrapper (streams, raw text, formats, zoom…)
+  wnd/editkeys.rs     editor subclass: auto-indent, Tab/Shift+Tab, paste
+  wnd/format.rs       headings, lists, alignment, code, highlight, colour, font
+  wnd/table.rs        tables: insert, rows, columns
+  wnd/image.rs        pictures: insert, paste, resize, save
+  wnd/formula.rs      formula rendering (GDI, Cambria Math) and editing
+  wnd/link.rs         hyperlinks, link safety policy
+  wnd/find.rs         Find/Replace (common dialogs), search all notes
+  wnd/context.rs      right-click menu inside a note
+  wnd/form.rs         small DPI-aware modal form used by several dialogs
+  wnd/dialogs.rs      message boxes, icon picker, trash, note picker, file dialogs
+  wnd/clipboard.rs    clipboard writing
 ```
 
-## Save pipeline (data-loss is priority #1)
-1. EN_CHANGE → mark tab dirty, status `Modified`, (re)start debounce timer (SetTimer, 500 ms).
-2. Timer fires OR flush trigger (tab switch, note switch, close tab, WM_CLOSE, WM_QUERYENDSESSION/WM_ENDSESSION, Ctrl+S):
-   UI thread streams RTF + plain text out of Rich Edit (fast, in-memory), increments `seq`, sends `SaveRequest{id, seq, rtf, txt}` to the single writer thread (std mpsc). Status `Saving...`.
-3. Writer thread: write `<file>.tmp` → `sync_all()` → copy current to `.prev` → `std::fs::rename(tmp, file)` (MoveFileEx REPLACE_EXISTING) → result.
-4. Writer posts `WM_APP_SAVE_RESULT` (PostMessageW with boxed result) to main window. UI marks `Saved` ONLY if result Ok AND `seq` == latest seq for that note; else stays Modified/Saving. Error → `Save Failed` + MessageBox once per failure streak; content stays in memory; retry on next change or every 5 s.
-5. Shutdown flush: synchronous — send all pending, then wait on writer with timeout (5 s) before exiting. WM_ENDSESSION same.
-6. tree.json/session.json use the same atomic write path.
-7. Startup recovery: if `<id>.rtf` fails to load or is empty while `.prev` exists → offer `.prev`. Leftover `.tmp` files → keep as `recovered-<id>-<ts>.rtf` in `data/recovery/`, never silently delete.
+## Data (portable, never AppData)
 
-## UI (Notepad++-style, classic, light)
-Menu: File Edit Search View Insert Format Notes Tools Help. Toolbar (TB_ standard small icons/text). Left: TreeView (resizable splitter). Right: Tab control above one Rich Edit per open tab (hide/show on switch, preserves undo stack/caret). Bottom: status bar parts: `Ready` | save state | `Ln x, Col y` | `UTF-8` | `Rich Text`.
-Menu items that are not implemented must NOT be shown (or shown grayed with "(not yet)").
+Resolution: `NODI_DATA_DIR` → `<exe dir>\data`, except an exe in a Cargo
+`target\<profile>` folder uses `<workspace>\data` (so `cargo clean` cannot
+delete notes).
 
-## Rich features plan (Phase 4)
-- Images: `EM_INSERTIMAGE` (RICHEDIT_IMAGE_PARAMETERS, Win8+) from IStream (SHCreateMemStream). Persist via RTF `\pict`.
-- Tables: `EM_INSERTTABLE` (TABLEROWPARMS/TABLECELLPARMS). Row/col ops via EM_GETTABLEPARMS/EM_SETTABLEPARMS.
-- Links: CFE_LINK + `EM_SETTEXTEX` with RTF `{\field{\*\fldinst HYPERLINK "url"}{\fldrslt text}}`, EN_LINK handling. Internal = `nodi://note/<id>`.
-- Formula: research in Phase 4 (RichEdit math zones vs render-to-image with LaTeX source kept in attachments).
+```
+data/tree.json            node metadata
+data/session.json         open tabs, caret/scroll, window, sidebar, zoom, wrap
+data/notes/<id>.rtf       content (formatting, pictures, tables, links inside)
+data/notes/<id>.txt       plain-text sidecar for search
+data/notes/<id>.rtf.prev  previous good version
+data/backups/<ts>/        snapshots (daily at startup + Tools > Backup Now), keep 20
+data/recovery/            leftover .tmp files after a crash, purged notes
+```
+
+## Save pipeline (no data loss is priority #1)
+
+1. Typing → `Modified`, 500 ms debounce timer.
+2. Timer / tab switch / closing a tab / Ctrl+S / closing the app /
+   `WM_QUERYENDSESSION` → the UI thread streams RTF + plain text out of Rich
+   Edit (in memory) and hands them to the writer thread → `Saving...`.
+3. Writer: `<file>.tmp` → `sync_all` → old file copied to `.prev` → rename.
+4. The result is posted back; the tab shows `Saved` only when that exact save
+   succeeded. Failure → `Save Failed`, one message box per failure streak,
+   text stays in the editor, retry every 5 s.
+5. Closing flushes everything and waits for the writer; unsaved notes prompt
+   "Close anyway?". The session file and new-note files also go through the
+   writer, so the UI thread never waits for the disk.
+
+## Rich Edit findings that shaped the code
+
+- `richedit.h` uses `#pragma pack(4)`: `EDITSTREAM`, `GETTEXTEX`, `ENLINK`,
+  `TABLEROWPARMS` are declared `packed(4)`; natural alignment made
+  `EM_STREAMOUT` call a garbage pointer and hang.
+- `EM_GETTEXTRANGE` drops table delimiters (U+FFF9/U+FFFB/U+0007) and shifts
+  positions; `EM_GETTEXTEX` with `GT_RAWTEXT` keeps positions aligned.
+- Pictures report as U+FFFC in raw text and as a space in plain text.
+- Paragraph shading/borders are not rendered; table cell shading is — a code
+  block is therefore a one-cell grey, bordered Consolas table.
+- Enter is handled by Rich Edit on `WM_KEYDOWN` (the `WM_CHAR` CR is ignored);
+  Tab on `WM_CHAR`. Auto-indent hooks Enter at `WM_KEYDOWN`.
+- In a table cell, a tab inserted through `EM_REPLACESEL` acts like the Tab key
+  (next cell / new row); code blocks insert tabs as RTF `\tab`.
+- `EM_REPLACESEL("")` on a middle table row leaves a paragraph that splits the
+  table; `WM_CLEAR` deletes rows cleanly.
+- `EM_INSERTTABLE` leaves the caret after the table (not in the first cell).
+- Rich Edit re-encodes inserted pictures and drops custom PNG chunks and the
+  picture description on reload, but keeps hyperlink targets. Formulas are
+  therefore stored as a picture inside a `HYPERLINK "nodi-math:<LaTeX>"` field.
+- Without an OLE callback Rich Edit only pastes text/RTF; clipboard pictures
+  (PNG, DIB) are inserted by Nodi.
+
+## Markdown
+
+Visual editing is the source of truth. Markdown is generated on demand
+(View > Markdown Source, File > Export Note as Markdown) and never written back
+into the note, so nothing is lost silently. Features Markdown cannot express
+are listed in the export dialog. Markdown source *editing* (Markdown → RTF) is
+not implemented yet; the core keeps the conversion in `nodi-core` so it can be
+added (and reused on Android) later.
+
+## Android later
+
+`nodi-core` has no Windows code: tree, storage format, autosave writer,
+backups, search, links, formula parser/layout and the Markdown converter can
+be reused. An Android UI would need its own editor and an RTF subset reader or
+a migration of the content format.

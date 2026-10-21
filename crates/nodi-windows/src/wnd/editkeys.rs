@@ -14,7 +14,7 @@
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_INSERT, VK_MENU, VK_SHIFT,
+    GetKeyState, VK_CONTROL, VK_INSERT, VK_MENU, VK_RETURN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -60,15 +60,17 @@ unsafe extern "system" fn subclass(
             if ch == 0x16 && SWALLOW_SYN.with(|flag| flag.replace(false)) {
                 return 0;
             }
-            if ch == 0x0D && !ctrl && !alt && !shift && newline_keep_indent(hwnd) {
-                return 0;
-            }
+            // Enter is handled on WM_KEYDOWN (Rich Edit inserts the paragraph
+            // there and ignores the WM_CHAR CR); Tab arrives as WM_CHAR.
             if ch == 0x09 && !ctrl && !alt && tab_key(hwnd, shift) {
                 return 0;
             }
         }
         WM_KEYDOWN => {
             let key = wparam as u16;
+            if key == VK_RETURN && !ctrl && !alt && !shift && newline_keep_indent(hwnd) {
+                return 0;
+            }
             let paste =
                 (ctrl && !alt && key == u16::from(b'V')) || (shift && !ctrl && key == VK_INSERT);
             if paste {

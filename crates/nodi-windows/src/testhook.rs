@@ -9,7 +9,7 @@
 use std::mem::size_of;
 
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
-use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR};
 
 use crate::app::App;
 use crate::wnd::{editkeys, editor, formula, image, link, menu, table, tree};
@@ -255,15 +255,46 @@ fn run(app: &mut App, line: &str) -> String {
                     .markdown
             })
             .unwrap_or_default(),
+        // Enter / Tab go through the same WM_CHAR path as real keys (the
+        // editor subclass first, then Rich Edit's own handling).
         ("enter", Some(window)) => {
-            if !editkeys::newline_keep_indent(window) {
-                editor::replace_selection(window, "\r", true);
+            // The full sequence a real key press produces.
+            // SAFETY: keyboard messages to our own Rich Edit.
+            unsafe {
+                SendMessageW(window, 0x0100, 0x0D, 1); // WM_KEYDOWN VK_RETURN
+                SendMessageW(window, WM_CHAR, 0x0D, 1);
+                SendMessageW(window, 0x0101, 0x0D, 0xC000_0001u32 as isize); // WM_KEYUP
+            }
+            "ok".to_owned()
+        }
+        ("raw-key", Some(window)) => {
+            // raw-key down|char|both <code>: Rich Edit without the subclass.
+            let mut parts = rest.split_whitespace();
+            let mode = parts.next().unwrap_or("both");
+            let code: usize = parts
+                .next()
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(13);
+            // SAFETY: plain keyboard messages to our own Rich Edit, bypassing
+            // the subclass through DefSubclassProc's original window proc.
+            unsafe {
+                if mode != "char" {
+                    SendMessageW(window, 0x0100, code, 1); // WM_KEYDOWN
+                }
+                if mode != "down" {
+                    SendMessageW(window, WM_CHAR, code, 1);
+                }
+                if mode != "char" {
+                    SendMessageW(window, 0x0101, code, 0xC000_0001u32 as isize);
+                    // WM_KEYUP
+                }
             }
             "ok".to_owned()
         }
         ("tab", Some(window)) => {
-            if !editkeys::tab_key(window, false) {
-                crate::wnd::format::insert_text(window, "\t");
+            // SAFETY: a character message to our own Rich Edit.
+            unsafe {
+                SendMessageW(window, WM_CHAR, 0x09, 1);
             }
             "ok".to_owned()
         }

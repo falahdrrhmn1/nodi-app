@@ -1,3 +1,6 @@
+> **Archived agent report from the first build phase.** Current status, tests and
+> measurements: [docs/STATUS.md](../../docs/STATUS.md).
+
 # nodi-core — Phase 1a report
 
 Crate `crates/nodi-core` (lib, `version.workspace`, `edition.workspace`, v0.3.0).

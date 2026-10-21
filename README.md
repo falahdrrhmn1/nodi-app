@@ -7,6 +7,20 @@ Tampilan mengikuti Notepad++ (menu klasik, toolbar kecil, tab), sidebar pohon
 catatan mengikuti KeepNote (catatan boleh punya anak catatan), dan editornya
 WYSIWYG (Ctrl+B langsung tebal, bukan `**teks**`).
 
+## Fitur utama
+
+- Pohon catatan: folder, catatan bertingkat (catatan boleh punya anak), ikon,
+  drag & drop, Trash, cari judul, link antarcatatan yang tahan ganti nama.
+- Editor WYSIWYG: tebal/miring/garis bawah/coret, heading, daftar, rata,
+  font, warna, highlight, kode inline, **blok kode**, tabel sungguhan,
+  **gambar** (sisip, paste screenshot, resize, rata, simpan), **rumus LaTeX**
+  yang dirender rapi dan bisa diedit lagi (klik ganda).
+- Indentasi ala Notepad++: Enter mengikuti indent baris atas, Tab/Shift+Tab
+  untuk banyak baris sekaligus.
+- Autosave tanpa Save As, penulisan atomik, backup harian, pemulihan crash.
+- Cari/ganti di catatan, cari di semua catatan, ekspor Markdown.
+- Daftar shortcut lengkap: `docs/SHORTCUTS.md` atau **F1** di aplikasi.
+
 ## Menjalankan
 
 ### Cara biasa (portable)

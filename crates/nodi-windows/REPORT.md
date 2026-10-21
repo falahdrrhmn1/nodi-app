@@ -1,3 +1,6 @@
+> **Archived agent report from the first build phase.** Current status, tests and
+> measurements: [docs/STATUS.md](../../docs/STATUS.md).
+
 # nodi-windows — Phase 1b + Phase 2+3
 
 > The Phase 1b part (§1–§7) is the historical report of the first milestone: a

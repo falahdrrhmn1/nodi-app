@@ -489,6 +489,11 @@ impl Default for Session {
 }
 
 impl Session {
+    /// The `session.json` text (for the background writer).
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+
     /// Keeps the active tab index inside the tab list.
     pub fn clamp(&mut self) {
         if self.tabs.is_empty() {

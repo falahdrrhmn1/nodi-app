@@ -40,6 +40,9 @@ const DEBOUNCE_MS: u32 = 500;
 const RETRY_MS: u32 = 5000;
 /// Timer id used by the "retry failed saves" timer.
 pub const RETRY_TIMER: usize = usize::MAX - 1;
+/// Timer id of the debounced session save.
+pub const SESSION_TIMER: usize = usize::MAX - 2;
+const SESSION_DELAY_MS: u32 = 1500;
 /// Backups older than this are refreshed at startup.
 const BACKUP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -116,6 +119,8 @@ pub struct App {
     pub restored_window: bool,
 
     pub toolbar_height: i32,
+    /// New notes whose first (empty) file write is still queued.
+    pub pending_new: HashSet<NoteId>,
     /// View > Word Wrap, applied to every editor.
     pub word_wrap: bool,
     /// Zoom percentage applied to every editor.
@@ -166,6 +171,7 @@ impl App {
             splitter_drag: false,
             restored_window: false,
             toolbar_height: 0,
+            pending_new: HashSet::new(),
             word_wrap: true,
             zoom: 100,
             created: false,
@@ -497,12 +503,15 @@ impl App {
             .get(&id)
             .map(|node| node.title.clone())
             .unwrap_or_else(|| "Untitled".to_owned());
+        // A new note's empty file may still be queued: "Saving..." until the
+        // writer confirms it (seq 1).
+        let first_write_pending = self.pending_new.contains(&id);
         self.tabs.push(Tab {
             editor,
             note: id.clone(),
             title,
             dirty: false,
-            seq: 0,
+            seq: u64::from(first_write_pending),
             acked: 0,
             last_error: None,
             failure_streak: false,
@@ -773,6 +782,9 @@ impl App {
     pub fn on_save_result(&mut self, result: SaveResult) {
         match result.target {
             Target::Note(note) => {
+                // The first write may be coalesced with a later one, so any
+                // result for the note settles it.
+                self.pending_new.remove(&note);
                 let Some(index) = self.tab_index_for_note(&note) else {
                     return;
                 };
@@ -814,6 +826,10 @@ impl App {
 
     /// Timer callback: either a per-tab debounce or the 5 s retry.
     pub fn on_timer(&mut self, id: usize) {
+        if id == SESSION_TIMER {
+            self.write_session();
+            return;
+        }
         if id == RETRY_TIMER {
             let failing: Vec<usize> = (0..self.tabs.len())
                 .filter(|&index| self.tabs[index].last_error.is_some())
@@ -874,7 +890,7 @@ impl App {
     /// dropping unsaved content. Returns true when the app may close.
     pub fn maybe_close(&mut self) -> bool {
         self.flush_all();
-        self.save_session_now();
+        self.write_session();
         if let Some(writer) = &self.writer {
             let _ = writer.flush_blocking(Duration::from_secs(5));
         }
@@ -895,7 +911,7 @@ impl App {
     /// `WM_QUERYENDSESSION` / `WM_ENDSESSION`: best-effort synchronous flush.
     pub fn flush_for_session_end(&mut self) {
         self.flush_all();
-        self.save_session_now();
+        self.write_session();
         if let Some(writer) = &self.writer {
             let _ = writer.flush_blocking(Duration::from_secs(5));
         }
@@ -943,10 +959,32 @@ impl App {
         })
     }
 
-    /// Writes `session.json` synchronously (it is tiny).
+    /// Schedules a `session.json` save (debounced: tabs, caret and window
+    /// state change constantly). Closing writes it immediately.
     pub fn save_session_now(&self) {
-        if let Some(data) = &self.data {
-            let _ = data.save_session(&self.collect_session());
+        // SAFETY: our own window and a fixed timer id.
+        unsafe {
+            SetTimer(self.hwnd, SESSION_TIMER, SESSION_DELAY_MS, None);
+        }
+    }
+
+    /// Queues `session.json` on the writer thread right away (no disk I/O on
+    /// the UI thread).
+    pub fn write_session(&self) {
+        // SAFETY: our own window and a fixed timer id.
+        unsafe {
+            KillTimer(self.hwnd, SESSION_TIMER);
+        }
+        let session = self.collect_session();
+        match &self.writer {
+            Some(writer) => {
+                writer.submit(Job::SessionSave(session.to_json()));
+            }
+            None => {
+                if let Some(data) = &self.data {
+                    let _ = data.save_session(&session);
+                }
+            }
         }
     }
 
@@ -955,10 +993,16 @@ impl App {
     fn create_note_node(&mut self, kind: NodeKind, title: &str, parent: Option<NoteId>) -> NoteId {
         let id = self.tree.new_node(kind, title, parent);
         if kind == NodeKind::Note {
-            if let Some(data) = &self.data {
-                // A brand-new note gets an empty file at once, so an
-                // untouched tab is genuinely "Saved".
-                let _ = data.save_note(&id, b"", "");
+            // The empty file is written by the writer thread; the tab opened
+            // for the note shows "Saving..." until that write is confirmed.
+            if let Some(writer) = &self.writer {
+                writer.submit(Job::Note(SaveRequest {
+                    note: id.clone(),
+                    seq: 1,
+                    rtf: Vec::new(),
+                    txt: String::new(),
+                }));
+                self.pending_new.insert(id.clone());
             }
         }
         id
@@ -992,8 +1036,12 @@ impl App {
         let id = self.create_note_node(kind, title, parent.clone());
         self.tree_save();
         self.selected = Some(id.clone());
+        // Insert just the new item; rebuilding the whole tree made every new
+        // note slower than the last.
+        if !tree::add_node(self, &id) {
+            self.rebuild_tree();
+        }
         self.expand(parent);
-        self.rebuild_tree();
         if kind == NodeKind::Note {
             self.open_note(id);
         } else {

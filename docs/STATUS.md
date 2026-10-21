@@ -1,0 +1,126 @@
+# Nodi Mark III — Status
+
+Measured on the development laptop (Windows 11, 8 GB RAM, 125 % display
+scaling), release build, 2026-10-22.
+
+## Test results
+
+Automated end-to-end tests drive the real `nodi.exe` (`scripts/e2e.ps1`,
+throw-away data folders under `target\e2e`). Keys are sent as the same
+`WM_KEYDOWN`/`WM_CHAR` messages a keyboard produces; commands go through the
+same handlers as the menus.
+
+| Test (spec §16) | Scenario | Result |
+|---|---|---|
+| A — Quick notes | type, no Ctrl+S, wait for `Saved`, close, reopen | **PASS** (Saved ≈ 0.52 s after typing) |
+| B — Nested notes | A > B > C, rename B, restart, hierarchy intact | **PASS** |
+| C — Rich text | bold + italic ranges survive restart | **PASS** |
+| D — Image persistence | insert picture, resize to 50 %, restart | **PASS** (e2e G) |
+| E — Autosave failure | injected write failure → `Save Failed`, never `Saved`, nothing written | **PASS** |
+| F — Many notes | 150 notes created, restart, still responsive | **PASS** (150 notes in 6.3 s incl. test IPC; restart 2.2 s with 151 tabs) |
+| G — Markdown conversion | headings, lists, code blocks, tables, links, formulas exported; lossy features reported, note untouched | **PASS** (e2e H, I, J, K, L + unit tests) |
+| H — Long editing session | 60 edits across 3 tabs with tab switching; 1 MB note | **PASS** (e2e O + perf) |
+| extra — auto-indent | Enter keeps indent, Tab/Shift+Tab on selected lines | **PASS** (e2e F) |
+| extra — tables | insert, add/delete rows/columns, persist | **PASS** (e2e H) |
+| extra — code block | indentation kept, exports as fenced code | **PASS** (e2e I) |
+| extra — formulas | render, persist, LaTeX editable, `$…$` export, bad LaTeX rejected | **PASS** (e2e J) |
+| extra — links | internal + web links survive restart | **PASS** (e2e K) |
+
+Unit and integration tests: `cargo test` — 85 tests pass (nodi-core: tree,
+storage, autosave, backup, search, links, image, RTF, Markdown, LaTeX parser,
+math layout, PNG; nodi-windows: table structure, link parsing/safety).
+`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean.
+
+**NOT TESTED automatically:** physical mouse and keyboard input (the tests do
+not take over the real mouse/keyboard). Specifically still to be tried by hand:
+dragging a picture's resize handles, drag-and-drop of notes in the tree,
+right-click menus, the common dialogs (open/save/colour/font/find).
+
+## Measurements (release build)
+
+| Metric | Result |
+|---|---|
+| `nodi.exe` size | 800 KB (single file, no DLLs to ship) |
+| Startup to idle window | 117 ms best, ~150–370 ms typical |
+| RAM idle (one empty note) | 23.5 MB working set, 4.8 MB private |
+| RAM with 10 open notes (text + 640×360 picture + formula each) | 40.9 MB working set, 20.8 MB private |
+| Restart with those 10 tabs | ~0.3–0.4 s |
+| 1 MB note (12,500 lines): load into editor | 0.75 s |
+| Keystroke round trip in the 1 MB note | 7 ms average, 9 ms worst (includes test IPC) |
+| Autosave of the 1 MB note | `Saved` 0.55 s after the last key (0.5 s debounce included) |
+| RAM with the 1 MB note | 26.3 MB working set |
+| Restart with the 1 MB note open | ~1.05 s |
+
+Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
+
+## Features
+
+### Done
+- Native Win32 window: classic menus, toolbar with tooltips, Notes Explorer
+  tree, resizable sidebar, tabs, status bar, Per-Monitor DPI.
+- Notes tree: folders and notes, notes with child notes, context menus,
+  inline rename (F2), 8 built-in icons, duplicate, drag & drop (drop on empty
+  space → top level), Move Up/Down, Move to Top Level, Copy Internal Link,
+  Trash with restore and permanent delete (files moved to `recovery/`),
+  properties, Go to Note by title.
+- Editor: WYSIWYG rich text (bold, italic, underline, strikethrough, headings
+  1–3, bulleted/numbered lists, alignment, font, size, colour, highlight,
+  inline code, clear formatting), undo/redo, Unicode, zoom, word wrap,
+  duplicate line, go to line, date/time.
+- Notepad++-style indentation: Enter keeps indentation, Tab/Shift+Tab on
+  selections, Backspace removes a tab indent.
+- Code blocks: grey bordered box, Consolas, code-editor Enter/Tab.
+- Pictures: insert from file, paste screenshots/copied images, Rich Edit's
+  own resize handles, exact size dialog, 25/50/75/100 %, fit to width,
+  alignment, save as file. Stored inside the note (no external paths).
+- Tables: insert, add rows above/below, add columns left/right, delete rows
+  and columns. Real Rich Edit tables, not ASCII.
+- Links: web, local file, internal `nodi://note/<id>` (survive renames),
+  Ctrl+Click to follow, automatic URL detection, link safety policy (below).
+- Formulas: LaTeX dialog (Alt+=), rendered with a TeX-like layout in Cambria
+  Math: fractions, roots, scripts, ∑/∏/∫ with limits, `\left…\right`,
+  matrices, cases, accents, Greek, ℝ/ℕ/ℤ, operators. Editable again by
+  double-click; errors reported with the position.
+- Search: Find/Replace in the note, F3/Shift+F3, Search in All Notes.
+- Autosave with atomic writes, `.prev` generation, crash leftovers moved to
+  `recovery/`, honest status (`Modified` / `Saving...` / `Saved` /
+  `Save Failed`), retry, flush on tab switch / close / Windows shutdown.
+- Backups: daily snapshot at startup + Tools > Backup Now, 20 kept, never
+  overwritten; restore offered when `tree.json` is corrupt.
+- Session restore: open tabs, active tab, caret, scroll, window, sidebar,
+  expanded folders, zoom, word wrap.
+- Markdown: read-only Markdown view and export (`.md` + picture folder),
+  lossy features listed.
+- Portable build (`scripts/build.ps1` → `dist\Nodi`), data next to the exe.
+
+### Not done yet / limitations
+- **Markdown source editing** (typing Markdown that becomes rich text) is not
+  implemented. The Markdown view is read-only; the note itself stays the
+  source of truth.
+- Picture rotate/crop and editing in an external program are not implemented.
+- Dragging picture files from Explorer into a note is not implemented
+  (Insert > Image and paste work).
+- Custom icons from local files are not implemented (8 built-in icons).
+- No "Move to…" picker dialog (use drag & drop / Move Up/Down / Top Level).
+- No restore-from-backup menu yet (backups are plain folders in
+  `data\backups`; the app offers a restore only when `tree.json` is corrupt).
+- Formula evaluation (calculating results) is not implemented — rendering only.
+- Older small dialogs (icon picker, Trash, note picker) do not scale with DPI.
+- All tabs of the previous session are loaded at startup (150 tabs ≈ 2.2 s).
+- No installer (portable by design); no Android app yet (`nodi-core` is ready
+  to be reused).
+
+## Security notes
+- Links never run programs: `http(s)`/`mailto` open in the browser/mail
+  client; local files and network paths ask first and show the real target;
+  executables/scripts (`.exe`, `.bat`, `.ps1`, `.lnk`, …) are never started —
+  Nodi offers to show them in Explorer instead; other URL schemes are refused.
+  The status bar shows the real target of a link, not its display text.
+- The test remote control (`testhook.rs`) is only active when `nodi.exe` is
+  started with `NODI_TEST_HOOKS=1`.
+- No network access, no telemetry, no background processes.
+
+## Disk usage on C:
+Notes, backups, logs, the Rust toolchain (`E:\Software\Rust`, GNU target),
+the Cargo cache and build output (`E:\nodi-app\mark-3\target`) are all on E:.
+Windows itself (Rich Edit, fonts) lives on C: as always.
