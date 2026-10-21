@@ -28,7 +28,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::win;
-use crate::wnd::{dialogs, editor, menu, status, tabs, tree};
+use crate::wnd::form::{Field, Form};
+use crate::wnd::{clipboard, dialogs, editor, image, link, menu, status, table, tabs, tree};
 
 /// Custom message posted by the writer thread with a boxed [`SaveResult`].
 pub const WM_APP_SAVE_RESULT: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 1;
@@ -115,6 +116,10 @@ pub struct App {
     pub restored_window: bool,
 
     pub toolbar_height: i32,
+    /// View > Word Wrap, applied to every editor.
+    pub word_wrap: bool,
+    /// Zoom percentage applied to every editor.
+    pub zoom: i32,
     /// Set once `WM_CREATE` finished: from then on the window procedure owns
     /// the boxed `App` and frees it in `WM_NCDESTROY`.
     pub created: bool,
@@ -161,6 +166,8 @@ impl App {
             splitter_drag: false,
             restored_window: false,
             toolbar_height: 0,
+            word_wrap: true,
+            zoom: 100,
             created: false,
         }
     }
@@ -292,6 +299,9 @@ impl App {
             self.sidebar_width = session.sidebar_width;
         }
         self.expanded = session.expanded.iter().cloned().collect();
+        self.word_wrap = session.word_wrap;
+        self.zoom = session.zoom.clamp(25, 500);
+        menu::set_checked(self, menu::IDM_VIEW_WORD_WRAP, self.word_wrap);
         if let Some(rect) = session.window {
             self.apply_window_rect(rect);
         }
@@ -500,10 +510,11 @@ impl App {
         });
         let index = self.tabs.len() - 1;
         tabs::insert(self, index, &self.tabs[index].title);
-        self.selected = Some(id);
-        crate::wnd::layout(self);
+        self.selected = Some(id.clone());
         self.activate_tab_impl(index, false);
-        self.rebuild_tree();
+        // Selecting is enough; rebuilding the whole tree per opened note made
+        // restoring many tabs quadratic.
+        tree::select_item(self, &id);
     }
 
     /// Flushes the active tab (if needed) and switches to `index`.
@@ -519,21 +530,20 @@ impl App {
             self.flush_active();
         }
 
+        // Editors are created hidden; only the outgoing one needs hiding.
         // SAFETY: every handle came from `CreateWindowExW` and is still alive.
         unsafe {
-            for (position, tab) in self.tabs.iter().enumerate() {
-                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    tab.editor,
-                    if position == index {
-                        windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW
-                    } else {
-                        windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE
-                    },
-                );
+            use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
+            if let Some(previous) = self.active.filter(|previous| *previous != index) {
+                if let Some(tab) = self.tabs.get(previous) {
+                    ShowWindow(tab.editor, SW_HIDE);
+                }
             }
+            self.active = Some(index);
+            crate::wnd::layout(self);
+            ShowWindow(self.tabs[index].editor, SW_SHOW);
         }
 
-        self.active = Some(index);
         tabs::set_cur(self, index);
         status::update_caret(self);
         status::set_message(self, "Ready");
@@ -912,6 +922,8 @@ impl App {
             sidebar_width: self.sidebar_width,
             window: self.window_rect(),
             expanded,
+            word_wrap: self.word_wrap,
+            zoom: self.zoom,
         }
     }
 
@@ -1392,6 +1404,299 @@ pub fn open_selected(app: &mut App) {
     if let Some(id) = app.context_note.clone().or_else(|| app.selected.clone()) {
         app.open_note(id);
     }
+}
+
+impl App {
+    /// Notes > Move Up / Move Down (Alt+Up / Alt+Down).
+    pub fn move_selected(&mut self, delta: i32) {
+        let Some(id) = self.context_note.clone().or_else(|| self.selected.clone()) else {
+            return;
+        };
+        if self.tree.move_among_siblings(&id, delta) {
+            self.tree_save();
+            self.selected = Some(id);
+            self.rebuild_tree();
+        }
+    }
+
+    /// Notes > Move to Top Level.
+    pub fn move_selected_to_root(&mut self) {
+        let Some(id) = self.context_note.clone().or_else(|| self.selected.clone()) else {
+            return;
+        };
+        if self.tree.move_node(&id, None, usize::MAX).is_ok() {
+            self.tree_save();
+            self.selected = Some(id);
+            self.rebuild_tree();
+            status::set_message(self, "Moved to the top level");
+        }
+    }
+}
+
+/// Insert > Image...: file picker, then the picture goes in at the caret.
+pub fn insert_image_file(app: &mut App) {
+    let Some(editor) = app.active_editor() else {
+        status::set_message(app, "Open a note first");
+        return;
+    };
+    let Some((_, bytes)) = image::choose_file(app.hwnd) else {
+        return;
+    };
+    match image::insert_bytes(editor, &bytes) {
+        Ok(()) => app.mark_dirty(editor),
+        Err(message) => dialogs::error(app.hwnd, &message),
+    }
+    // SAFETY: focusing our own editor.
+    unsafe {
+        SetFocus(editor);
+    }
+}
+
+/// Insert > Table...
+pub fn insert_table(app: &mut App) {
+    let Some(editor) = app.active_editor() else {
+        status::set_message(app, "Open a note first");
+        return;
+    };
+    let Some(values) = Form::new("Insert Table")
+        .field(Field::new("Rows:", "3"))
+        .field(Field::new("Columns:", "3"))
+        .show(app.hwnd)
+    else {
+        return;
+    };
+    let rows = values[0].trim().parse::<usize>().unwrap_or(0);
+    let cols = values[1].trim().parse::<usize>().unwrap_or(0);
+    if rows == 0 || cols == 0 || cols > 63 {
+        dialogs::error(app.hwnd, "Enter at least 1 row and 1 to 63 columns.");
+        return;
+    }
+    match table::insert(editor, rows, cols) {
+        Ok(()) => app.mark_dirty(editor),
+        Err(message) => dialogs::error(app.hwnd, &message),
+    }
+    // SAFETY: focusing our own editor.
+    unsafe {
+        SetFocus(editor);
+    }
+}
+
+/// Edit > Go to Line... (lines = paragraphs, as in Notepad++ with wrapping).
+pub fn go_to_line(app: &mut App) {
+    let Some(editor) = app.active_editor() else {
+        return;
+    };
+    let total = editor::text_units(editor, 0, editor::text_length(editor))
+        .iter()
+        .filter(|unit| **unit == 0x000D)
+        .count()
+        + 1;
+    let Some(values) = Form::new("Go to Line")
+        .field(Field::new(&format!("Line (1-{total}):"), ""))
+        .show(app.hwnd)
+    else {
+        return;
+    };
+    let Ok(line) = values[0].trim().parse::<usize>() else {
+        return;
+    };
+    let units = editor::text_units(editor, 0, editor::text_length(editor));
+    let mut position = 0i32;
+    let mut current = 1usize;
+    for (index, unit) in units.iter().enumerate() {
+        if current >= line {
+            break;
+        }
+        if *unit == 0x000D {
+            current += 1;
+            position = index as i32 + 1;
+        }
+    }
+    editor::set_selection(editor, position, position);
+    editor::scroll_caret(editor);
+    // SAFETY: focusing our own editor.
+    unsafe {
+        SetFocus(editor);
+    }
+}
+
+/// View > Zoom In / Out (`Some(true)` / `Some(false)`) or reset (`None`).
+pub fn zoom(app: &mut App, larger: Option<bool>) {
+    const STEPS: [i32; 13] = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300];
+    let current = app
+        .active_editor()
+        .map(editor::zoom_percent)
+        .unwrap_or(app.zoom);
+    let next = match larger {
+        Some(true) => STEPS
+            .iter()
+            .copied()
+            .find(|step| *step > current)
+            .unwrap_or(300),
+        Some(false) => STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|step| *step < current)
+            .unwrap_or(50),
+        None => 100,
+    };
+    app.zoom = next;
+    for tab in &app.tabs {
+        editor::set_zoom_percent(tab.editor, next);
+    }
+    status::set_message(app, &format!("Zoom {next}%"));
+    app.save_session_now();
+}
+
+/// Notes > Copy Internal Link: puts a link to the note on the clipboard, as
+/// RTF (pastes as a clickable title) and as plain `nodi://note/<id>` text.
+pub fn copy_internal_link(app: &mut App) {
+    let Some(id) = app.context_note.clone().or_else(|| app.selected.clone()) else {
+        return;
+    };
+    let title = app
+        .tree
+        .get(&id)
+        .map(|node| node.title.clone())
+        .unwrap_or_default();
+    let url = nodi_core::links::format_note_link(&id);
+    let rtf = link::link_rtf(&title, &url);
+    if clipboard::set_text_and_rtf(app.hwnd, &url, &rtf) {
+        status::set_message(
+            app,
+            &format!("Link to \"{title}\" copied — paste it into a note"),
+        );
+    } else {
+        dialogs::error(app.hwnd, "The clipboard is busy; try again.");
+    }
+}
+
+/// Insert > Formula... (Alt+=).
+pub fn insert_formula(app: &mut App) {
+    crate::wnd::formula::insert_or_edit(app);
+}
+
+/// Markdown for the active note: (title, export). `None` without a note.
+fn active_markdown(app: &App, asset_dir: &str) -> Option<(String, nodi_core::markdown::Export)> {
+    let index = app.active?;
+    let tab = app.tabs.get(index)?;
+    let rtf = editor::stream_out_rtf(tab.editor)?;
+    let text = String::from_utf8_lossy(&rtf);
+    Some((
+        tab.title.clone(),
+        nodi_core::markdown::rtf_to_markdown(&text, asset_dir),
+    ))
+}
+
+fn lossy_note(lossy: &[String]) -> String {
+    if lossy.is_empty() {
+        "Everything in this note has a Markdown equivalent.".to_owned()
+    } else {
+        format!(
+            "Markdown cannot keep: {}. The note itself is unchanged.",
+            lossy.join(", ")
+        )
+    }
+}
+
+/// Characters Windows does not allow in file names.
+fn safe_file_name(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|ch| {
+            if r#"<>:"/\|?*"#.contains(ch) || ch.is_control() {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        "note".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// View > Markdown Source: a read-only copy of the note as Markdown.
+pub fn show_markdown(app: &mut App) {
+    let Some((title, export)) = active_markdown(app, "attachments") else {
+        status::set_message(app, "Open a note first");
+        return;
+    };
+    let _ = Form::new(&format!("Markdown — {title}"))
+        .note(&format!(
+            "Read-only preview: edits here are not saved. Use File > Export Note as Markdown to write a .md file.\n{}",
+            lossy_note(&export.lossy)
+        ))
+        .field(Field::multiline("Markdown:", export.markdown, 22))
+        .show(app.hwnd);
+}
+
+/// File > Export Note as Markdown...: writes `<name>.md` plus a
+/// `<name>_files` folder with the pictures. Never overwrites a picture folder.
+pub fn export_markdown(app: &mut App) {
+    let Some(index) = app.active else {
+        status::set_message(app, "Open a note first");
+        return;
+    };
+    let name = safe_file_name(&app.tabs[index].title);
+    let Some(path) = dialogs::save_file(app.hwnd, &format!("{name}.md"), "Markdown (*.md)", "md")
+    else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or(name);
+    let folder = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut asset_dir = format!("{stem}_files");
+    let mut attempt = 2;
+    while folder.join(&asset_dir).exists() {
+        asset_dir = format!("{stem}_files-{attempt}");
+        attempt += 1;
+    }
+    let Some((_, export)) = active_markdown(app, &asset_dir) else {
+        return;
+    };
+    let result = (|| -> std::io::Result<()> {
+        std::fs::write(&path, export.markdown.as_bytes())?;
+        if !export.assets.is_empty() {
+            let dir = folder.join(&asset_dir);
+            std::fs::create_dir_all(&dir)?;
+            for (file, bytes) in &export.assets {
+                std::fs::write(dir.join(file), bytes)?;
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => dialogs::info(
+            app.hwnd,
+            &format!(
+                "Exported to\n{}\n\n{}",
+                path.display(),
+                lossy_note(&export.lossy)
+            ),
+        ),
+        Err(err) => dialogs::error(app.hwnd, &format!("Export failed:\n{err}")),
+    }
+}
+
+/// Local date and time for Insert > Date and Time (F5).
+pub fn local_date_time() -> String {
+    let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // SAFETY: `now` is a valid out parameter.
+    unsafe {
+        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now);
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute
+    )
 }
 
 /// Runs a Notes/Search/Tools command that came from the tree context menu.

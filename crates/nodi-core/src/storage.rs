@@ -454,10 +454,24 @@ pub struct Session {
     /// Tree items the user expanded.
     #[serde(default)]
     pub expanded: Vec<NoteId>,
+    /// View > Word Wrap.
+    #[serde(default = "default_true")]
+    pub word_wrap: bool,
+    /// Editor zoom in percent.
+    #[serde(default = "default_zoom")]
+    pub zoom: i32,
 }
 
 fn default_sidebar_width() -> i32 {
     DEFAULT_SIDEBAR_WIDTH
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_zoom() -> i32 {
+    100
 }
 
 impl Default for Session {
@@ -468,6 +482,8 @@ impl Default for Session {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             window: None,
             expanded: Vec::new(),
+            word_wrap: true,
+            zoom: 100,
         }
     }
 }

@@ -11,8 +11,8 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Controls::EM_SETMARGINS;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    SendMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_NOHIDESEL, ES_WANTRETURN, WM_COPY, WM_CUT,
-    WM_PASTE, WS_CHILD, WS_TABSTOP, WS_VSCROLL,
+    SendMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NOHIDESEL, ES_WANTRETURN,
+    WM_COPY, WM_CUT, WM_PASTE, WS_CHILD, WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::app::App;
@@ -217,7 +217,8 @@ pub fn create(app: &App) -> Option<HWND> {
     let style = WS_CHILD
         | WS_TABSTOP
         | WS_VSCROLL
-        | (ES_MULTILINE | ES_AUTOVSCROLL | ES_NOHIDESEL | ES_WANTRETURN) as u32;
+        | WS_HSCROLL
+        | (ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL | ES_WANTRETURN) as u32;
 
     // SAFETY: `class` outlives the call; all handles belong to `app`.
     let window = unsafe {
@@ -262,6 +263,12 @@ pub fn create(app: &App) -> Option<HWND> {
             ((margin as isize) << 16) | margin as isize,
         );
         SendMessageW(window, EM_SETMODIFY, 0, 0);
+    }
+    crate::wnd::editkeys::install(window, app.hwnd);
+    crate::wnd::link::enable_auto_detect(window);
+    set_word_wrap(window, app.word_wrap);
+    if app.zoom != 100 {
+        set_zoom_percent(window, app.zoom);
     }
 
     Some(window)
@@ -325,6 +332,18 @@ pub fn load_rtf(editor: HWND, bytes: &[u8]) -> bool {
         clear(editor);
         return true;
     }
+    let ok = stream_in(editor, bytes, SF_RTF);
+
+    // SAFETY: the control is alive and owned by us.
+    unsafe {
+        SendMessageW(editor, EM_SETMODIFY, 0, 0);
+        SendMessageW(editor, EM_EMPTYUNDOBUFFER, 0, 0);
+    }
+    ok
+}
+
+/// `EM_STREAMIN` from a byte slice with the given `SF_*` flags.
+fn stream_in(editor: HWND, bytes: &[u8], flags: usize) -> bool {
     let mut reader = StreamReader {
         data: bytes.as_ptr(),
         len: bytes.len(),
@@ -342,22 +361,22 @@ pub fn load_rtf(editor: HWND, bytes: &[u8]) -> bool {
         SendMessageW(
             editor,
             EM_STREAMIN,
-            SF_RTF,
+            flags,
             &mut stream as *mut EditStream as isize,
         )
     };
-
-    // SAFETY: the control is alive and owned by us.
-    unsafe {
-        SendMessageW(editor, EM_SETMODIFY, 0, 0);
-        SendMessageW(editor, EM_EMPTYUNDOBUFFER, 0, 0);
-    }
-
-    inserted != 0 && stream.dw_error == 0
+    let error = stream.dw_error;
+    // An empty but well-formed document inserts zero characters.
+    error == 0 && (inserted != 0 || bytes.starts_with(b"{\\rtf"))
 }
 
 /// Streams the whole document out as RTF. `None` when Rich Edit failed.
 pub fn stream_out_rtf(editor: HWND) -> Option<Vec<u8>> {
+    stream_out(editor, SF_RTF)
+}
+
+/// `EM_STREAMOUT` into a byte vector with the given `SF_*` flags.
+fn stream_out(editor: HWND, flags: usize) -> Option<Vec<u8>> {
     let mut sink: Vec<u8> = Vec::new();
     let mut stream = EditStream {
         dw_cookie: &mut sink as *mut Vec<u8> as usize,
@@ -369,11 +388,12 @@ pub fn stream_out_rtf(editor: HWND) -> Option<Vec<u8>> {
         SendMessageW(
             editor,
             EM_STREAMOUT,
-            SF_RTF,
+            flags,
             &mut stream as *mut EditStream as isize,
         )
     };
-    if written != 0 && stream.dw_error == 0 {
+    let error = stream.dw_error;
+    if written != 0 && error == 0 {
         Some(sink)
     } else {
         None
@@ -433,12 +453,264 @@ pub fn selection_format(editor: HWND) -> CharFormat2W {
     format
 }
 
-/// Number of embedded objects (images, …): each one is a U+FFFC in the text.
-pub fn object_count(editor: HWND) -> usize {
-    plain_text(editor)
-        .chars()
-        .filter(|ch| *ch == '\u{FFFC}')
-        .count()
+/// Applies `format` (only the fields named in its `dw_mask`) to the selection.
+pub fn set_selection_format(editor: HWND, format: &CharFormat2W) {
+    let mut format = *format;
+    format.cb_size = size_of::<CharFormat2W>() as u32;
+    // SAFETY: `format` is a valid `CHARFORMAT2W` for the call.
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_SETCHARFORMAT,
+            SCF_SELECTION,
+            &format as *const CharFormat2W as isize,
+        );
+    }
+}
+
+/// `PARAFORMAT2` from `richedit.h` (188 bytes; every field is naturally
+/// aligned, so `pack(4)` changes nothing here).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ParaFormat2 {
+    pub cb_size: u32,
+    pub dw_mask: u32,
+    pub w_numbering: u16,
+    pub w_effects: u16,
+    pub dx_start_indent: i32,
+    pub dx_right_indent: i32,
+    pub dx_offset: i32,
+    pub w_alignment: u16,
+    pub c_tab_count: i16,
+    pub rgx_tabs: [i32; 32],
+    pub dy_space_before: i32,
+    pub dy_space_after: i32,
+    pub dy_line_spacing: i32,
+    pub s_style: i16,
+    pub b_line_spacing_rule: u8,
+    pub b_outline_level: u8,
+    pub w_shading_weight: u16,
+    pub w_shading_style: u16,
+    pub w_numbering_start: u16,
+    pub w_numbering_style: u16,
+    pub w_numbering_tab: u16,
+    pub w_border_space: u16,
+    pub w_border_width: u16,
+    pub w_borders: u16,
+}
+
+const _: () = assert!(size_of::<ParaFormat2>() == 188);
+
+impl Default for ParaFormat2 {
+    fn default() -> Self {
+        // SAFETY: all-zero is a valid `PARAFORMAT2`; callers set the mask.
+        let mut format: Self = unsafe { std::mem::zeroed() };
+        format.cb_size = size_of::<Self>() as u32;
+        format
+    }
+}
+
+pub const EM_GETPARAFORMAT: u32 = WM_USER + 61;
+pub const EM_SETPARAFORMAT: u32 = WM_USER + 71;
+pub const PFM_STARTINDENT: u32 = 0x0000_0001;
+pub const PFM_OFFSET: u32 = 0x0000_0004;
+pub const PFM_ALIGNMENT: u32 = 0x0000_0008;
+pub const PFM_NUMBERING: u32 = 0x0000_0020;
+pub const PFM_SPACEBEFORE: u32 = 0x0000_0040;
+pub const PFM_SPACEAFTER: u32 = 0x0000_0080;
+pub const PFM_NUMBERINGSTYLE: u32 = 0x0000_2000;
+pub const PFM_NUMBERINGTAB: u32 = 0x0000_4000;
+pub const PFM_NUMBERINGSTART: u32 = 0x0000_8000;
+/// `wEffects` bit for "paragraph is inside a table row".
+pub const PFE_TABLE: u16 = 0x4000;
+
+/// Paragraph format at the selection.
+pub fn para_format(editor: HWND) -> ParaFormat2 {
+    let mut format = ParaFormat2::default();
+    // SAFETY: `format` is a valid `PARAFORMAT2` for the call.
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_GETPARAFORMAT,
+            0,
+            &mut format as *mut ParaFormat2 as isize,
+        );
+    }
+    format
+}
+
+/// Applies the fields named in `format.dw_mask` to the selected paragraphs.
+pub fn set_para_format(editor: HWND, format: &ParaFormat2) {
+    let mut format = *format;
+    format.cb_size = size_of::<ParaFormat2>() as u32;
+    // SAFETY: `format` is a valid `PARAFORMAT2` for the call.
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_SETPARAFORMAT,
+            0,
+            &format as *const ParaFormat2 as isize,
+        );
+    }
+}
+
+/// True inside a table cell or a bulleted/numbered paragraph, where Enter and
+/// Tab keep their native Rich Edit meaning.
+pub fn in_table_or_list(editor: HWND) -> bool {
+    let format = para_format(editor);
+    format.w_effects & PFE_TABLE != 0 || format.w_numbering != 0
+}
+
+pub fn in_table(editor: HWND) -> bool {
+    para_format(editor).w_effects & PFE_TABLE != 0
+}
+
+const EM_GETTEXTLENGTHEX: u32 = WM_USER + 95;
+const EM_REPLACESEL: u32 = 0x00C2;
+/// `GETTEXTEX.flags`: text exactly as stored, including table delimiters
+/// (U+FFF9/U+FFFB/U+0007) and object markers (U+FFFC), so indexes match
+/// Rich Edit character positions. `EM_GETTEXTRANGE` drops the table marks
+/// and shifts every position after a table.
+const GT_RAWTEXT: u32 = 4;
+
+/// Whole document as stored in memory (see [`GT_RAWTEXT`]).
+pub fn raw_text(editor: HWND) -> Vec<u16> {
+    #[repr(C)]
+    struct GetTextLengthEx {
+        flags: u32,
+        codepage: u32,
+    }
+    const GTL_PRECISE: u32 = 2;
+    const GTL_NUMCHARS: u32 = 8;
+    let request = GetTextLengthEx {
+        flags: GTL_PRECISE | GTL_NUMCHARS,
+        codepage: CP_UTF16,
+    };
+    // SAFETY: `request` is valid for the call.
+    let estimate = unsafe {
+        SendMessageW(
+            editor,
+            EM_GETTEXTLENGTHEX,
+            &request as *const GetTextLengthEx as usize,
+            0,
+        )
+    }
+    .max(0) as usize;
+    // Raw text can be longer than the plain length (table marks): grow until
+    // the whole story fits.
+    let mut capacity = estimate * 2 + 64;
+    loop {
+        let mut buffer = vec![0u16; capacity];
+        let mut query = GetTextEx {
+            cb: (capacity * 2) as u32,
+            flags: GT_RAWTEXT,
+            codepage: CP_UTF16,
+            lp_default_char: ptr::null(),
+            lp_used_def_char: ptr::null_mut(),
+        };
+        // SAFETY: the buffer holds `capacity` UTF-16 units.
+        let copied = unsafe {
+            SendMessageW(
+                editor,
+                EM_GETTEXTEX,
+                &mut query as *mut GetTextEx as usize,
+                buffer.as_mut_ptr() as isize,
+            )
+        }
+        .max(0) as usize;
+        if copied + 1 < capacity || capacity > 64 * 1024 * 1024 {
+            buffer.truncate(copied);
+            return buffer;
+        }
+        capacity *= 2;
+    }
+}
+
+/// Number of characters in the document (paragraph marks count as one).
+pub fn text_length(editor: HWND) -> i32 {
+    raw_text(editor).len() as i32
+}
+
+/// UTF-16 text of `[from, to)` with positions that match the selection.
+pub fn text_units(editor: HWND, from: i32, to: i32) -> Vec<u16> {
+    let raw = raw_text(editor);
+    let from = from.clamp(0, raw.len() as i32) as usize;
+    let to = to.clamp(0, raw.len() as i32) as usize;
+    if to <= from {
+        return Vec::new();
+    }
+    raw[from..to].to_vec()
+}
+
+pub fn text_range(editor: HWND, from: i32, to: i32) -> String {
+    String::from_utf16_lossy(&text_units(editor, from, to))
+}
+
+/// Start of the paragraph that contains `pos`.
+pub fn paragraph_start(editor: HWND, pos: i32) -> i32 {
+    let raw = raw_text(editor);
+    let end = (pos.max(0) as usize).min(raw.len());
+    raw[..end]
+        .iter()
+        .rposition(|unit| is_paragraph_break(*unit))
+        .map_or(0, |index| index as i32 + 1)
+}
+
+/// Position of the paragraph mark that ends the paragraph containing `pos`
+/// (or the document length when there is none).
+pub fn paragraph_end(editor: HWND, pos: i32) -> i32 {
+    let raw = raw_text(editor);
+    let start = (pos.max(0) as usize).min(raw.len());
+    raw[start..]
+        .iter()
+        .position(|unit| is_paragraph_break(*unit))
+        .map_or(raw.len() as i32, |index| (start + index) as i32)
+}
+
+/// `\r`, the table cell mark and the table row delimiters all end a paragraph.
+fn is_paragraph_break(unit: u16) -> bool {
+    matches!(unit, 0x000D | 0x0007 | 0xFFF9 | 0xFFFB)
+}
+
+/// Replaces the selection with plain text (inherits the formatting at the
+/// selection). `undoable` adds the change to the undo stack.
+pub fn replace_selection(editor: HWND, text: &str, undoable: bool) {
+    let wide = win::wide(text);
+    // SAFETY: `wide` is NUL terminated and outlives the call.
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_REPLACESEL,
+            usize::from(undoable),
+            wide.as_ptr() as isize,
+        );
+    }
+}
+
+/// `SFF_SELECTION`: stream only the selection.
+const SFF_SELECTION: usize = 0x8000;
+
+/// RTF of the current selection.
+pub fn selection_rtf(editor: HWND) -> Option<Vec<u8>> {
+    stream_out(editor, SF_RTF | SFF_SELECTION)
+}
+
+/// Replaces the selection with RTF (keeps formatting, pictures, fields).
+pub fn insert_rtf(editor: HWND, rtf: &[u8]) -> bool {
+    stream_in(editor, rtf, SF_RTF | SFF_SELECTION)
+}
+
+/// Number of pictures in the document. Rich Edit reports a picture as a plain
+/// space in its text, so they are counted in the RTF instead.
+pub fn picture_count(editor: HWND) -> usize {
+    stream_out_rtf(editor)
+        .map(|rtf| count_pictures(&rtf))
+        .unwrap_or(0)
+}
+
+/// Number of `{\pict` groups in an RTF byte string.
+pub fn count_pictures(rtf: &[u8]) -> usize {
+    rtf.windows(5).filter(|window| window == b"\\pict").count()
 }
 
 /// Current selection as `(from, to)` character offsets.
@@ -465,6 +737,14 @@ pub fn set_selection(editor: HWND, from: i32, to: i32) {
     // SAFETY: `range` is a valid `CHARRANGE` for the call.
     unsafe {
         SendMessageW(editor, EM_EXSETSEL, 0, &range as *const CharRange as isize);
+    }
+}
+
+/// Scrolls the caret into view.
+pub fn scroll_caret(editor: HWND) {
+    // SAFETY: standard edit message on our control.
+    unsafe {
+        SendMessageW(editor, 0x00B7, 0, 0); // EM_SCROLLCARET
     }
 }
 
@@ -531,7 +811,17 @@ pub fn command(app: &mut App, id: u16) {
                 SendMessageW(editor, WM_COPY, 0, 0);
             }
             menu::IDM_EDIT_PASTE => {
+                // Goes through the subclass, which also handles pictures.
                 SendMessageW(editor, WM_PASTE, 0, 0);
+            }
+            menu::IDM_EDIT_PASTE_PLAIN => {
+                if let Some(text) = crate::wnd::image::clipboard_text(app.hwnd) {
+                    replace_selection(
+                        editor,
+                        &text.replace("\r\n", "\r").replace('\n', "\r"),
+                        true,
+                    );
+                }
             }
             menu::IDM_EDIT_SELECT_ALL => {
                 let range = CharRange {
@@ -548,6 +838,78 @@ pub fn command(app: &mut App, id: u16) {
     status::update_caret(app);
     if let Some(index) = app.active {
         app.refresh_tab_ui(index);
+    }
+}
+
+/// Edit > Duplicate Line (Ctrl+D): copies the current paragraph, formatting
+/// included, below itself. With a selection, duplicates the selection.
+pub fn duplicate_line(editor: HWND) {
+    let (from, to) = selection(editor);
+    if from != to {
+        if let Some(rtf) = selection_rtf(editor) {
+            set_selection(editor, to, to);
+            insert_rtf(editor, &rtf);
+            set_selection(editor, to, to + (to - from));
+        }
+        return;
+    }
+    let start = paragraph_start(editor, from);
+    let end = paragraph_end(editor, from);
+    let rtf = if end > start {
+        set_selection(editor, start, end);
+        selection_rtf(editor)
+    } else {
+        None
+    };
+    set_selection(editor, end, end);
+    replace_selection(editor, "\r", true);
+    if let Some(rtf) = rtf {
+        insert_rtf(editor, &rtf);
+    }
+    let caret = end + 1 + (from - start);
+    set_selection(editor, caret, caret);
+}
+
+const EM_SETTARGETDEVICE: u32 = WM_USER + 72;
+const EM_GETZOOM: u32 = WM_USER + 224;
+const EM_SETZOOM: u32 = WM_USER + 225;
+
+/// View > Word Wrap. Off means long lines scroll horizontally (handy for code).
+pub fn set_word_wrap(editor: HWND, wrap: bool) {
+    // SAFETY: plain message to our Rich Edit (no target DC).
+    unsafe {
+        SendMessageW(editor, EM_SETTARGETDEVICE, 0, isize::from(!wrap));
+    }
+}
+
+/// Current zoom as a percentage (100 = normal).
+pub fn zoom_percent(editor: HWND) -> i32 {
+    let (mut numerator, mut denominator) = (0i32, 0i32);
+    // SAFETY: both out parameters live on the stack.
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_GETZOOM,
+            &mut numerator as *mut i32 as usize,
+            &mut denominator as *mut i32 as isize,
+        );
+    }
+    if numerator <= 0 || denominator <= 0 {
+        100
+    } else {
+        numerator * 100 / denominator
+    }
+}
+
+pub fn set_zoom_percent(editor: HWND, percent: i32) {
+    let percent = percent.clamp(25, 500);
+    // SAFETY: plain message to our Rich Edit; 0/0 resets the zoom.
+    unsafe {
+        if percent == 100 {
+            SendMessageW(editor, EM_SETZOOM, 0, 0);
+        } else {
+            SendMessageW(editor, EM_SETZOOM, percent as usize, 100);
+        }
     }
 }
 

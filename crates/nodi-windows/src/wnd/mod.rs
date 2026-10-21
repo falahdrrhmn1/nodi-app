@@ -1,9 +1,19 @@
 //! Frame window: creation, message loop, layout and splitter handling.
 
+pub mod clipboard;
+pub mod context;
 pub mod dialogs;
+pub mod editkeys;
 pub mod editor;
+pub mod find;
+pub mod form;
+pub mod format;
+pub mod formula;
+pub mod image;
+pub mod link;
 pub mod menu;
 pub mod status;
+pub mod table;
 pub mod tabs;
 pub mod toolbar;
 pub mod tree;
@@ -19,6 +29,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
+use windows_sys::Win32::System::Ole::OleInitialize;
 use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
     ICC_TREEVIEW_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR, TCN_SELCHANGE,
@@ -27,7 +38,9 @@ use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, ReleaseCapture, SetCapture, SetFocus,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::DestroyAcceleratorTable;
 use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -43,6 +56,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN,
     WS_OVERLAPPEDWINDOW,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, IsDialogMessageW};
 
 use nodi_core::autosave::SaveResult;
 
@@ -61,6 +75,10 @@ pub fn run() -> i32 {
 }
 
 unsafe fn run_inner() -> i32 {
+    // OLE powers Rich Edit's drag-and-drop (moving a picture or text inside a
+    // note) and its clipboard data objects. Failure only disables those.
+    let _ = OleInitialize(ptr::null());
+
     let msftedit = LoadLibraryW(win::wide("msftedit.dll").as_ptr());
     if msftedit.is_null() {
         show_fatal("Nodi requires msftedit.dll (Rich Edit 4.1), which is missing.");
@@ -178,7 +196,15 @@ unsafe fn run_inner() -> i32 {
         if result <= 0 {
             break;
         }
-        if TranslateAcceleratorW(hwnd, accel, &message) == 0 {
+        // The modeless Find/Replace dialog handles its own keys (Tab, Enter).
+        let find_dialog = find::dialog();
+        if !find_dialog.is_null() && IsDialogMessageW(find_dialog, &message) != 0 {
+            continue;
+        }
+        // While a tree label is being renamed, keys belong to that edit box
+        // (Ctrl+Z, Ctrl+C, F2...), not to the note commands.
+        let renaming = is_plain_edit(GetFocus());
+        if renaming || TranslateAcceleratorW(hwnd, accel, &message) == 0 {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -190,6 +216,17 @@ unsafe fn run_inner() -> i32 {
     destroy_menu_compat(menu);
 
     message.wParam as i32
+}
+
+/// True for a standard "Edit" control (the tree's inline rename box).
+fn is_plain_edit(window: HWND) -> bool {
+    if window.is_null() {
+        return false;
+    }
+    let mut name = [0u16; 16];
+    // SAFETY: `name` is a valid buffer of the given length.
+    let length = unsafe { GetClassNameW(window, name.as_mut_ptr(), name.len() as i32) };
+    String::from_utf16_lossy(&name[..length.max(0) as usize]).eq_ignore_ascii_case("Edit")
 }
 
 fn destroy_menu_compat(menu: HMENU) {
@@ -399,9 +436,11 @@ pub fn layout(app: &mut App) {
 
         let editor_top = top + tab_height;
         let editor_height = (content_height - tab_height).max(0);
-        for tab in &app.tabs {
+        // Hidden editors are sized when they become active (see
+        // `App::activate_tab_impl`), so many open tabs stay cheap.
+        if let Some(editor) = app.active_editor() {
             SetWindowPos(
-                tab.editor,
+                editor,
                 ptr::null_mut(),
                 right_x,
                 editor_top,
@@ -608,6 +647,13 @@ pub unsafe extern "system" fn wndproc(
                     };
                     tree::show_context_menu(app, screen);
                     handled = true;
+                } else if app.tab_index(wparam as HWND).is_some() {
+                    let screen = (lparam != -1).then(|| POINT {
+                        x: win::x_from_lparam(lparam),
+                        y: win::y_from_lparam(lparam),
+                    });
+                    context::show_editor_menu(app, wparam as HWND, screen);
+                    handled = true;
                 }
             }
             if handled {
@@ -633,7 +679,20 @@ pub unsafe extern "system" fn wndproc(
                     && app.tab_index(header.hwndFrom).is_some()
                 {
                     status::update_caret(app);
+                } else if header.code == link::EN_LINK && app.tab_index(header.hwndFrom).is_some() {
+                    // SAFETY: Rich Edit sends an ENLINK for EN_LINK.
+                    let info = &*(lparam as *const link::EnLink);
+                    return LRESULT::from(link::on_link(app, info));
+                } else if header.code == toolbar::TTN_GETDISPINFOW {
+                    toolbar::tooltip(lparam);
                 }
+            }
+            0
+        }
+
+        msg if msg == find::message_id() && msg != 0 => {
+            if let Some(app) = app_mut(hwnd) {
+                find::on_message(app);
             }
             0
         }

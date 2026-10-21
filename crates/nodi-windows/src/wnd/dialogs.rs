@@ -49,6 +49,26 @@ pub fn about(owner: HWND) {
     info(owner, &text);
 }
 
+/// Help > Keyboard Shortcuts (F1).
+pub fn shortcuts(owner: HWND) {
+    let width = crate::wnd::menu::SHORTCUTS
+        .iter()
+        .map(|(keys, _)| keys.chars().count())
+        .max()
+        .unwrap_or(10);
+    let text = crate::wnd::menu::SHORTCUTS
+        .iter()
+        .map(|(keys, action)| format!("{keys:<width$}\t{action}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    message(
+        owner,
+        "Nodi — Keyboard Shortcuts",
+        &text,
+        MB_OK | MB_ICONINFORMATION,
+    );
+}
+
 /// Yes → true.
 pub fn ask_yes_no(owner: HWND, text: &str) -> bool {
     message(owner, "Nodi", text, MB_YESNO | MB_ICONWARNING) == IDYES
@@ -573,10 +593,21 @@ struct FindState {
     edit: HWND,
     list: HWND,
     result: Option<NoteId>,
+    label: &'static str,
 }
 
 /// Live-filtering title search. Enter or double-click opens the note.
 pub fn find_note(owner: HWND, entries: &[(NoteId, String)]) -> Option<NoteId> {
+    pick_note(owner, "Go to Note", "Title contains:", entries)
+}
+
+/// A filterable list of notes (`entries` are shown as given).
+pub fn pick_note(
+    owner: HWND,
+    caption: &str,
+    label: &'static str,
+    entries: &[(NoteId, String)],
+) -> Option<NoteId> {
     // SAFETY: as in `pick_icon`.
     unsafe {
         ensure_class("NodiFindNote", Some(find_note_proc));
@@ -586,12 +617,13 @@ pub fn find_note(owner: HWND, entries: &[(NoteId, String)]) -> Option<NoteId> {
             edit: ptr::null_mut(),
             list: ptr::null_mut(),
             result: None,
+            label,
         });
         let state_ptr = Box::into_raw(state);
         let dialog = create_dialog(
             owner,
             "NodiFindNote",
-            "Find Note by Title",
+            caption,
             420,
             400,
             state_ptr as *mut core::ffi::c_void,
@@ -620,7 +652,7 @@ unsafe extern "system" fn find_note_proc(
         }
         WM_CREATE => {
             if let Some(state) = dialog_state::<FindState>(hwnd) {
-                child(hwnd, "Static", "Title contains:", 0, -1, 12, 12, 380, 18);
+                child(hwnd, "Static", state.label, 0, -1, 12, 12, 380, 18);
                 state.edit = child(
                     hwnd,
                     "EDIT",
@@ -724,6 +756,66 @@ unsafe fn finish_find(hwnd: HWND) {
         }
     }
     DestroyWindow(hwnd);
+}
+
+/// Standard "Save As" dialog. `filter_label` like "Markdown (*.md)".
+pub fn save_file(
+    owner: HWND,
+    default_name: &str,
+    filter_label: &str,
+    extension: &str,
+) -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetSaveFileNameW, OFN_EXPLORER, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+        OPENFILENAMEW,
+    };
+    let filter: Vec<u16> = format!("{filter_label}\0*.{extension}\0All files (*.*)\0*.*\0\0")
+        .encode_utf16()
+        .collect();
+    let mut buffer = vec![0u16; 4096];
+    for (slot, unit) in buffer
+        .iter_mut()
+        .zip(default_name.encode_utf16().take(4000))
+    {
+        *slot = unit;
+    }
+    let default_extension = win::wide(extension);
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrFile = buffer.as_mut_ptr();
+    dialog.nMaxFile = buffer.len() as u32;
+    dialog.lpstrDefExt = default_extension.as_ptr();
+    dialog.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    // SAFETY: the pointers refer to buffers that outlive the call.
+    if unsafe { GetSaveFileNameW(&mut dialog) } == 0 {
+        return None;
+    }
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    Some(String::from_utf16_lossy(&buffer[..length]))
+}
+
+/// Standard "Open" dialog for any file; returns its full path.
+pub fn open_any_file(owner: HWND) -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OPENFILENAMEW,
+    };
+    let filter: Vec<u16> = "All files (*.*)\0*.*\0\0".encode_utf16().collect();
+    let mut buffer = vec![0u16; 4096];
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrFile = buffer.as_mut_ptr();
+    dialog.nMaxFile = buffer.len() as u32;
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    // SAFETY: the pointers refer to buffers that outlive the call.
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+        return None;
+    }
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    Some(String::from_utf16_lossy(&buffer[..length]))
 }
 
 // Keep the instance handle import used (documentation for the class instance).

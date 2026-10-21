@@ -13,7 +13,11 @@
 pub mod autosave;
 pub mod backup;
 pub mod id;
+pub mod image;
 pub mod links;
+pub mod markdown;
+pub mod math;
+pub mod rtf;
 pub mod search;
 pub mod storage;
 pub mod tree;

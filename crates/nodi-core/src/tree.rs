@@ -247,6 +247,44 @@ impl Tree {
         Ok(())
     }
 
+    /// Moves `id` one place up (`delta < 0`) or down among its *visible*
+    /// siblings, skipping trashed ones. Returns false at either end.
+    pub fn move_among_siblings(&mut self, id: &NoteId, delta: i32) -> bool {
+        let Some(parent) = self.nodes.get(id).map(|node| node.parent.clone()) else {
+            return false;
+        };
+        let visible: Vec<NoteId> = self
+            .children(parent.as_ref())
+            .into_iter()
+            .map(|node| node.id.clone())
+            .collect();
+        let Some(position) = visible.iter().position(|sibling| sibling == id) else {
+            return false;
+        };
+        let target = position as i64 + i64::from(delta.signum());
+        if target < 0 || target as usize >= visible.len() {
+            return false;
+        }
+        // Index in the full (trash-including) sibling list, as `move_node`
+        // counts it after taking `id` out.
+        let neighbour = &visible[target as usize];
+        let all: Vec<NoteId> = self
+            .all_children(parent.as_ref())
+            .into_iter()
+            .map(|node| node.id.clone())
+            .filter(|sibling| sibling != id)
+            .collect();
+        let Some(neighbour_index) = all.iter().position(|sibling| sibling == neighbour) else {
+            return false;
+        };
+        let index = if delta < 0 {
+            neighbour_index
+        } else {
+            neighbour_index + 1
+        };
+        self.move_node(id, parent, index).is_ok()
+    }
+
     fn renumber(&mut self, parent: Option<&NoteId>) {
         let siblings: Vec<NoteId> = self
             .all_children(parent)

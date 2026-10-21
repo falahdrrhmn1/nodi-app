@@ -1,4 +1,9 @@
-# nodi-windows — Phase 1b native shell
+# nodi-windows — Phase 1b + Phase 2+3
+
+> The Phase 1b part (§1–§7) is the historical report of the first milestone: a
+> shell with a static demo tree, no persistence, `nodi-core` not wired. All of
+> that has since been replaced by Phase 2+3 — see the **Phase 2+3** section at
+> the end of this file (§8–§12), which is the current state.
 
 Status: **done for the Phase 1b scope**. `crates/nodi-windows` builds a real
 `nodi.exe` (pure Win32 + `windows-sys`, no WebView, no other UI crates) and every
@@ -245,3 +250,218 @@ Two Win32 details that cost time and are worth remembering:
   single entry, `?? crates/nodi-windows/`; `git diff --stat` is empty, so
   `crates/nodi-core`, `docs/`, `Cargo.toml` and `Cargo.lock` are untouched.
 - No files were deleted, nothing outside `E:\nodi-app\mark-3` was written.
+
+---
+
+# Phase 2+3 — notes explorer, editor persistence, autosave
+
+Status: **done for the Phase 2+3 scope**. `crates/nodi-windows` is now wired to
+`crates/nodi-core` (`nodi-core = { path = "../nodi-core" }`) and every check in
+`docs/tasks/phase2-3-tree-editor-autosave.md` was run on this machine. The four
+scenarios in `scripts/e2e.ps1` pass against `target\release\nodi.exe`.
+
+## 8. Verification (commands exactly as run)
+
+```powershell
+$env:CARGO_HOME='E:\Software\Rust\cargo'; $env:RUSTUP_HOME='E:\Software\Rust\rustup'
+$env:PATH="E:\Software\Rust\cargo\bin;$env:PATH"
+$env:CARGO_BUILD_JOBS='1'      # 8 GB laptop, kept at 1 job
+```
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | exit 0, no output |
+| `cargo clippy --all-targets -- -D warnings` | exit 0, no lints |
+| `cargo test` | exit 0 — **45 tests, 0 failed**: `nodi-core` 9 (lib) + 6 `autosave` + 6 `backup` + 3 `search_links` + 10 `storage` + 11 `tree`; `nodi-windows` 0 tests, 0 doc-tests |
+| `cargo build --release` | ``Finished `release` profile [optimized] target(s) in 29.05s``; `target\release\nodi.exe` = 579,584 bytes |
+| `pwsh -NoProfile -File scripts\e2e.ps1 -Exe .\target\release\nodi.exe` | `--- 4 passed, 0 failed` (over a throw-away data dir per test) |
+| `pwsh -NoProfile -File scripts\e2e.ps1 -Exe .\target\debug\nodi.exe` | `--- 4 passed, 0 failed` |
+
+### `scripts/e2e.ps1` output, verbatim (release exe)
+
+```
+A quick note survives restart without Ctrl+S                 PASS (Saved after 498 ms)
+B nested notes keep hierarchy after rename + restart         PASS 
+C bold survives restart                                      PASS 
+E write failure shows Save Failed, never Saved               PASS 
+--- 4 passed, 0 failed
+```
+
+The same script and the same four scenarios against the debug binary:
+
+```
+A quick note survives restart without Ctrl+S                 PASS (Saved after 552 ms)
+B nested notes keep hierarchy after rename + restart         PASS 
+C bold survives restart                                      PASS 
+E write failure shows Save Failed, never Saved               PASS 
+--- 4 passed, 0 failed
+```
+
+## 9. What works
+
+### Phase 2 — notes explorer (KeepNote style)
+
+- **Startup pipeline**: `DataDir::resolve()` → `ensure_layout()` →
+  `recover_leftovers()` (one `MessageBox` listing every recovered path) →
+  `load_tree()`. A corrupt `tree.json` shows a `Yes/No` dialog offering the
+  newest snapshot (`Yes` restores then reloads, `No` exits **without touching the
+  file**; no snapshot → error box and exit). First run with an empty tree creates
+  one `Untitled` note at the root, writes it to disk and opens it, so typing
+  works immediately.
+- **TreeView ⇄ `Tree`**: every item carries the `NoteId` in its `lParam` (plus
+  `HashMap<HTREEITEM, NoteId>` / reverse maps); order and hierarchy come from
+  `nodi-core::Tree`, never from the control. Notes and folders use different
+  icons; the image list is built from shell stock icons
+  (`SHGetStockIconInfo` / `ExtractIconExW` + `ImageList_ReplaceIcon`), no asset
+  files. The "Change Icon" catalog has the 8 requested keys
+  (`folder, note, star, book, flag, code, bulb, warning`, the key string is
+  stored in `node.icon`).
+- **Open in tab**: double click / Enter / `Notes ▸ Open` opens a note, re-using
+  an existing tab for that id; folders do not open.
+- **Context menu** (`WM_CONTEXTMENU`, also on the keyboard menu key, target
+  selected first): empty area → New Note, New Folder, Expand All, Collapse All;
+  note → Open, New Child Note, New Sibling Note, New Folder (child), Rename,
+  Change Icon…, Duplicate, Move to Trash, Properties; folder → New Note, New
+  Subfolder, Rename, Change Icon…, Move to Trash. Items that do not work yet
+  (Move / Copy Internal Link / Paste) are **not** in the menu.
+- **Rename**: `TVN_BEGINLABELEDITW` lets the edit start (the notification handler
+  returns 0, i.e. "not cancelled"); `TVN_ENDLABELEDITW` ignores a
+  null/blank/whitespace title, otherwise renames through `Tree::rename_node` and
+  then updates the tab label and the frame caption. `F2` and the context menu
+  start the same inline editor.
+- **Drag & drop**: `TVN_BEGINDRAGW` + a drag image list, drop target highlighted,
+  drop calls `Tree::move_node`; a rejected move (cycle: onto itself or one of its
+  descendants) only writes a status-bar message and leaves the tree unchanged.
+- **Trash**: `Notes ▸ Trash…` opens a modal list of trashed **roots** with
+  Restore and Delete Permanently (confirmed). Permanent delete calls
+  `purge_node` → `DataDir::purge_note_files`, which *moves* `notes/<id>.rtf/.txt`
+  into `recovery/purged-<id>-<ts>/` instead of deleting them. Trashing a node
+  first flushes and closes every tab of its subtree.
+- **State persistence**: expand/collapse in `session.json` `expanded`,
+  `order` in `tree.json`; every tree mutation submits `Job::TreeSave`
+  immediately.
+- **Menus**: `Notes` and `Search` menus added (with `Find Note by Title…`,
+  Ctrl+Shift+F: modal edit box + list live-filtered from
+  `App::visible_titles`, Enter opens the highlighted note), `View ▸
+  Expand/Collapse All`, `Tools ▸ Backup Now`, `Tools ▸ Open Data Folder`,
+  `Format` extended, `Insert` present but with its four items greyed out and
+  labelled `… (not yet)`. New accelerators: Ctrl+S, F2, Ctrl+Shift+F on top of
+  the Phase 1b set.
+
+### Phase 3 — editor persistence + autosave
+
+- **Open**: `load_note()` → `EM_STREAMIN(SF_RTF)` with an `EDITSTREAM` callback
+  over the byte slice, then `EM_SETMODIFY FALSE` + `EM_EMPTYUNDOBUFFER`.
+  `EN_CHANGE` is masked off during the load so a fresh note is never dirty.
+  Missing file = empty note; a parse failure offers the `.prev` generation.
+- **Save pipeline** exactly as `docs/ARCHITECTURE.md`: `EM_STREAMOUT(SF_RTF)`
+  for the `.rtf`, `WM_GETTEXTLENGTH` + `EM_GETTEXTEX` (codepage 1200) for the
+  `.txt` sidecar, then `Writer::spawn`'s notify callback →
+  `PostMessageW(hwnd, WM_APP_SAVE_RESULT, 0, Box::into_raw(..))`; the window
+  procedure reclaims the box, and a failed `PostMessageW` reclaims it
+  immediately (no leak).
+- **Per-tab state machine**: `dirty`, `seq`, `acked`, `last_error`,
+  `failure_streak`; 500 ms debounce (`SetTimer`, id per tab), 5 s retry while
+  failing, status part 2 shows exactly one of `Modified` / `Saving...` / `Saved`
+  / `Save Failed` for the active tab, tab label gets ` *` while unsaved, caption
+  is `<title> - Nodi`.
+- **Save failure**: status stays `Save Failed`, one `MessageBox` per failure
+  streak (not per retry), content stays in memory, retry every 5 s.
+- **Flush triggers**: tab switch, opening another note, closing a tab, Ctrl+S,
+  `WM_CLOSE`, `WM_QUERYENDSESSION` (returns TRUE after flushing) and
+  `WM_ENDSESSION`. `WM_CLOSE` first drains the posted results with a filtered
+  `PeekMessageW`, then `flush_blocking(5 s)`; if any tab still has
+  `acked < seq` the "Some notes could not be saved … Close anyway?" prompt
+  decides (No keeps the app open).
+- **Session**: open notes + active index + caret + first visible line + sidebar
+  width + `GetWindowPlacement` rect + expanded nodes, written synchronously on
+  tab changes and on close (`session.json` is tiny), restored at startup while
+  skipping ids that vanished or were trashed.
+- **Backup**: at startup a snapshot is taken when the newest one is older than
+  24 h (`backup::snapshot` + `prune(20)` on a short-lived thread, never on the
+  UI thread); `Tools ▸ Backup Now` does the same on demand.
+
+### Test channel for the e2e script
+
+Cross-process `SendMessage` only marshals pointers for a handful of system
+messages; Rich Edit messages at/above `WM_USER` are not marshalled, so pointers
+from a test process are garbage inside `nodi.exe`. `src/testhook.rs` therefore
+handles `WM_COPYDATA` **inside** the app (`dwData = 'NODT'`, command line as
+UTF-8) and writes the reply to the file named by `NODI_TEST_REPLY`:
+`state`, `tabs`, `cmd <menu id>`, `select-title <title>`,
+`rename-selected <title>`, `text`, `rtf`, `type <text>`, `select a b`,
+`caret`, `fmt a b`, `objects`. It is only reachable when the process is started
+with `NODI_TEST_HOOKS=1`, so a normal run has no remote-control surface.
+
+## 10. The one real bug: `richedit.h` is `#pragma pack(4)`
+
+Worth writing down, because it looked like a platform fault and was not one.
+
+`EDITSTREAM` was declared as
+`#[repr(C)] { dwCookie: usize, dwError: u32, pfnCallback: Option<fn> }` — 24
+bytes with the callback at offset 16, the layout every "64-bit" tutorial shows.
+Rich Edit never called the callback: the process died with `0xC0000409`
+(`FAST_FAIL_INVALID_ARG`, WER "faulting module: unknown") inside ntdll's
+mapping, and a variant with a null callback faulted at the *garbage* address
+`0x450054` instead of at `0` — i.e. Rich Edit was reading the function pointer
+from the wrong offset and calling whatever it found there. The same crash
+appeared with a plain `RICHEDIT50W`, with `RichEdit20W` and in a separate C#
+`Add-Type` probe, which is what ruled the Rust code out.
+
+`richedit.h` wraps its structures in `#pragma pack(4)`, so on x64 `EDITSTREAM`
+is **20 bytes with the callback at offset 12** (and `GETTEXTEX` is 28 bytes, not
+32). Both structs now carry `#[repr(C, packed(4))]`, a
+`const _: () = assert!(size_of::<…>() == 20/28);` next to them, and the RTF
+in/out path works. `EM_STREAMIN`/`EM_STREAMOUT` themselves were never broken:
+
+```
+C bold survives restart                                      PASS
+```
+
+is the regression test for exactly this.
+
+## 11. Checks run outside `scripts/e2e.ps1`
+
+The four scripted scenarios are the contract, but they only touch create and
+rename among the tree commands, so the following was driven through the same
+test channel (`cmd <id>` = `menu::on_command`) on a throw-away data dir and
+asserted against `tree.json` / `session.json` / `backups\` (the throw-away
+driver script is `target\hookcheck.ps1`, outside version control):
+
+```
+create + rename 4 nodes                        PASS (4 nodes, child under folder)
+duplicate selected note                        PASS (5 nodes, copy titled 'Note2 (copy)')
+trash closes the tab                           PASS (3 tabs before, trashed=true, 2 tabs after)
+expand all / collapse all reach session.json   PASS commands accepted
+Tools > Backup Now writes a snapshot           PASS (1 -> 2 snapshots)
+session.json expanded after Collapse All       expanded=0
+```
+
+## 12. Known gaps
+
+- **Not driven by the script**: inline label editing (`TVM_EDITLABELW`, F2 —
+  the same `App::rename_node` path *is* covered by test B), tree drag & drop
+  (a mouse drag cannot be synthesized from the script), and the popup windows
+  (Change Icon, Trash, Find Note, Properties) — they run a nested message loop on
+  the UI thread, which would block the synchronous `WM_COPYDATA` channel. They
+  are wired to the menus and were written for this phase, but this report does
+  not claim an automated check for them.
+- **No physical key presses**: this desktop does not let the agent take the
+  foreground, so the commands behind Ctrl+B / Ctrl+I / F2 / Ctrl+Shift+F were
+  sent as `WM_COMMAND` (`cmd <id>`) and the accelerator table is verified only by
+  construction.
+- **No single-instance guard**: two `nodi.exe` on the same data dir would both
+  write `tree.json`/`session.json` and last writer wins. Nothing in the spec
+  asked for it; noting it because autosave makes it more likely.
+- **No conflict handling between tabs of the same note**: a note can only be
+  open once (tabs are keyed by `NoteId`), so this cannot happen inside one
+  instance.
+- **Insert menu**: Image / Table / Horizontal Rule / Date-Time are visible but
+  disabled (`MF_GRAYED`); images, tables and printing remain out of scope.
+- **Search** is title-only over the loaded tree (`App::visible_titles` filtered
+  in the dialog); there is no full-text search over the `.txt` sidecars yet.
+- **DPI** was exercised at 125 % only (one monitor on this machine); the
+  `WM_DPICHANGED` path is implemented but unverified, as in Phase 1b.
+- **Crash dumps**: no minidump/WER hooks; a hard failure still only produces a
+  WER entry. `panic = "abort"` in the release profile means a panic surfaces as
+  `0xC0000409` (this is how the `EDITSTREAM` bug above looked at first).

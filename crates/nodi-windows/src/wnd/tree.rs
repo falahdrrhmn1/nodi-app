@@ -473,10 +473,13 @@ pub fn handle_notify(app: &mut App, header: &NMHDR) -> bool {
         TVN_SELCHANGEDW => {
             let info = header as *const NMHDR as *const NMTREEVIEWW;
             // SAFETY: the TreeView sent an NMTREEVIEWW for this code.
-            let item = unsafe { (*info).itemNew.hItem };
+            let (item, action) = unsafe { ((*info).itemNew.hItem, (*info).action) };
             if let Some(id) = item_note(app, item) {
                 app.selected = Some(id.clone());
-                if app.suppress_select == 0 && is_note(app, &id) {
+                // A click opens the note; arrow keys only move the selection
+                // (Enter opens), so browsing does not spawn a tab per note.
+                const TVC_BYMOUSE: u32 = 1;
+                if app.suppress_select == 0 && action == TVC_BYMOUSE && is_note(app, &id) {
                     app.open_note(id);
                 }
             }
@@ -642,9 +645,13 @@ fn on_drop(app: &mut App, lparam: LPARAM) {
     }
     app.dragging = false;
     if let Some(source) = app.drag_source.take() {
-        if let Some(target) = hit_test(app, point) {
-            if target != source {
-                app.move_node(source, target);
+        match hit_test(app, point) {
+            Some(target) if target != source => app.move_node(source, target),
+            Some(_) => {}
+            // Dropped on empty space: move to the top level.
+            None => {
+                app.selected = Some(source);
+                app.move_selected_to_root();
             }
         }
     }

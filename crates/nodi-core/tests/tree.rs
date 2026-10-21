@@ -249,3 +249,29 @@ fn path_titles_and_ancestors_are_root_first() {
     assert_eq!(tree.ancestors(&b), vec![a]);
     assert!(tree.path_titles(&NoteId::generate()).is_empty());
 }
+
+#[test]
+fn move_among_siblings_skips_trashed_and_stops_at_the_ends() {
+    let mut tree = Tree::new();
+    let a = tree.new_node(NodeKind::Note, "A", None);
+    let hidden = tree.new_node(NodeKind::Note, "Hidden", None);
+    let b = tree.new_node(NodeKind::Note, "B", None);
+    let c = tree.new_node(NodeKind::Note, "C", None);
+    assert!(tree.trash(&hidden));
+    let titles = |tree: &Tree| -> Vec<String> {
+        tree.children(None)
+            .iter()
+            .map(|node| node.title.clone())
+            .collect()
+    };
+
+    assert!(tree.move_among_siblings(&c, -1));
+    assert_eq!(titles(&tree), vec!["A", "C", "B"]);
+    assert!(tree.move_among_siblings(&c, -1));
+    assert_eq!(titles(&tree), vec!["C", "A", "B"]);
+    assert!(!tree.move_among_siblings(&c, -1), "already first");
+    assert!(tree.move_among_siblings(&a, 1));
+    assert_eq!(titles(&tree), vec!["C", "B", "A"]);
+    assert!(!tree.move_among_siblings(&a, 1), "already last");
+    let _ = b;
+}

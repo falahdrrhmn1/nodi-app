@@ -12,6 +12,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# `pwsh -File e2e.ps1 -Only A,B` passes one string "A,B".
+$Only = @($Only | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $Exe = (Resolve-Path $Exe).Path
 $Root = Join-Path (Resolve-Path "$PSScriptRoot\..").Path 'target\e2e'
 New-Item -ItemType Directory -Force $Root | Out-Null
@@ -259,6 +261,224 @@ Test-Case 'E' 'write failure shows Save Failed, never Saved' {
         [IO.File]::ReadAllText($_.FullName).Contains('must not be reported') }
     Assert ($null -eq $leaked) 'text reached disk although writes were failing'
     ''
+}
+
+function Get-Units($nodi) { (Invoke-Nodi $nodi 'units') -split ' ' }
+function Count-Unit($nodi, [string]$hex) { @(Get-Units $nodi | Where-Object { $_ -eq $hex }).Count }
+
+Test-Case 'F' 'Enter keeps indentation, Tab/Shift+Tab indent lines' {
+    $data = New-DataDir 'F'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'type \tif x:' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'type y = 1' | Out-Null
+    $text = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
+    Assert ($text -like "`tif x:|`ty = 1*") "auto-indent failed: '$text'"
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'shift-tab' | Out-Null
+    Invoke-Nodi $nodi 'type done' | Out-Null
+    $text = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
+    Assert ($text -like "`tif x:|`ty = 1|done*") "shift-tab did not outdent: '$text'"
+    Invoke-Nodi $nodi 'select 0 30' | Out-Null
+    Invoke-Nodi $nodi 'tab' | Out-Null
+    $text = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
+    Assert ($text -like "`t`tif x:|`t`ty = 1|`tdone*") "block indent failed: '$text'"
+    Invoke-Nodi $nodi 'shift-tab' | Out-Null
+    $text = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
+    Assert ($text -like "`tif x:|`ty = 1|done*") "block outdent failed: '$text'"
+    Stop-Nodi $nodi
+    ''
+}
+
+Test-Case 'G' 'image persists and resizes' {
+    . "$PSScriptRoot\probe-lib.ps1"
+    $png = New-TestPng (Join-Path $Root 'e2e-image.png') 240 120
+    $data = New-DataDir 'G'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'type Picture:\n' | Out-Null
+    $inserted = Invoke-Nodi $nodi "insert-image $png"
+    Assert ($inserted -eq 'ok') "insert failed: $inserted"
+    Invoke-Nodi $nodi 'type \nafter' | Out-Null
+    Invoke-Nodi $nodi 'select 9 9' | Out-Null
+    Invoke-Nodi $nodi 'cmd 242' | Out-Null                # Image 50%
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $pictures = Invoke-Nodi $nodi 'pictures'
+    Invoke-Nodi $nodi 'select 9 10' | Out-Null
+    $rtf = Invoke-Nodi $nodi 'sel-rtf'
+    $text = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
+    Stop-Nodi $nodi
+    Assert ($pictures -eq '1') "expected 1 picture after restart, got $pictures"
+    Assert ($rtf -match 'picwgoal1800') "picture was not resized to 50% (120 px = 1800 twips)"
+    Assert ($text -like 'Picture:|*|after*') "text around the picture moved: '$text'"
+    ''
+}
+
+Test-Case 'H' 'table: insert, add/delete rows and columns, persist' {
+    $data = New-DataDir 'H'
+    $nodi = Start-Nodi $data
+    Assert ((Invoke-Nodi $nodi 'table 2 3') -eq 'ok') 'table insert failed'
+    Assert ((Count-Unit $nodi 'FFF9') -eq 2) 'expected 2 rows'
+    Assert ((Count-Unit $nodi '0007') -eq 6) 'expected 6 cells'
+    Invoke-Nodi $nodi 'cmd 231' | Out-Null                # row below
+    Assert ((Count-Unit $nodi 'FFF9') -eq 3) "row insert failed: $(Count-Unit $nodi 'FFF9') rows"
+    Invoke-Nodi $nodi 'cmd 233' | Out-Null                # column right
+    Assert ((Count-Unit $nodi '0007') -eq 12) "column insert failed: $(Count-Unit $nodi '0007') cells"
+    Invoke-Nodi $nodi 'cmd 235' | Out-Null                # delete column
+    Assert ((Count-Unit $nodi '0007') -eq 9) "column delete failed: $(Count-Unit $nodi '0007') cells"
+    Invoke-Nodi $nodi 'cmd 234' | Out-Null                # delete row (the middle one)
+    Assert ((Count-Unit $nodi 'FFF9') -eq 2) "row delete failed: $(Count-Unit $nodi 'FFF9') rows"
+    $units = (Invoke-Nodi $nodi 'units')
+    Assert (-not $units.Contains('FFFB 000D 000D FFF9')) "deleting a row split the table: $units"
+    Invoke-Nodi $nodi 'select 2 2' | Out-Null
+    Invoke-Nodi $nodi 'type Nama' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $rows = Count-Unit $nodi 'FFF9'
+    $cells = Count-Unit $nodi '0007'
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($rows -eq 2 -and $cells -eq 6) "after restart: $rows rows, $cells cells"
+    Assert ($markdown -match '\| Nama \|') "markdown table missing: $markdown"
+    ''
+}
+
+Test-Case 'I' 'code block keeps indentation and exports as fenced code' {
+    $data = New-DataDir 'I'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'type Contoh:' | Out-Null
+    Invoke-Nodi $nodi 'cmd 205' | Out-Null                # code block
+    Invoke-Nodi $nodi 'type fn main() {' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'tab' | Out-Null
+    Invoke-Nodi $nodi 'type x();' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'type y();' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    $fence = [string]::new([char]96, 3)
+    $expected = "$fence`nfn main() {`n`tx();`n`ty();`n$fence"
+    Assert ($markdown.Contains($expected)) "code block lost after restart:`n$markdown"
+    ''
+}
+
+Test-Case 'J' 'formulas render, persist and keep their LaTeX' {
+    $data = New-DataDir 'J'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'type Energi: ' | Out-Null
+    $first = Invoke-Nodi $nodi 'formula E = mc^2'
+    Assert ($first -eq 'ok') "formula 1: $first"
+    Invoke-Nodi $nodi 'type \nLoss: ' | Out-Null
+    $loss = 'L = \frac{1}{n} \sum_{i=1}^{n} (\hat{y}_i - y_i)^2'
+    $second = Invoke-Nodi $nodi "formula $loss"
+    Assert ($second -eq 'ok') "formula 2: $second"
+    $bad = Invoke-Nodi $nodi 'formula \frac{a'
+    Assert ($bad -like 'error:*') "a broken formula should be rejected, got: $bad"
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $pictures = Invoke-Nodi $nodi 'pictures'
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Invoke-Nodi $nodi 'select 8 9' | Out-Null
+    $source = Invoke-Nodi $nodi 'formula-source'
+    Stop-Nodi $nodi
+    Assert ($pictures -eq '2') "expected 2 formula pictures, got $pictures"
+    Assert ($markdown.Contains('$E = mc^2$')) "markdown lost formula 1: $markdown"
+    Assert ($markdown.Contains("`$$loss`$")) "markdown lost formula 2: $markdown"
+    Assert ($source -eq 'E = mc^2') "formula source not editable: '$source'"
+    ''
+}
+
+Test-Case 'K' 'links: web and internal note links survive restart' {
+    $data = New-DataDir 'K'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'type Lihat juga: ' | Out-Null
+    Invoke-Nodi $nodi 'link Gradient Descent|nodi://note/0123456789abcdef0123456789abcdef' | Out-Null
+    Invoke-Nodi $nodi 'type  dan ' | Out-Null
+    Invoke-Nodi $nodi 'link docs|https://example.com/a b' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Invoke-Nodi $nodi 'select 13 20' | Out-Null
+    $target = Invoke-Nodi $nodi 'link-target'
+    Stop-Nodi $nodi
+    Assert ($markdown.Contains('[Gradient Descent](nodi://note/0123456789abcdef0123456789abcdef)')) "internal link lost: $markdown"
+    Assert ($markdown.Contains('[docs](https://example.com/a%20b)')) "web link lost: $markdown"
+    Assert ($target -eq 'nodi://note/0123456789abcdef0123456789abcdef') "link target not readable: '$target'"
+    ''
+}
+
+Test-Case 'L' 'headings, lists and Enter-after-heading' {
+    $data = New-DataDir 'L'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'type Machine Learning' | Out-Null
+    Invoke-Nodi $nodi 'cmd 210' | Out-Null                # Heading 1
+    Invoke-Nodi $nodi 'select 16 16' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'type Badan teks.' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'cmd 214' | Out-Null                # bullets
+    Invoke-Nodi $nodi 'type satu' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($markdown.StartsWith("# Machine Learning`n`nBadan teks.")) "heading/body wrong:`n$markdown"
+    Assert ($markdown.Contains('- satu')) "list lost:`n$markdown"
+    ''
+}
+
+Test-Case 'M' 'many notes stay responsive' {
+    $data = New-DataDir 'M'
+    $nodi = Start-Nodi $data
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    for ($i = 0; $i -lt 150; $i++) { Invoke-Nodi $nodi 'cmd 170' | Out-Null }
+    $create = $watch.ElapsedMilliseconds
+    Stop-Nodi $nodi
+    $watch.Restart()
+    $nodi = Start-Nodi $data
+    $start = $watch.ElapsedMilliseconds
+    $responding = $nodi.Process.Responding
+    Stop-Nodi $nodi
+    $count = @((Read-Tree $data).nodes).Count
+    Assert ($count -eq 151) "expected 151 notes, found $count"
+    Assert $responding 'not responding after restart'
+    "(150 notes created in $create ms, restart to window $start ms)"
+}
+
+Test-Case 'O' 'long session: switching tabs while typing loses nothing' {
+    $data = New-DataDir 'O'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'rename-selected Satu' | Out-Null
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Dua' | Out-Null
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Tiga' | Out-Null
+    for ($round = 1; $round -le 20; $round++) {
+        for ($tab = 0; $tab -lt 3; $tab++) {
+            Invoke-Nodi $nodi "type r$round-t$tab " | Out-Null
+            Invoke-Nodi $nodi 'cmd 150' | Out-Null          # next tab (flushes)
+        }
+    }
+    Stop-Nodi $nodi
+    $texts = Get-ChildItem "$data\notes\*.txt" | ForEach-Object {
+        [IO.File]::ReadAllText($_.FullName, [Text.Encoding]::UTF8) }
+    $all = $texts -join "`n"
+    $missing = @()
+    for ($round = 1; $round -le 20; $round++) {
+        for ($tab = 0; $tab -lt 3; $tab++) {
+            if (-not $all.Contains("r$round-t$tab ")) { $missing += "r$round-t$tab" }
+        }
+    }
+    Assert ($missing.Count -eq 0) "lost tokens: $($missing -join ', ')"
+    '(60 edits across 3 tabs)'
 }
 
 # --------------------------------------------------------------------- report

@@ -161,6 +161,8 @@ fn session_round_trip() {
             height: 720,
         }),
         expanded: vec![note_b.clone()],
+        word_wrap: false,
+        zoom: 125,
     };
     data.save_session(&session).expect("save session");
     let loaded = data.load_session().expect("load session");
