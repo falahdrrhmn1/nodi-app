@@ -26,7 +26,7 @@ same handlers as the menus.
 | extra — formulas | render, persist, LaTeX editable, `$…$` export, bad LaTeX rejected | **PASS** (e2e J) |
 | extra — links | internal + web links survive restart | **PASS** (e2e K) |
 
-Unit and integration tests: `cargo test` — 85 tests pass (nodi-core: tree,
+Unit and integration tests: `cargo test` — 86 tests pass (nodi-core: tree,
 storage, autosave, backup, search, links, image, RTF, Markdown, LaTeX parser,
 math layout, PNG; nodi-windows: table structure, link parsing/safety).
 `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean.
@@ -112,10 +112,14 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
 
 ## Security notes
 - Links never run programs: `http(s)`/`mailto` open in the browser/mail
-  client; local files and network paths ask first and show the real target;
-  executables/scripts (`.exe`, `.bat`, `.ps1`, `.lnk`, …) are never started —
-  Nodi offers to show them in Explorer instead; other URL schemes are refused.
-  The status bar shows the real target of a link, not its display text.
+  client. Local paths are normalised the way Win32 resolves them (trailing
+  dots/spaces dropped, so `calc.exe.` is still `calc.exe`); alternate data
+  streams, device paths and quotes are refused. Only file types on a
+  **document allowlist** (pdf, docx, png, txt, …) that Windows' own
+  `AssocIsDangerous` does not flag are opened, after a confirmation that shows
+  the real path. Programs, scripts, shortcuts, unknown types and every file on
+  a network share are only shown in Explorer on request. Other URL schemes are
+  refused. The status bar shows the real target, not the display text.
 - The test remote control (`testhook.rs`) is only active when `nodi.exe` is
   started with `NODI_TEST_HOOKS=1`.
 - No network access, no telemetry, no background processes.

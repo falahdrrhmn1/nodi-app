@@ -196,13 +196,16 @@ pub fn follow(app: &mut App, target: &str) {
             app.hwnd,
             &format!("Nodi only opens web, e-mail, file and note links. Not opened:\n{target}"),
         ),
-        Kind::Program(path) => {
-            // Links never start programs or scripts (a pasted link could
-            // point anywhere). Offer to show the file instead.
-            let question = format!(
-                "This link points to a program or script:\n{path}\n\n\
-                 Nodi does not run programs from links. Show it in its folder instead?"
-            );
+        Kind::Reveal { path, network } => {
+            // Links never start programs, scripts or unknown file types, and
+            // never open files on another computer. Offer Explorer instead.
+            let reason = if network {
+                "a file on a network location"
+            } else {
+                "a program, a script or a file type Nodi does not open"
+            };
+            let question =
+                format!("This link points to {reason}:\n{path}\n\nShow it in Explorer instead?");
             if dialogs::ask_yes_no(app.hwnd, &question) {
                 shell(
                     app,
@@ -212,15 +215,10 @@ pub fn follow(app: &mut App, target: &str) {
                 );
             }
         }
-        Kind::File { path, network } => {
+        Kind::Document(path) | Kind::Folder(path) => {
             let confirmed = CONFIRMED.with(|set| set.borrow().contains(&path));
             if !confirmed {
-                let warning = if network {
-                    "\n\nThis is a network location: opening it contacts another computer."
-                } else {
-                    ""
-                };
-                let question = format!("Open this file with its default program?\n{path}{warning}");
+                let question = format!("Open this with its default program?\n{path}");
                 if !dialogs::ask_yes_no(app.hwnd, &question) {
                     return;
                 }
@@ -242,57 +240,27 @@ thread_local! {
 enum Kind {
     /// http(s) / mailto: handed to the browser or mail client.
     Web,
-    /// A document or folder on disk / on the network (asks first).
-    File { path: String, network: bool },
-    /// An executable or script: never run.
-    Program(String),
-    /// Any other scheme (`ms-settings:`, `javascript:` …).
+    /// A local file whose type is on the document allowlist (asks first).
+    Document(String),
+    /// A local folder (asks first, opens in Explorer).
+    Folder(String),
+    /// Programs, scripts, unknown types and any file on another computer:
+    /// never opened, only shown in Explorer on request.
+    Reveal { path: String, network: bool },
+    /// Any other scheme (`ms-settings:`, `javascript:` …) or a malformed path.
     Refused,
 }
 
-const PROGRAM_EXTENSIONS: &[&str] = &[
-    "exe",
-    "com",
-    "bat",
-    "cmd",
-    "ps1",
-    "psm1",
-    "psd1",
-    "vbs",
-    "vbe",
-    "js",
-    "jse",
-    "wsf",
-    "wsh",
-    "hta",
-    "msi",
-    "msp",
-    "mst",
-    "scr",
-    "pif",
-    "lnk",
-    "cpl",
-    "jar",
-    "reg",
-    "url",
-    "application",
-    "appref-ms",
-    "gadget",
-    "msc",
-    "scf",
-    "inf",
-    "dll",
-    "sys",
-    "chm",
-    "py",
-    "pyw",
-    "sh",
-    "library-ms",
-    "settingcontent-ms",
-    "diagcab",
-    "appx",
-    "msix",
-    "xbap",
+/// File types a link may open with their default program. Everything else
+/// (programs, scripts, shortcuts, unknown types) is only shown in Explorer:
+/// an allowlist cannot be bypassed by an extension nobody thought of.
+const DOCUMENT_EXTENSIONS: &[&str] = &[
+    "pdf", "txt", "md", "markdown", "rtf", "log", "csv", "tsv", "json", "xml", "yaml", "yml",
+    "toml", "ini", "tex", "bib", "doc", "docx", "odt", "xls", "xlsx", "ods", "ppt", "pptx", "odp",
+    "epub", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "heic", "mp3", "wav",
+    "flac", "ogg", "m4a", "mp4", "mkv", "avi", "mov", "webm", "zip", "7z", "rar", "tar", "gz",
+    "ipynb", "rs", "c", "h", "cpp", "hpp", "cs", "java", "go", "kt", "sql", "css", "drawio",
+    "nodi",
 ];
 
 fn classify(target: &str) -> Kind {
@@ -301,41 +269,115 @@ fn classify(target: &str) -> Kind {
     {
         return Kind::Web;
     }
-    let path = if let Some(rest) = lower.strip_prefix("file:") {
+    let path = match lower.strip_prefix("file:") {
         // file:///C:/a%20b.pdf → C:\a b.pdf, file://server/share → \\server\share
-        let original = &target[target.len() - rest.len()..];
-        let trimmed = original.trim_start_matches('/');
-        let unc = original.starts_with("//") && !original.starts_with("///");
-        let decoded = percent_decode(trimmed).replace('/', "\\");
-        if unc {
-            format!("\\\\{decoded}")
-        } else {
-            decoded
+        // (`to_ascii_lowercase` keeps byte offsets, and "file:" is ASCII.)
+        Some(rest) => {
+            let original = &target[target.len() - rest.len()..];
+            let trimmed = original.trim_start_matches('/');
+            let unc = original.starts_with("//") && !original.starts_with("///");
+            let decoded = percent_decode(trimmed).replace('/', "\\");
+            if unc {
+                format!("\\\\{decoded}")
+            } else {
+                decoded
+            }
         }
-    } else {
-        target.to_owned()
+        None => target.to_owned(),
     };
     // Anything else with a scheme (but not a drive letter like C:) is refused.
     // RFC 3986 scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
-    let has_scheme = path.find(':').is_some_and(|colon| {
+    let scheme_like = |colon: usize| {
         colon > 1
-            && path[..1].chars().all(|ch| ch.is_ascii_alphabetic())
+            && path
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic())
             && path[..colon]
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
-    });
-    if has_scheme {
+    };
+    if path.find(':').is_some_and(scheme_like) {
         return Kind::Refused;
     }
-    let network = path.starts_with("\\\\") || path.starts_with("//");
-    let extension = std::path::Path::new(path.trim_end_matches(['\\', '/']))
+    let Some(path) = normalize_path(&path) else {
+        return Kind::Refused;
+    };
+    let network = path.starts_with("\\\\");
+    if network {
+        return Kind::Reveal { path, network };
+    }
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+        return Kind::Folder(path);
+    }
+    let extension = std::path::Path::new(&path)
         .extension()
         .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    if PROGRAM_EXTENSIONS.contains(&extension.as_str()) {
-        return Kind::Program(path);
+    if DOCUMENT_EXTENSIONS.contains(&extension.as_str()) && !windows_says_dangerous(&extension) {
+        Kind::Document(path)
+    } else {
+        Kind::Reveal { path, network }
     }
-    Kind::File { path, network }
+}
+
+/// Normalises a path the way Win32 resolves it: forward slashes become
+/// backslashes and trailing dots/spaces are dropped from every component
+/// (`calc.exe.` *is* `calc.exe`). Returns `None` for paths Nodi will not touch:
+/// alternate data streams (`a.txt:evil.exe`, `::$DATA`), quotes, control
+/// characters, or `\\?\` device paths.
+fn normalize_path(path: &str) -> Option<String> {
+    let path = path.trim().replace('/', "\\");
+    if path.is_empty()
+        || path.starts_with("\\\\?\\")
+        || path.starts_with("\\\\.\\")
+        || path.chars().any(|ch| ch == '"' || ch.is_control())
+    {
+        return None;
+    }
+    // A colon is only allowed as the drive separator ("C:").
+    let drive = path
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic())
+        && path[1..].starts_with(':');
+    if path.matches(':').count() > usize::from(drive) {
+        return None;
+    }
+    let (prefix, rest) = if drive {
+        path.split_at(2)
+    } else {
+        ("", path.as_str())
+    };
+    let components: Vec<&str> = rest
+        .split('\\')
+        .enumerate()
+        .map(|(index, part)| {
+            // Keep "." and ".." components; strip trailing dots/spaces elsewhere.
+            if part == "." || part == ".." || (index == 0 && part.is_empty()) {
+                part
+            } else {
+                part.trim_end_matches(['.', ' '])
+            }
+        })
+        .collect();
+    let joined = components.join("\\");
+    let cleaned = joined.trim_end_matches('\\');
+    if cleaned.is_empty() && prefix.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}{cleaned}"))
+}
+
+/// Windows' own list of dangerous file types (`AssocIsDangerous`), as a
+/// second opinion on top of the allowlist.
+fn windows_says_dangerous(extension: &str) -> bool {
+    if extension.is_empty() {
+        return true;
+    }
+    let dotted = win::wide(&format!(".{extension}"));
+    // SAFETY: NUL-terminated string; the call only reads the registry.
+    unsafe { windows_sys::Win32::UI::Shell::AssocIsDangerous(dotted.as_ptr()) != 0 }
 }
 
 fn percent_decode(text: &str) -> String {
@@ -344,7 +386,11 @@ fn percent_decode(text: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(value) = u8::from_str_radix(&text[index + 1..index + 3], 16) {
+            // Work on bytes: `index + 3` may fall inside a multi-byte char.
+            let value = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            if let Some(value) = value {
                 out.push(value);
                 index += 3;
                 continue;
@@ -362,7 +408,7 @@ fn describe(target: &str) -> String {
         return format!("note {id}");
     }
     match classify(target) {
-        Kind::Program(path) => format!("{path} (program — will not be run)"),
+        Kind::Reveal { path, .. } => format!("{path} (will only be shown in Explorer)"),
         Kind::Refused => format!("{target} (not supported)"),
         _ => target.to_owned(),
     }
@@ -488,37 +534,44 @@ mod tests {
 
     #[test]
     fn classify_never_runs_programs() {
+        let reveal = |target: &str| matches!(classify(target), Kind::Reveal { .. });
         assert_eq!(classify("https://example.com/x"), Kind::Web);
         assert_eq!(classify("mailto:a@b.c"), Kind::Web);
-        assert!(matches!(
-            classify(r"C:\Windows\System32\calc.exe"),
-            Kind::Program(_)
-        ));
-        assert!(matches!(
-            classify("file:///C:/Users/x/run.BAT"),
-            Kind::Program(_)
-        ));
-        assert!(matches!(
-            classify(r"C:\docs\evil.pdf.lnk"),
-            Kind::Program(_)
-        ));
+        assert!(reveal(r"C:\Windows\System32\calc.exe"));
+        assert!(reveal("file:///C:/Users/x/run.BAT"));
+        assert!(reveal(r"C:\docs\evil.pdf.lnk"));
+        // Win32 drops trailing dots and spaces: these are still calc.exe.
+        assert!(reveal(r"C:\Windows\System32\calc.exe."));
+        assert!(reveal("C:/Windows/System32/calc.exe . ."));
+        assert!(reveal("file:///C:/x/run.bat%20"));
+        // No extension or an unknown one is never opened.
+        assert!(reveal(r"C:\tools\README"));
+        assert!(reveal(r"C:\x\payload.xyz"));
+        // Alternate data streams, device paths and quotes are refused.
+        assert_eq!(classify(r"C:\x\a.txt:evil.exe"), Kind::Refused);
+        assert_eq!(classify(r"C:\x\a.txt::$DATA"), Kind::Refused);
+        assert_eq!(classify(r"\\?\C:\x\a.pdf"), Kind::Refused);
+        assert_eq!(classify("C:/x/a\"b.pdf"), Kind::Refused);
         assert_eq!(classify("ms-settings:privacy"), Kind::Refused);
         assert_eq!(classify("javascript:alert(1)"), Kind::Refused);
+        // Documents on the allowlist open (after the confirmation prompt).
         assert_eq!(
             classify("file:///C:/My%20Docs/paper.pdf"),
-            Kind::File {
-                path: r"C:\My Docs\paper.pdf".to_owned(),
-                network: false
-            }
+            Kind::Document(r"C:\My Docs\paper.pdf".to_owned())
         );
+        // Files on another computer are only shown, never opened.
         assert!(matches!(
             classify(r"\\server\share\notes.txt"),
-            Kind::File { network: true, .. }
+            Kind::Reveal { network: true, .. }
         ));
         assert!(matches!(
             classify("file://server/share/a.docx"),
-            Kind::File { network: true, .. }
+            Kind::Reveal { network: true, .. }
         ));
+        // Multi-byte text never panics.
+        assert_eq!(classify("ü:x"), Kind::Refused);
+        assert!(reveal("übung"));
+        assert_eq!(percent_decode("%€x%4"), "%€x%4");
     }
 
     #[test]

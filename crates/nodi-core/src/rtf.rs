@@ -135,7 +135,10 @@ fn control_word_end(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut index = 1;
     if index < bytes.len() && !bytes[index].is_ascii_alphabetic() {
-        return (index + 1).min(bytes.len());
+        // A control symbol: `\` plus one character (which may be multi-byte
+        // in pasted text), so the slice end stays on a char boundary.
+        let symbol = text[index..].chars().next().map_or(1, char::len_utf8);
+        return index + symbol;
     }
     while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
         index += 1;
@@ -204,6 +207,13 @@ mod tests {
             picture_blob(SAMPLE).unwrap(),
             vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
         );
+    }
+
+    #[test]
+    fn non_ascii_control_symbol_does_not_panic() {
+        let rtf = "{\\rtf1{\\pict\\é\\picwgoal10\\pichgoal20 00}}";
+        assert_eq!(picture_goal(rtf), Some((10, 20)));
+        assert!(set_picture_goal(rtf, 30, 40).is_some());
     }
 
     #[test]
