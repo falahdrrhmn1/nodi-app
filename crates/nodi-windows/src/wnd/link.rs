@@ -194,61 +194,92 @@ pub fn follow(app: &mut App, target: &str) {
         Kind::Web => shell(app, "open", target, None),
         Kind::Refused => dialogs::error(
             app.hwnd,
-            &format!("Nodi only opens web, e-mail, file and note links. Not opened:\n{target}"),
+            &format!(
+                "Nodi only opens web, e-mail, note links and files on this computer \
+                 (C:\\..., D:\\...). Not opened:\n{target}"
+            ),
         ),
-        Kind::Reveal { path, network } => {
-            // Links never start programs, scripts or unknown file types, and
-            // never open files on another computer. Offer Explorer instead.
-            let reason = if network {
-                "a file on a network location"
-            } else {
-                "a program, a script or a file type Nodi does not open"
-            };
-            let question =
-                format!("This link points to {reason}:\n{path}\n\nShow it in Explorer instead?");
-            if dialogs::ask_yes_no(app.hwnd, &question) {
-                shell(
-                    app,
-                    "open",
-                    "explorer.exe",
-                    Some(&format!("/select,\"{path}\"")),
-                );
+        Kind::Network(path) => network_refused(app, &path),
+        Kind::Local(path) => {
+            // The file system is only touched here, after a deliberate
+            // Ctrl+Click, and never on a network drive (that would contact the
+            // other computer and could hand it the Windows login hash).
+            if drive_is_remote(&path) {
+                network_refused(app, &path);
+                return;
             }
-        }
-        Kind::Document(path) | Kind::Folder(path) => {
-            let confirmed = CONFIRMED.with(|set| set.borrow().contains(&path));
-            if !confirmed {
-                let question = format!("Open this with its default program?\n{path}");
-                if !dialogs::ask_yes_no(app.hwnd, &question) {
-                    return;
+            let is_dir = std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir());
+            match local_action(&path, is_dir) {
+                LocalAction::Open => {
+                    let confirmed = CONFIRMED.with(|set| set.borrow().contains(&path));
+                    if !confirmed {
+                        let question = format!("Open this with its default program?\n{path}");
+                        if !dialogs::ask_yes_no(app.hwnd, &question) {
+                            return;
+                        }
+                        CONFIRMED.with(|set| set.borrow_mut().insert(path.clone()));
+                    }
+                    shell(app, "open", &path, None);
                 }
-                CONFIRMED.with(|set| set.borrow_mut().insert(path.clone()));
+                LocalAction::Reveal => {
+                    // Programs, scripts, shortcuts and unknown types are never
+                    // run from a link; Explorer can show where they are.
+                    let question = format!(
+                        "This link points to a program, a script or a file type Nodi does \
+                         not open:\n{path}\n\nShow it in Explorer instead?"
+                    );
+                    if dialogs::ask_yes_no(app.hwnd, &question) {
+                        shell(
+                            app,
+                            "open",
+                            "explorer.exe",
+                            Some(&format!("/select,\"{path}\"")),
+                        );
+                    }
+                }
             }
-            shell(app, "open", &path, None);
         }
     }
 }
 
+fn network_refused(app: &App, path: &str) {
+    dialogs::info(
+        app.hwnd,
+        &format!(
+            "This link points to a network location:\n{path}\n\n\
+             Nodi does not open network locations from links, because that \
+             contacts another computer. Open it yourself in Explorer if you trust it."
+        ),
+    );
+}
+
 thread_local! {
-    /// Local file targets the user already agreed to open this session.
+    /// Local targets the user already agreed to open this session.
     static CONFIRMED: std::cell::RefCell<std::collections::HashSet<String>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
-/// What following a link would do.
+/// What a link target is. Deciding this never touches the file system, so
+/// hovering a link has no side effects.
 #[derive(Debug, PartialEq, Eq)]
 enum Kind {
     /// http(s) / mailto: handed to the browser or mail client.
     Web,
-    /// A local file whose type is on the document allowlist (asks first).
-    Document(String),
-    /// A local folder (asks first, opens in Explorer).
-    Folder(String),
-    /// Programs, scripts, unknown types and any file on another computer:
-    /// never opened, only shown in Explorer on request.
-    Reveal { path: String, network: bool },
-    /// Any other scheme (`ms-settings:`, `javascript:` …) or a malformed path.
+    /// A fully qualified path on a drive letter (`X:\...`), normalised.
+    Local(String),
+    /// `\\server\share\...`: never opened or touched.
+    Network(String),
+    /// Other schemes, relative or device paths, streams, reserved names.
     Refused,
+}
+
+/// What to do with a local path once it was clicked.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalAction {
+    /// A folder, or a document type on the allowlist (asks first).
+    Open,
+    /// Anything else: only shown in Explorer on request.
+    Reveal,
 }
 
 /// File types a link may open with their default program. Everything else
@@ -283,90 +314,118 @@ fn classify(target: &str) -> Kind {
                 decoded
             }
         }
-        None => target.to_owned(),
+        None => target.trim().replace('/', "\\"),
     };
-    // Anything else with a scheme (but not a drive letter like C:) is refused.
-    // RFC 3986 scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
-    let scheme_like = |colon: usize| {
-        colon > 1
-            && path
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_alphabetic())
-            && path[..colon]
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
-    };
-    if path.find(':').is_some_and(scheme_like) {
-        return Kind::Refused;
+    // `\\server\share` is a network location. `\\?\`, `\\.\` and `\??\`
+    // (device / NT object paths, which can also reach the network) and any
+    // other path starting with a backslash are refused outright.
+    if let Some(rest) = path.strip_prefix("\\\\") {
+        let device = rest.starts_with('?') || rest.starts_with('.');
+        return if device || rest.is_empty() {
+            Kind::Refused
+        } else {
+            Kind::Network(path)
+        };
     }
-    let Some(path) = normalize_path(&path) else {
-        return Kind::Refused;
-    };
-    let network = path.starts_with("\\\\");
-    if network {
-        return Kind::Reveal { path, network };
+    match normalize_path(&path) {
+        Some(path) => Kind::Local(path),
+        None => Kind::Refused,
     }
-    if std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
-        return Kind::Folder(path);
+}
+
+/// Accepts only fully qualified drive paths (`X:\...`) and normalises them the
+/// way Win32 resolves them: trailing dots/spaces are dropped from every
+/// component (`calc.exe.` *is* `calc.exe`). Returns `None` for relative paths,
+/// alternate data streams (`a.txt:evil.exe`, `::$DATA`), quotes, control
+/// characters and reserved device names (`CON`, `NUL`, `COM1`, …).
+fn normalize_path(path: &str) -> Option<String> {
+    let path = path.trim();
+    let bytes = path.as_bytes();
+    let fully_qualified =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    if !fully_qualified
+        || path.matches(':').count() != 1
+        || path
+            .chars()
+            .any(|ch| ch == '"' || ch.is_control() || ch == '*' || ch == '?')
+    {
+        return None;
     }
-    let extension = std::path::Path::new(&path)
+    // `bytes[0..3]` are ASCII, so slicing at 3 is on a char boundary.
+    let (drive, rest) = path.split_at(3);
+    let mut components = Vec::new();
+    for part in rest.split('\\') {
+        if part.is_empty() {
+            continue;
+        }
+        let part = if part == "." || part == ".." {
+            part
+        } else {
+            part.trim_end_matches(['.', ' '])
+        };
+        if part.is_empty() || is_reserved_device(part) {
+            return None;
+        }
+        components.push(part);
+    }
+    Some(format!(
+        "{}{}",
+        drive.to_ascii_uppercase(),
+        components.join("\\")
+    ))
+}
+
+/// `CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`, `CONIN$`, `CONOUT$` — with
+/// or without an extension, these name devices, not files.
+fn is_reserved_device(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.len() == 4
+        && stem.as_bytes()[3].is_ascii_digit())
+}
+
+/// Folder → open; allowlisted document type (that Windows does not flag) →
+/// open; anything else → reveal only.
+fn local_action(path: &str, is_dir: bool) -> LocalAction {
+    if is_dir {
+        return LocalAction::Open;
+    }
+    let extension = std::path::Path::new(path)
         .extension()
         .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     if DOCUMENT_EXTENSIONS.contains(&extension.as_str()) && !windows_says_dangerous(&extension) {
-        Kind::Document(path)
+        LocalAction::Open
     } else {
-        Kind::Reveal { path, network }
+        LocalAction::Reveal
     }
 }
 
-/// Normalises a path the way Win32 resolves it: forward slashes become
-/// backslashes and trailing dots/spaces are dropped from every component
-/// (`calc.exe.` *is* `calc.exe`). Returns `None` for paths Nodi will not touch:
-/// alternate data streams (`a.txt:evil.exe`, `::$DATA`), quotes, control
-/// characters, or `\\?\` device paths.
-fn normalize_path(path: &str) -> Option<String> {
-    let path = path.trim().replace('/', "\\");
-    if path.is_empty()
-        || path.starts_with("\\\\?\\")
-        || path.starts_with("\\\\.\\")
-        || path.chars().any(|ch| ch == '"' || ch.is_control())
-    {
-        return None;
-    }
-    // A colon is only allowed as the drive separator ("C:").
-    let drive = path
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic())
-        && path[1..].starts_with(':');
-    if path.matches(':').count() > usize::from(drive) {
-        return None;
-    }
-    let (prefix, rest) = if drive {
-        path.split_at(2)
-    } else {
-        ("", path.as_str())
+/// True unless the path's drive is a local disk, removable drive, CD or RAM
+/// disk (mapped network drives and unknown roots count as remote).
+fn drive_is_remote(path: &str) -> bool {
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    const DRIVE_CDROM: u32 = 5;
+    const DRIVE_RAMDISK: u32 = 6;
+    let Some(root) = path.get(..3) else {
+        return true;
     };
-    let components: Vec<&str> = rest
-        .split('\\')
-        .enumerate()
-        .map(|(index, part)| {
-            // Keep "." and ".." components; strip trailing dots/spaces elsewhere.
-            if part == "." || part == ".." || (index == 0 && part.is_empty()) {
-                part
-            } else {
-                part.trim_end_matches(['.', ' '])
-            }
-        })
-        .collect();
-    let joined = components.join("\\");
-    let cleaned = joined.trim_end_matches('\\');
-    if cleaned.is_empty() && prefix.is_empty() {
-        return None;
-    }
-    Some(format!("{prefix}{cleaned}"))
+    let root = win::wide(root);
+    // SAFETY: NUL-terminated root such as "C:\"; the call only queries.
+    let kind = unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) };
+    !matches!(
+        kind,
+        DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_CDROM | DRIVE_RAMDISK
+    )
 }
 
 /// Windows' own list of dangerous file types (`AssocIsDangerous`), as a
@@ -402,15 +461,17 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Human-readable target for the status bar.
+/// Human-readable target for the status bar. Pure: hovering a link never
+/// touches the file system or the network.
 fn describe(target: &str) -> String {
     if let Some(id) = links::parse_note_link(target) {
         return format!("note {id}");
     }
     match classify(target) {
-        Kind::Reveal { path, .. } => format!("{path} (will only be shown in Explorer)"),
+        Kind::Web => target.to_owned(),
+        Kind::Local(path) => path,
+        Kind::Network(path) => format!("{path} (network location — not opened)"),
         Kind::Refused => format!("{target} (not supported)"),
-        _ => target.to_owned(),
     }
 }
 
@@ -534,43 +595,69 @@ mod tests {
 
     #[test]
     fn classify_never_runs_programs() {
-        let reveal = |target: &str| matches!(classify(target), Kind::Reveal { .. });
+        let local = |target: &str| match classify(target) {
+            Kind::Local(path) => path,
+            other => panic!("{target}: expected a local path, got {other:?}"),
+        };
+        let action = |target: &str| local_action(&local(target), false);
         assert_eq!(classify("https://example.com/x"), Kind::Web);
         assert_eq!(classify("mailto:a@b.c"), Kind::Web);
-        assert!(reveal(r"C:\Windows\System32\calc.exe"));
-        assert!(reveal("file:///C:/Users/x/run.BAT"));
-        assert!(reveal(r"C:\docs\evil.pdf.lnk"));
+        // Programs, scripts and shortcuts are only revealed, never opened.
+        assert_eq!(action(r"C:\Windows\System32\calc.exe"), LocalAction::Reveal);
+        assert_eq!(action("file:///C:/Users/x/run.BAT"), LocalAction::Reveal);
+        assert_eq!(action(r"C:\docs\evil.pdf.lnk"), LocalAction::Reveal);
         // Win32 drops trailing dots and spaces: these are still calc.exe.
-        assert!(reveal(r"C:\Windows\System32\calc.exe."));
-        assert!(reveal("C:/Windows/System32/calc.exe . ."));
-        assert!(reveal("file:///C:/x/run.bat%20"));
+        assert_eq!(
+            local(r"C:\Windows\System32\calc.exe."),
+            r"C:\Windows\System32\calc.exe"
+        );
+        assert_eq!(
+            action("C:/Windows/System32/calc.exe . ."),
+            LocalAction::Reveal
+        );
+        assert_eq!(action("file:///C:/x/run.bat%20"), LocalAction::Reveal);
         // No extension or an unknown one is never opened.
-        assert!(reveal(r"C:\tools\README"));
-        assert!(reveal(r"C:\x\payload.xyz"));
-        // Alternate data streams, device paths and quotes are refused.
+        assert_eq!(action(r"C:\tools\README"), LocalAction::Reveal);
+        assert_eq!(action(r"C:\x\payload.xyz"), LocalAction::Reveal);
+        // Documents on the allowlist (and folders) open after a prompt.
+        assert_eq!(
+            local("file:///C:/My%20Docs/paper.pdf"),
+            r"C:\My Docs\paper.pdf"
+        );
+        assert_eq!(action("file:///C:/My%20Docs/paper.pdf"), LocalAction::Open);
+        assert_eq!(local_action(r"C:\Users", true), LocalAction::Open);
+        // Streams, device and NT object paths, relative paths, reserved
+        // names and quotes are refused.
         assert_eq!(classify(r"C:\x\a.txt:evil.exe"), Kind::Refused);
         assert_eq!(classify(r"C:\x\a.txt::$DATA"), Kind::Refused);
         assert_eq!(classify(r"\\?\C:\x\a.pdf"), Kind::Refused);
+        assert_eq!(classify(r"\\.\pipe\x"), Kind::Refused);
+        assert_eq!(classify(r"\??\UNC\server\share\a.pdf"), Kind::Refused);
+        assert_eq!(classify(r"\server\share\a.pdf"), Kind::Refused);
+        assert_eq!(classify(r"..\a.pdf"), Kind::Refused);
+        assert_eq!(classify("a.pdf"), Kind::Refused);
+        assert_eq!(classify(r"C:x.pdf"), Kind::Refused);
+        assert_eq!(classify(r"C:\x\CON"), Kind::Refused);
+        assert_eq!(classify(r"C:\x\nul.txt"), Kind::Refused);
+        assert_eq!(classify(r"C:\x\COM1.pdf"), Kind::Refused);
         assert_eq!(classify("C:/x/a\"b.pdf"), Kind::Refused);
+        assert_eq!(classify(r"C:\x\a*.pdf"), Kind::Refused);
         assert_eq!(classify("ms-settings:privacy"), Kind::Refused);
         assert_eq!(classify("javascript:alert(1)"), Kind::Refused);
-        // Documents on the allowlist open (after the confirmation prompt).
-        assert_eq!(
-            classify("file:///C:/My%20Docs/paper.pdf"),
-            Kind::Document(r"C:\My Docs\paper.pdf".to_owned())
-        );
-        // Files on another computer are only shown, never opened.
+        // Network locations are recognised but never opened or touched.
         assert!(matches!(
             classify(r"\\server\share\notes.txt"),
-            Kind::Reveal { network: true, .. }
+            Kind::Network(_)
         ));
         assert!(matches!(
             classify("file://server/share/a.docx"),
-            Kind::Reveal { network: true, .. }
+            Kind::Network(_)
         ));
+        assert!(describe(r"\\server\share\a.pdf").contains("not opened"));
         // Multi-byte text never panics.
         assert_eq!(classify("ü:x"), Kind::Refused);
-        assert!(reveal("übung"));
+        assert_eq!(classify("übung"), Kind::Refused);
+        assert_eq!(local(r"C:\übung\Ä.pdf"), r"C:\übung\Ä.pdf");
         assert_eq!(percent_decode("%€x%4"), "%€x%4");
     }
 

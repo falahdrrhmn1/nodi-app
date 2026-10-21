@@ -112,14 +112,21 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
 
 ## Security notes
 - Links never run programs: `http(s)`/`mailto` open in the browser/mail
-  client. Local paths are normalised the way Win32 resolves them (trailing
-  dots/spaces dropped, so `calc.exe.` is still `calc.exe`); alternate data
-  streams, device paths and quotes are refused. Only file types on a
-  **document allowlist** (pdf, docx, png, txt, …) that Windows' own
+  client. File links must be fully qualified drive paths (`X:\...`);
+  relative paths, `\\?\`, `\\.\`, `\??\` device/NT paths, alternate data
+  streams, wildcards, quotes and reserved device names (`CON`, `NUL`, `COM1`,
+  …) are refused. Paths are normalised the way Win32 resolves them (trailing
+  dots/spaces dropped, so `calc.exe.` is still `calc.exe`). Only file types on
+  a **document allowlist** (pdf, docx, png, txt, …) that Windows' own
   `AssocIsDangerous` does not flag are opened, after a confirmation that shows
-  the real path. Programs, scripts, shortcuts, unknown types and every file on
-  a network share are only shown in Explorer on request. Other URL schemes are
-  refused. The status bar shows the real target, not the display text.
+  the real path; programs, scripts, shortcuts and unknown types are only shown
+  in Explorer on request. Other URL schemes are refused.
+- Network locations (`\\server\share`, mapped network drives) are never
+  opened or touched from a link, so a link cannot make Windows contact another
+  computer (no SMB/NTLM exposure). Hovering a link is side-effect free: the
+  status bar shows the real target without accessing the file system; the
+  disk is only read after a deliberate Ctrl+Click, and only on local drives
+  (checked with `GetDriveTypeW`).
 - The test remote control (`testhook.rs`) is only active when `nodi.exe` is
   started with `NODI_TEST_HOOKS=1`.
 - No network access, no telemetry, no background processes.
