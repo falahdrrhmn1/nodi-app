@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostMessageW, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_PASTE,
 };
 
-use crate::wnd::{editor, format, image};
+use crate::wnd::{editor, format, image, link};
 
 const SUBCLASS_ID: usize = 0x4E4F_4445; // 'NODE'
 
@@ -123,8 +123,16 @@ unsafe extern "system" fn subclass(
             }
             // A space after `-`, `*`, `1.`, `1)` or `#{1,4}` is a Markdown
             // marker; it is converted before Rich Edit inserts the space.
-            if ch == 0x20 && !ctrl && !alt && space_marker(hwnd, shift) {
-                return 0;
+            if ch == 0x20 && !ctrl && !alt {
+                if space_marker(hwnd, shift) {
+                    return 0;
+                }
+                // A full local path just typed becomes a link; the space is
+                // then inserted after it.
+                if link::auto_link_before_caret(hwnd) {
+                    editor::replace_selection(hwnd, " ", true);
+                    return 0;
+                }
             }
             // Enter is handled on WM_KEYDOWN (Rich Edit inserts the paragraph
             // there and ignores the WM_CHAR CR); Tab arrives as WM_CHAR.
@@ -133,6 +141,11 @@ unsafe extern "system" fn subclass(
                 if !ctrl && !alt && tab_key(hwnd, shift) {
                     return 0;
                 }
+            } else if ch == 0x22 && !ctrl && !alt {
+                // A quoted path is complete once the closing quote is in.
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                link::auto_link_before_caret(hwnd);
+                return result;
             } else if ch >= 0x20 {
                 clear_marker_undo();
             }
@@ -143,9 +156,13 @@ unsafe extern "system" fn subclass(
                 if key == VK_RETURN {
                     clear_marker_undo();
                 }
-            } else if (key == VK_RETURN && !shift && newline_keep_indent(hwnd))
-                || (key == VK_BACK && !shift && backspace_key(hwnd))
-            {
+            } else if key == VK_RETURN && !shift {
+                // Finish a typed path before the paragraph break splits it.
+                link::auto_link_before_caret(hwnd);
+                if newline_keep_indent(hwnd) {
+                    return 0;
+                }
+            } else if key == VK_BACK && !shift && backspace_key(hwnd) {
                 return 0;
             }
             let paste =
@@ -498,7 +515,7 @@ fn code_tab_key(editor: HWND, outdent: bool) -> bool {
     true
 }
 
-/// Handles the paste cases Rich Edit cannot: a picture on the clipboard, and
+/// Handles the paste cases Rich Edit cannot: pictures, HTML and Markdown, and
 /// Ctrl+Shift+V (plain text). Returns false for an ordinary paste.
 fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
     if plain {
@@ -512,6 +529,25 @@ fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
         return true;
     }
     if !image::clipboard_is_image_only() {
+        // Rich Text Format wins: Rich Edit pastes it natively, unchanged.
+        if !image::clipboard_has_rtf() {
+            if let Some(html) = image::clipboard_html(frame) {
+                let markdown = nodi_core::html_in::cf_html_to_markdown(&html);
+                if paste_markdown(editor, &markdown) {
+                    return true;
+                }
+            }
+            if let Some(text) = image::clipboard_text(frame) {
+                if nodi_core::markdown_in::looks_like_markdown(&text)
+                    && paste_markdown(editor, &text)
+                {
+                    return true;
+                }
+                if link::paste_path_link(editor, &text) {
+                    return true;
+                }
+            }
+        }
         return false;
     }
     match image::clipboard_image(frame) {
@@ -523,4 +559,13 @@ fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
         }
         None => false,
     }
+}
+
+/// Converts Markdown to the RTF Nodi uses and inserts it at the caret.
+fn paste_markdown(editor: HWND, markdown: &str) -> bool {
+    if markdown.trim().is_empty() {
+        return false;
+    }
+    let rtf = nodi_core::markdown_in::markdown_to_rtf(markdown, format::full_width_twips(editor));
+    editor::insert_rtf(editor, rtf.as_bytes())
 }

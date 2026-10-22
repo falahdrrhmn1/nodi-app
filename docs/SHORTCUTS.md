@@ -17,6 +17,7 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 | F2 | Rename note |
 | Del (in the tree) | Move note to Trash |
 | Alt+Up / Alt+Down | Move note up / down among its siblings |
+| Drag & drop in the tree | Move before / after (insertion line) or inside (highlighted row, last child); near the top/bottom edge auto-scrolls, hovering a collapsed node expands it, **Esc** cancels |
 | Enter (in the tree) | Open the selected note |
 
 ## Editing (Notepad++ style)
@@ -29,6 +30,8 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 | Backspace | At the start of a paragraph: remove a bullet (keeping the indentation), turn a heading back into text, or outdent one step |
 | Ctrl+Z / Ctrl+Y | Undo / Redo |
 | Ctrl+X / Ctrl+C / Ctrl+V | Cut / Copy / Paste (also pastes screenshots and copied pictures) |
+| Ctrl+V with Markdown text | Converts headings, lists, code fences, tables and links to Nodi formatting |
+| Ctrl+V from a browser | Keeps the copied HTML structure (headings, lists, tables, links, code) |
 | Ctrl+Shift+V | Paste as plain text |
 | Ctrl+A | Select all |
 | Ctrl+D | Duplicate line (or the selection) |
@@ -66,7 +69,8 @@ the insert commands.
 | Ctrl+B / Ctrl+I / Ctrl+U | Bold / Italic / Underline |
 | Alt+Shift+5 | Strikethrough |
 | Ctrl+` | Inline code |
-| Ctrl+Shift+C | Code block (keeps indentation, Tab inserts a tab) |
+| Ctrl+Shift+C | Code block (keeps indentation, Tab inserts a tab, Copy link in its header) |
+| Ctrl+Shift+O | Output block (dark code block, exports as ```` ```output ````) |
 | Ctrl+Shift+H | Highlight |
 | Ctrl+] / Ctrl+[ | Bigger / smaller text |
 | Ctrl+Alt+1 / 2 / 3 / 4 | Heading 1 / 2 / 3 / 4 (Enter after a heading continues with normal text) |
@@ -86,7 +90,7 @@ the insert commands.
 | Alt+= | Insert formula (LaTeX) |
 | Ctrl+Shift+- | Insert separator (horizontal rule) |
 | Double-click a formula | Edit the formula |
-| Double-click a picture | Open Image > Size... |
+| Double-click a picture | Open Image > Size... (px, %, lock aspect ratio) |
 
 ## Search and view
 
@@ -103,15 +107,22 @@ the insert commands.
 ## Mouse
 
 - Right-click a note in the tree: New Child/Sibling Note, Rename, Change Icon,
-  Duplicate, Move to Trash, Properties. Moving to the Trash asks first and
+  Duplicate, Move Up/Down, **Move to...** (pick any parent or Top level), Move
+  to Top Level, Move to Trash, Properties. Moving to the Trash asks first and
   mentions how many sub-notes go with it.
 - **Trash (N)** sits at the bottom of the tree: click it (or press Enter) to
   open the Trash; right-click it for Open Trash and Empty Trash... (files are
   still kept in `data/recovery/`).
-- Drag a note onto another note to make it a child; drop on empty space to move
-  it to the top level.
-- Right-click inside a note: clipboard commands plus picture (size, 25–100 %,
-  fit to width, align, save), table (insert/delete rows and columns), link and
-  formula commands when the click lands on one.
+- Drag a note or folder in the tree: the top/bottom quarter of a row shows an
+  insertion line (before/after), the middle half highlights the row (drop
+  inside as the last child). Dropping on empty space moves it to the top
+  level. Dragging near an edge scrolls; hovering a collapsed node expands it
+  after ~0.7 s; Esc cancels.
+- A full local path (`C:\...`, `D:\...`, or a quoted path with spaces) becomes
+  a link when you type a space, Enter or the closing quote, or when you paste
+  it. Insert > Link... has **Browse Folder...** as well as Browse File.
+- Right-click inside a note: clipboard commands plus picture (size, crop,
+  25–100 %, fit to width, align, save), table (insert/delete rows and columns),
+  link and formula commands when the click lands on one.
 - A selected picture shows resize handles (Rich Edit's own); **Image > Size...**
-  sets an exact size.
+  sets an exact size in pixels or percent and **Image > Crop...** trims it.

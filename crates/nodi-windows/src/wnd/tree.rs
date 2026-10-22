@@ -3,6 +3,7 @@
 
 use std::ptr;
 
+use nodi_core::tree::Position;
 use nodi_core::{NodeKind, NoteId};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
@@ -11,16 +12,16 @@ use windows_sys::Win32::UI::Controls::{
     ImageList_BeginDrag, ImageList_Create, ImageList_DragEnter, ImageList_DragLeave,
     ImageList_DragMove, ImageList_EndDrag, ImageList_ReplaceIcon, ILC_COLOR32, ILC_MASK, NMHDR,
     NMTREEVIEWW, NMTVDISPINFOW, NMTVKEYDOWN, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET,
-    TVHITTESTINFO, TVHT_ONITEM, TVIF_CHILDREN, TVIF_IMAGE, TVIF_SELECTEDIMAGE, TVIF_TEXT,
-    TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM,
-    TVM_EDITLABELW, TVM_EXPAND, TVM_GETEDITCONTROL, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM,
-    TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETIMAGELIST, TVM_SETITEMW, TVN_BEGINDRAGW,
-    TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW, TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVN_SELCHANGEDW,
-    TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
-    WC_TREEVIEWW,
+    TVGN_DROPHILITE, TVHITTESTINFO, TVHT_ONITEM, TVIF_CHILDREN, TVIF_IMAGE, TVIF_SELECTEDIMAGE,
+    TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT,
+    TVM_DELETEITEM, TVM_EDITLABELW, TVM_EXPAND, TVM_GETEDITCONTROL, TVM_GETITEMRECT, TVM_GETITEMW,
+    TVM_GETNEXTITEM, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETIMAGELIST,
+    TVM_SETINSERTMARK, TVM_SETITEMW, TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW,
+    TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS,
+    TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEWW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, VK_APPS, VK_DELETE, VK_RETURN,
+    ReleaseCapture, SetCapture, SetFocus, VK_APPS, VK_DELETE, VK_ESCAPE, VK_RETURN,
 };
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, ExtractIconExW, SHGetStockIconInfo, SetWindowSubclass, SHGSI_ICON,
@@ -29,15 +30,17 @@ use windows_sys::Win32::UI::Shell::{
     SIID_WARNING,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyIcon, DestroyMenu, GetCursorPos,
-    PostMessageW, SendMessageW, SetMenuDefaultItem, SetWindowTextW, TrackPopupMenu, HICON, HMENU,
-    MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WS_CHILD, WS_EX_CLIENTEDGE, WS_VISIBLE,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyIcon, DestroyMenu, GetClientRect,
+    GetCursorPos, KillTimer, PostMessageW, SendMessageW, SetMenuDefaultItem, SetTimer,
+    SetWindowTextW, TrackPopupMenu, HICON, HMENU, MF_SEPARATOR, MF_STRING, SB_LINEDOWN, SB_LINEUP,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_TIMER, WM_VSCROLL, WS_CHILD, WS_EX_CLIENTEDGE, WS_VISIBLE,
 };
 
 use crate::app::App;
 use crate::win;
 use crate::wnd::menu;
+use crate::wnd::status;
 
 /// The 8 built-in "Change Icon" choices: key → label. The order fixes the image
 /// list indices.
@@ -632,10 +635,6 @@ fn hit_item(app: &App, client: POINT) -> isize {
     }
 }
 
-fn hit_test(app: &App, client: POINT) -> Option<NoteId> {
-    item_note(app, hit_item(app, client))
-}
-
 // --------------------------------------------------------------- notifications
 
 /// Handles a `WM_NOTIFY` that came from the TreeView. Returns true when the
@@ -781,6 +780,14 @@ pub fn install_subclass(app: &App) {
     }
 }
 
+/// Timer that keeps auto-scroll and hover-expand alive while the mouse is
+/// still (no `WM_MOUSEMOVE` arrives then).
+const DRAG_TIMER: usize = 0x4E44; // 'ND'
+/// How long a collapsed node must be hovered to expand during a drag.
+const HOVER_EXPAND: u128 = 700;
+/// Distance from the top/bottom edge that starts auto-scrolling.
+const SCROLL_MARGIN: i32 = 24;
+
 unsafe extern "system" fn tree_subclass(
     hwnd: HWND,
     msg: u32,
@@ -807,10 +814,26 @@ unsafe extern "system" fn tree_subclass(
                 }
             }
         }
+        WM_KEYDOWN => {
+            if let Some(app) = crate::wnd::app_mut(frame) {
+                if app.dragging && wparam == VK_ESCAPE as usize {
+                    finish_drag(app);
+                    status::set_message(app, "Move cancelled");
+                    return 0;
+                }
+            }
+        }
+        WM_TIMER if wparam == DRAG_TIMER => {
+            if let Some(app) = crate::wnd::app_mut(frame).filter(|app| app.dragging) {
+                drag_tick(app);
+                return 0;
+            }
+        }
         _ => {}
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
+
 fn begin_drag(app: &mut App, item: isize, point: POINT) {
     let Some(id) = item_note(app, item) else {
         return;
@@ -824,21 +847,177 @@ fn begin_drag(app: &mut App, item: isize, point: POINT) {
     let index = icon_index_for(app, node.kind, node.icon.as_deref());
     app.drag_source = Some(id);
     app.dragging = true;
+    app.drag_hover = None;
+    app.drag_hover_since = None;
+    app.drag_point = Some((point.x, point.y));
     // SAFETY: `images`/`tree_view` belong to us; the drag lives until drop.
     unsafe {
         ImageList_BeginDrag(app.images, index, 8, 8);
         ImageList_DragEnter(app.tree_view, point.x, point.y);
         SetCapture(app.tree_view);
+        SetTimer(app.tree_view, DRAG_TIMER, 100, None);
     }
 }
 
-fn on_drag_move(_app: &App, lparam: LPARAM) {
-    let x = win::x_from_lparam(lparam);
-    let y = win::y_from_lparam(lparam);
+fn on_drag_move(app: &mut App, lparam: LPARAM) {
+    let point = POINT {
+        x: win::x_from_lparam(lparam),
+        y: win::y_from_lparam(lparam),
+    };
     // SAFETY: a drag image is in progress; coordinates are tree client coords.
     unsafe {
-        ImageList_DragMove(x, y);
+        ImageList_DragMove(point.x, point.y);
     }
+    app.drag_point = Some((point.x, point.y));
+    auto_scroll(app, point.y);
+    update_hover(app, point);
+}
+
+/// True while `point` is over the tree's "Trash" pseudo-item.
+fn over_trash(app: &App, point: POINT) -> bool {
+    app.trash_item != 0 && hit_item(app, point) == app.trash_item
+}
+
+/// Item under `client` plus the drop zone for its row: the top quarter means
+/// "before", the bottom quarter "after", the middle "inside".
+fn drop_zone(app: &App, client: POINT) -> Option<(NoteId, Position)> {
+    let item = hit_item(app, client);
+    if item == 0 || item == app.trash_item {
+        return None;
+    }
+    let id = item_note(app, item)?;
+    let mut rect = RECT {
+        left: 1,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: `rect` is valid for the call; `item` is a live item.
+    let ok = unsafe {
+        SendMessageW(
+            app.tree_view,
+            TVM_GETITEMRECT,
+            item as usize,
+            &mut rect as *mut RECT as isize,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let band = ((rect.bottom - rect.top) / 4).max(1);
+    let position = if client.y < rect.top + band {
+        Position::Before
+    } else if client.y >= rect.bottom - band {
+        Position::After
+    } else {
+        Position::Inside
+    };
+    Some((id, position))
+}
+
+/// Draws the drop feedback: an insertion line for before/after, the
+/// `TVGN_DROPHILITE` highlight for "inside".
+fn show_drop(app: &App, hover: Option<(NoteId, Position)>) {
+    if app.tree_view.is_null() {
+        return;
+    }
+    // SAFETY: plain messages to our TreeView; a zero item clears each mark.
+    unsafe {
+        SendMessageW(app.tree_view, TVM_SETINSERTMARK, 0, 0);
+        SendMessageW(app.tree_view, TVM_SELECTITEM, TVGN_DROPHILITE as usize, 0);
+        if let Some((id, position)) = hover {
+            if let Some(item) = item_of(app, &id) {
+                match position {
+                    Position::Before => {
+                        SendMessageW(app.tree_view, TVM_SETINSERTMARK, 0, item);
+                    }
+                    Position::After => {
+                        SendMessageW(app.tree_view, TVM_SETINSERTMARK, 1, item);
+                    }
+                    Position::Inside => {
+                        SendMessageW(
+                            app.tree_view,
+                            TVM_SELECTITEM,
+                            TVGN_DROPHILITE as usize,
+                            item,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn update_hover(app: &mut App, point: POINT) {
+    let hover = drop_zone(app, point);
+    if hover == app.drag_hover {
+        return;
+    }
+    app.drag_hover = hover;
+    app.drag_hover_since = Some(std::time::Instant::now());
+    let hover = app.drag_hover.clone();
+    show_drop(app, hover);
+}
+
+/// Scrolls the tree when the drag cursor is near the top or bottom edge.
+fn auto_scroll(app: &App, y: i32) {
+    let mut rect = RECT::default();
+    // SAFETY: `rect` is a valid out pointer; `tree_view` is ours.
+    unsafe {
+        GetClientRect(app.tree_view, &mut rect);
+    }
+    let (direction, distance) = if y < rect.top + SCROLL_MARGIN {
+        (SB_LINEUP, rect.top + SCROLL_MARGIN - y)
+    } else if y > rect.bottom - SCROLL_MARGIN {
+        (SB_LINEDOWN, y - (rect.bottom - SCROLL_MARGIN))
+    } else {
+        return;
+    };
+    let lines = (distance / 8).clamp(1, 4);
+    for _ in 0..lines {
+        // SAFETY: a vertical scroll message to our own TreeView.
+        unsafe {
+            SendMessageW(app.tree_view, WM_VSCROLL, direction as usize, 0);
+        }
+    }
+}
+
+/// Timer tick during a drag: auto-scroll, refresh the indicator and expand a
+/// collapsed node that has been hovered for `HOVER_EXPAND` ms.
+fn drag_tick(app: &mut App) {
+    let Some((x, y)) = app.drag_point else {
+        return;
+    };
+    auto_scroll(app, y);
+    update_hover(app, POINT { x, y });
+    let Some((id, Position::Inside)) = app.drag_hover.clone() else {
+        return;
+    };
+    let hovered = app
+        .drag_hover_since
+        .is_some_and(|since| since.elapsed().as_millis() >= HOVER_EXPAND);
+    if hovered && !app.expanded.contains(&id) && !app.tree.children(Some(&id)).is_empty() {
+        app.drag_hover_since = Some(std::time::Instant::now());
+        app.expand(Some(id));
+    }
+}
+
+/// Ends the drag (drop or Esc) and clears every visual mark.
+fn finish_drag(app: &mut App) {
+    // SAFETY: matching the BeginDrag/DragEnter/SetCapture/SetTimer calls; a
+    // missing capture or timer is harmless.
+    unsafe {
+        ImageList_DragLeave(app.tree_view);
+        ImageList_EndDrag();
+        ReleaseCapture();
+        KillTimer(app.tree_view, DRAG_TIMER);
+    }
+    show_drop(app, None);
+    app.dragging = false;
+    app.drag_source = None;
+    app.drag_hover = None;
+    app.drag_hover_since = None;
+    app.drag_point = None;
 }
 
 fn on_drop(app: &mut App, lparam: LPARAM) {
@@ -846,19 +1025,22 @@ fn on_drop(app: &mut App, lparam: LPARAM) {
         x: win::x_from_lparam(lparam),
         y: win::y_from_lparam(lparam),
     };
-    // SAFETY: matching the BeginDrag/DragEnter from `begin_drag`.
-    unsafe {
-        ImageList_DragLeave(app.tree_view);
-        ImageList_EndDrag();
-        ReleaseCapture();
+    let hover = drop_zone(app, point);
+    let trash = over_trash(app, point);
+    let source = app.drag_source.clone();
+    finish_drag(app);
+    if trash {
+        return;
     }
-    app.dragging = false;
-    if let Some(source) = app.drag_source.take() {
-        match hit_test(app, point) {
-            Some(target) if target != source => app.move_node(source, target),
+    if let Some(source) = source {
+        match hover {
+            Some((target, position)) if target != source => {
+                app.move_node_relative(source, target, position);
+            }
             Some(_) => {}
             // Dropped on empty space: move to the top level.
             None => {
+                app.context_note = Some(source.clone());
                 app.selected = Some(source);
                 app.move_selected_to_root();
             }
@@ -1002,6 +1184,11 @@ fn build_menu(app: &App) -> HMENU {
                 append(menu, menu::IDM_NOTES_ICON, "Change Icon...");
                 append(menu, menu::IDM_NOTES_DUPLICATE, "Duplicate");
                 AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(menu, menu::IDM_NOTES_MOVE_UP, "Move Up");
+                append(menu, menu::IDM_NOTES_MOVE_DOWN, "Move Down");
+                append(menu, menu::IDM_NOTES_MOVE_TO, "Move to...");
+                append(menu, menu::IDM_NOTES_MOVE_ROOT, "Move to Top Level");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
                 append(menu, menu::IDM_NOTES_TRASH, "Move to Trash");
                 append(menu, menu::IDM_NOTES_PROPERTIES, "Properties");
                 SetMenuDefaultItem(menu, menu::IDM_NOTES_OPEN as u32, 0);
@@ -1012,6 +1199,11 @@ fn build_menu(app: &App) -> HMENU {
                 AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
                 append(menu, menu::IDM_NOTES_RENAME, "Rename");
                 append(menu, menu::IDM_NOTES_ICON, "Change Icon...");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(menu, menu::IDM_NOTES_MOVE_UP, "Move Up");
+                append(menu, menu::IDM_NOTES_MOVE_DOWN, "Move Down");
+                append(menu, menu::IDM_NOTES_MOVE_TO, "Move to...");
+                append(menu, menu::IDM_NOTES_MOVE_ROOT, "Move to Top Level");
                 AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
                 append(menu, menu::IDM_NOTES_TRASH, "Move to Trash");
                 append(menu, menu::IDM_NOTES_PROPERTIES, "Properties");

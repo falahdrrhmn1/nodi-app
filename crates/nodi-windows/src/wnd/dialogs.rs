@@ -588,17 +588,22 @@ const IDC_FIND_EDIT: i32 = 110;
 const IDC_FIND_LIST: i32 = 111;
 
 struct FindState {
-    entries: Vec<(NoteId, String)>,
+    entries: Vec<(Option<NoteId>, String)>,
     shown: Vec<usize>,
     edit: HWND,
     list: HWND,
-    result: Option<NoteId>,
+    result: Option<Option<NoteId>>,
     label: &'static str,
+    action: &'static str,
 }
 
 /// Live-filtering title search. Enter or double-click opens the note.
 pub fn find_note(owner: HWND, entries: &[(NoteId, String)]) -> Option<NoteId> {
-    pick_note(owner, "Go to Note", "Title contains:", entries)
+    let entries: Vec<(Option<NoteId>, String)> = entries
+        .iter()
+        .map(|(id, title)| (Some(id.clone()), title.clone()))
+        .collect();
+    pick(owner, "Go to Note", "Title contains:", &entries, "Open").flatten()
 }
 
 /// A filterable list of notes (`entries` are shown as given).
@@ -608,6 +613,27 @@ pub fn pick_note(
     label: &'static str,
     entries: &[(NoteId, String)],
 ) -> Option<NoteId> {
+    let entries: Vec<(Option<NoteId>, String)> = entries
+        .iter()
+        .map(|(id, title)| (Some(id.clone()), title.clone()))
+        .collect();
+    pick(owner, caption, label, &entries, "Open").flatten()
+}
+
+/// "Move to..." picker: the list holds an explicit "Top level" row
+/// (`None`) followed by every possible parent. `None` means cancelled,
+/// `Some(None)` the top level and `Some(Some(id))` that parent.
+pub fn move_to(owner: HWND, entries: &[(Option<NoteId>, String)]) -> Option<Option<NoteId>> {
+    pick(owner, "Move to", "Title contains:", entries, "Move")
+}
+
+fn pick(
+    owner: HWND,
+    caption: &str,
+    label: &'static str,
+    entries: &[(Option<NoteId>, String)],
+    action: &'static str,
+) -> Option<Option<NoteId>> {
     // SAFETY: as in `pick_icon`.
     unsafe {
         ensure_class("NodiFindNote", Some(find_note_proc));
@@ -618,6 +644,7 @@ pub fn pick_note(
             list: ptr::null_mut(),
             result: None,
             label,
+            action,
         });
         let state_ptr = Box::into_raw(state);
         let dialog = create_dialog(
@@ -679,7 +706,7 @@ unsafe extern "system" fn find_note_proc(
                 child(
                     hwnd,
                     "BUTTON",
-                    "Open",
+                    state.action,
                     BS_DEFPUSHBUTTON as u32,
                     IDOK,
                     252,
@@ -816,6 +843,35 @@ pub fn open_any_file(owner: HWND) -> Option<String> {
     }
     let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
     Some(String::from_utf16_lossy(&buffer[..length]))
+}
+
+/// Folder picker for the Link dialog; returns the full folder path.
+pub fn open_folder(owner: HWND) -> Option<String> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
+        BROWSEINFOW,
+    };
+    let title = win::wide("Choose a folder");
+    let mut browse: BROWSEINFOW = unsafe { std::mem::zeroed() };
+    browse.hwndOwner = owner;
+    browse.lpszTitle = title.as_ptr();
+    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    let mut buffer = vec![0u16; 4096];
+    // SAFETY: the title outlives the modal call; the item list is freed below.
+    unsafe {
+        let item = SHBrowseForFolderW(&browse);
+        if item.is_null() {
+            return None;
+        }
+        let ok = SHGetPathFromIDListW(item, buffer.as_mut_ptr());
+        CoTaskMemFree(item as *mut core::ffi::c_void);
+        if ok == 0 {
+            return None;
+        }
+    }
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    (length > 0).then(|| String::from_utf16_lossy(&buffer[..length]))
 }
 
 // Keep the instance handle import used (documentation for the class instance).

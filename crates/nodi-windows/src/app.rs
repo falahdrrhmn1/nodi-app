@@ -12,6 +12,7 @@ use std::time::Duration;
 use nodi_core::autosave::{Job, SaveRequest, SaveResult, Target, Writer};
 use nodi_core::backup;
 use nodi_core::storage::{Session, TabState, WindowRect, DEFAULT_SIDEBAR_WIDTH};
+use nodi_core::tree::Position;
 use nodi_core::{DataDir, NodeKind, NoteId, Tree};
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -100,6 +101,12 @@ pub struct App {
 
     pub drag_source: Option<NoteId>,
     pub dragging: bool,
+    /// Item and zone under the drag cursor (drives the drop indicator).
+    pub drag_hover: Option<(NoteId, Position)>,
+    /// When the cursor first hovered the current drop target.
+    pub drag_hover_since: Option<std::time::Instant>,
+    /// Last drag position in tree client coordinates (for the drag timer).
+    pub drag_point: Option<(i32, i32)>,
 
     pub dpi: u32,
     pub ui_font: HFONT,
@@ -164,6 +171,9 @@ impl App {
             next_timer: 0,
             drag_source: None,
             dragging: false,
+            drag_hover: None,
+            drag_hover_since: None,
+            drag_point: None,
             dpi: 96,
             ui_font: ptr::null_mut(),
             bold_font: ptr::null_mut(),
@@ -1223,22 +1233,60 @@ impl App {
         self.tree_save();
     }
 
-    pub fn move_node(&mut self, source: NoteId, target: NoteId) {
+    /// Moves a node before / after `target`, or inside it (last child).
+    pub fn move_node_relative(&mut self, source: NoteId, target: NoteId, position: Position) {
         if source == target {
             return;
         }
-        match self
-            .tree
-            .move_node(&source, Some(target.clone()), usize::MAX)
-        {
+        match self.tree.move_relative(&source, &target, position) {
             Ok(()) => {
                 self.tree_save();
-                self.expand(Some(target));
+                if position == Position::Inside {
+                    self.expand(Some(target));
+                }
+                self.selected = Some(source);
                 self.rebuild_tree();
-                status::set_message(self, "Moved");
+                let message = match position {
+                    Position::Before | Position::After => "Reordered",
+                    Position::Inside => "Moved",
+                };
+                status::set_message(self, message);
             }
             Err(err) => {
                 status::set_message(self, &format!("Move rejected: {err}"));
+            }
+        }
+    }
+
+    /// Notes > Move to...: pick any other node (or the top level) as the new
+    /// parent and move the selection there as the last child.
+    pub fn move_selected_to_picker(&mut self) {
+        let Some(id) = self.context_note.clone().or_else(|| self.selected.clone()) else {
+            return;
+        };
+        let mut entries: Vec<(Option<NoteId>, String)> = vec![(None, "— Top level —".to_owned())];
+        for node in self.tree.iter_ordered() {
+            if node.trashed || self.tree.is_within(&node.id, &id) {
+                continue;
+            }
+            let depth = self.tree.ancestors(&node.id).len();
+            let kind = match node.kind {
+                NodeKind::Folder => "folder",
+                NodeKind::Note => "note",
+            };
+            entries.push((
+                Some(node.id.clone()),
+                format!("{}{} ({kind})", "    ".repeat(depth), node.title),
+            ));
+        }
+        let Some(choice) = dialogs::move_to(self.hwnd, &entries) else {
+            return;
+        };
+        match choice {
+            None => self.move_selected_to_root(),
+            Some(parent) => {
+                self.context_note = Some(id.clone());
+                self.move_node_relative(id, parent, Position::Inside);
             }
         }
     }

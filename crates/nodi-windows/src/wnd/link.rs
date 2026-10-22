@@ -17,7 +17,7 @@ use crate::app::App;
 use crate::win;
 use crate::wnd::editor::{self, CharRange};
 use crate::wnd::form::{Field, Form};
-use crate::wnd::{dialogs, format, status};
+use crate::wnd::{clipboard, dialogs, format, status};
 
 pub const EN_LINK: u32 = 0x070B;
 const EM_AUTOURLDETECT: u32 = 0x0400 + 91;
@@ -96,7 +96,27 @@ fn raw_target(raw: &[u16], start: usize) -> Option<String> {
         .iter()
         .position(|unit| *unit == u16::from(b'"'))
         .map(|offset| target_start + offset)?;
-    Some(String::from_utf16_lossy(&window[target_start..target_end]))
+    Some(normalize_target(String::from_utf16_lossy(
+        &window[target_start..target_end],
+    )))
+}
+
+/// Trims a target and removes duplicated separators from `X:\` paths. Rich
+/// Edit's own field bookkeeping sometimes leaves `C:\\...` in the instruction
+/// when a link carries a trailing space (see `link_rtf`); Win32 treats the two
+/// forms the same, but links must read back cleanly.
+fn normalize_target(target: String) -> String {
+    let target = target.trim_end();
+    // Path links are stored as file URLs (Rich Edit drops a field whose target
+    // is a bare `C:\...`); report the path the user sees again.
+    if let Some(path) = links::file_url_path(target) {
+        return path;
+    }
+    if target.as_bytes().get(1) == Some(&b':') {
+        target.replace("\\\\", "\\")
+    } else {
+        target.to_owned()
+    }
 }
 
 /// First `HYPERLINK "..."` target in an RTF fragment (RTF escapes undone).
@@ -106,7 +126,7 @@ pub fn hyperlink_target(rtf: &str) -> Option<String> {
     let open = rest.find('"')?;
     let rest = &rest[open + 1..];
     let close = rest.find('"')?;
-    Some(rtf_unescape(&rest[..close]))
+    Some(normalize_target(rtf_unescape(&rest[..close])))
 }
 
 fn rtf_unescape(text: &str) -> String {
@@ -137,12 +157,22 @@ pub fn on_link(app: &mut App, link: &EnLink) -> bool {
     let range = link.range;
     match link.msg {
         WM_LBUTTONUP => {
+            let target = target_of(editor, range);
+            // A code block's Copy link works with a plain click (it is not a
+            // navigation link); editing the text is never the intent there.
+            if links::is_copy_link(&target) {
+                if let Some(code) = format::code_block_text(editor, range.cp_min) {
+                    if clipboard::set_text(editor, &code) {
+                        status::set_message(app, "Code copied");
+                    }
+                }
+                return true;
+            }
             // SAFETY: plain key-state query.
             let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
             if !ctrl {
                 return false;
             }
-            let target = target_of(editor, range);
             if links::parse_math_link(&target).is_some() {
                 editor::set_selection(editor, range.cp_min, range.cp_min);
             }
@@ -150,15 +180,15 @@ pub fn on_link(app: &mut App, link: &EnLink) -> bool {
             true
         }
         WM_MOUSEMOVE => {
+            let target = target_of(editor, range);
             let is_formula = crate::wnd::formula::formula_at(editor, range.cp_min).is_some();
-            let message = if is_formula {
+            let message = if links::is_copy_link(&target) {
+                "Click to copy this code block".to_owned()
+            } else if is_formula {
                 "Formula: double-click or Ctrl+Click to edit".to_owned()
             } else {
                 // Show where the link really goes, not its display text.
-                format!(
-                    "Ctrl+Click to open: {}",
-                    describe(&target_of(editor, range))
-                )
+                format!("Ctrl+Click to open: {}", describe(&target))
             };
             status::set_message(app, &message);
             false
@@ -497,10 +527,14 @@ fn shell(app: &App, verb: &str, file: &str, parameters: Option<&str>) {
 
 /// RTF for a friendly hyperlink showing `text` and pointing at `target`.
 pub fn link_rtf(text: &str, target: &str) -> String {
-    let target = target.replace('"', "%22");
+    let target = target.trim();
+    // Rich Edit silently drops a field whose target is a bare local path, so
+    // store those as file URLs; the display text stays exactly as given.
+    let stored = links::path_file_url(target).unwrap_or_else(|| target.to_owned());
+    let stored = stored.replace('"', "%22");
     format!(
         "{{\\rtf1\\ansi\\uc1{{\\field{{\\*\\fldinst{{HYPERLINK \"{}\"}}}}{{\\fldrslt{{{}}}}}}}}}",
-        format::rtf_escape(&target),
+        format::rtf_escape(&stored),
         format::rtf_escape(text)
     )
 }
@@ -547,6 +581,17 @@ pub fn insert_or_edit(app: &mut App) {
             }),
         )
         .extra(
+            "Browse Folder...",
+            Box::new(|owner, values| {
+                if let Some(path) = dialogs::open_folder(owner) {
+                    if values[0].trim().is_empty() {
+                        values[0] = path.clone();
+                    }
+                    values[1] = path;
+                }
+            }),
+        )
+        .extra(
             "Link to Note...",
             Box::new(move |owner, values| {
                 if let Some(id) = dialogs::find_note(owner, &notes) {
@@ -576,6 +621,62 @@ pub fn insert_or_edit(app: &mut App) {
     } else {
         dialogs::error(app.hwnd, "Rich Edit refused the link.");
     }
+}
+
+/// Turns the local path just before the caret into a link (typed text, a
+/// closing quote or Enter). Returns false when there is no path to convert.
+pub fn auto_link_before_caret(editor: HWND) -> bool {
+    if editor::in_table(editor) {
+        return false;
+    }
+    let (from, to) = editor::selection(editor);
+    if from != to {
+        return false;
+    }
+    let start = editor::paragraph_start(editor, from);
+    let text = editor::text_range(editor, start, from);
+    // A quoted path may contain spaces: wait for the closing quote instead of
+    // ending the path at the first space.
+    if text.matches('"').count() % 2 == 1 {
+        return false;
+    }
+    let Some((offset, path)) = links::local_path_suffix(&text) else {
+        return false;
+    };
+    let begin = start + text[..offset].encode_utf16().count() as i32;
+    // Do not wrap a link that is already there (its display text may itself
+    // be a path).
+    if raw_target(&editor::raw_text(editor), begin.max(0) as usize).is_some() {
+        return false;
+    }
+    let path = path.to_owned();
+    let before = editor::text_length(editor);
+    editor::set_selection(editor, begin, from);
+    if !editor::insert_rtf(editor, link_rtf(&path, &path).as_bytes()) {
+        editor::set_selection(editor, from, from);
+        return false;
+    }
+    // Rich Edit counts a field's hidden instruction text, so the caret is
+    // placed from the document-length change, never from the visible text.
+    let caret = begin + (editor::text_length(editor) - before) + (from - begin);
+    editor::set_selection(editor, caret, caret);
+    true
+}
+
+/// A pasted plain text that is exactly one local path becomes a link.
+pub fn paste_path_link(editor: HWND, text: &str) -> bool {
+    let Some(path) = links::whole_local_path(text) else {
+        return false;
+    };
+    let path = path.to_owned();
+    let (at, _) = editor::selection(editor);
+    let before = editor::text_length(editor);
+    if !editor::insert_rtf(editor, link_rtf(&path, &path).as_bytes()) {
+        return false;
+    }
+    let caret = at + (editor::text_length(editor) - before);
+    editor::set_selection(editor, caret, caret);
+    true
 }
 
 #[cfg(test)]

@@ -12,10 +12,12 @@
 
 pub mod autosave;
 pub mod backup;
+pub mod html_in;
 pub mod id;
 pub mod image;
 pub mod links;
 pub mod markdown;
+pub mod markdown_in;
 pub mod math;
 pub mod rtf;
 pub mod search;

@@ -55,9 +55,160 @@ pub fn format_rule_link() -> String {
     RULE_PREFIX.to_owned()
 }
 
+/// Target of a code block's Copy link. The block itself is found from the
+/// link's position in the document.
+pub const COPY_PREFIX: &str = "nodi-copy:";
+
+/// `nodi-copy:` for the code block's Copy link.
+pub fn format_copy_link() -> String {
+    COPY_PREFIX.to_owned()
+}
+
+/// True for a code block's Copy link.
+pub fn is_copy_link(target: &str) -> bool {
+    target.trim() == COPY_PREFIX
+}
+
 /// True for the separator target.
 pub fn is_rule_link(target: &str) -> bool {
     target.trim() == RULE_PREFIX
+}
+
+/// Finds a full local path at the end of `text` and returns the byte offset
+/// where the replaceable range starts plus the path itself. Quotes around the
+/// path are included in the range, so converting removes them.
+///
+/// Recognises only fully qualified drive paths (`C:\...`, `D:\...`): relative
+/// paths, UNC paths and other schemes are left alone. Trailing sentence
+/// punctuation is not part of the path.
+pub fn local_path_suffix(text: &str) -> Option<(usize, &str)> {
+    if let Some(rest) = text.strip_suffix('"') {
+        let open = rest.rfind('"')?;
+        let path = rest.get(open + 1..)?;
+        is_drive_path(path).then_some((open, path))
+    } else {
+        let mut start = text.len();
+        for (index, ch) in text.char_indices().rev() {
+            if ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | '[' | '<' | '{') {
+                break;
+            }
+            start = index;
+        }
+        let candidate = text.get(start..)?;
+        let path = candidate.trim_end_matches(['.', ',', ';', '!', '?', ')', ']', '}']);
+        is_drive_path(path).then_some((start, path))
+    }
+}
+
+/// The whole (trimmed) `text` is one local path, optionally quoted.
+pub fn whole_local_path(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let (offset, path) = local_path_suffix(text)?;
+    let quoted = text.starts_with('"') && text.ends_with('"') && text.len() >= 2;
+    let covered = if quoted {
+        offset == 0 && text.len() == path.len() + 2
+    } else {
+        offset == 0 && text.len() == path.len()
+    };
+    covered.then_some(path)
+}
+
+/// `X:\` followed by anything except characters Win32 treats as wildcards,
+/// quotes, control characters or a second colon (an alternate data stream).
+fn is_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return false;
+    }
+    path.matches(':').count() == 1
+        && !path.chars().any(|ch| {
+            ch == '"'
+                || ch == '*'
+                || ch == '?'
+                || ch == '<'
+                || ch == '>'
+                || ch == '|'
+                || ch.is_control()
+        })
+}
+
+/// `file:///C:/Users/a%20b` for a local drive path, or
+/// `file://server/share` for a UNC path. Rich Edit keeps a `HYPERLINK` field
+/// only when the target looks like a URL, so path links have to be stored as
+/// file URLs; [`file_url_path`] turns them back into paths.
+pub fn path_file_url(path: &str) -> Option<String> {
+    let path = path.trim();
+    let bytes = path.as_bytes();
+    let drive =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    let unc = path.starts_with("\\\\");
+    if !drive && !unc {
+        return None;
+    }
+    let mut out = String::from(if unc { "file://" } else { "file:///" });
+    let mut skipped = 0;
+    for ch in path.chars() {
+        if unc && skipped < 2 && ch == '\\' {
+            skipped += 1;
+            continue;
+        }
+        let ch = if ch == '\\' { '/' } else { ch };
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~' | ':' | '/') {
+            out.push(ch);
+        } else if ch == '/' {
+            out.push('/');
+        } else {
+            let mut buffer = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buffer).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Turns a `file:` URL back into the local path it names.
+pub fn file_url_path(target: &str) -> Option<String> {
+    let target = target.trim();
+    let scheme = target.get(..5)?;
+    if !scheme.eq_ignore_ascii_case("file:") {
+        return None;
+    }
+    let original = &target[5..];
+    let trimmed = original.trim_start_matches('/');
+    let unc = original.starts_with("//") && !original.starts_with("///");
+    let decoded = percent_decode(trimmed).replace('/', "\\");
+    Some(if unc {
+        format!("\\\\{decoded}")
+    } else {
+        decoded
+    })
+}
+
+/// Percent-decodes a `%XX` escaped target (the Markdown writer escapes spaces
+/// and parentheses in link targets).
+pub fn percent_decode_text(text: &str) -> String {
+    percent_decode(text)
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(value);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// LaTeX from a `nodi-math:` link target.
@@ -103,6 +254,45 @@ mod tests {
         assert!(is_rule_link("  nodi-hr:  "));
         assert!(!is_rule_link("nodi-math:E%20%3D%20mc%5E2"));
         assert_eq!(format_rule_link(), RULE_PREFIX);
+        assert!(is_copy_link(COPY_PREFIX));
+        assert!(is_copy_link(" nodi-copy: "));
+        assert!(!is_copy_link("nodi-hr:"));
+        assert_eq!(format_copy_link(), COPY_PREFIX);
+    }
+
+    #[test]
+    fn finds_local_paths_at_the_end() {
+        assert_eq!(
+            local_path_suffix(r"See C:\Users\Public"),
+            Some((4, r"C:\Users\Public"))
+        );
+        assert_eq!(
+            local_path_suffix(r"Open C:\Users\paper.pdf."),
+            Some((5, r"C:\Users\paper.pdf"))
+        );
+        // Quoted paths keep their spaces; the range starts at the quote.
+        assert_eq!(
+            local_path_suffix(r#"See "D:\My Data\a b.txt""#),
+            Some((4, r"D:\My Data\a b.txt"))
+        );
+        assert_eq!(whole_local_path(r" C:\Windows "), Some(r"C:\Windows"));
+        assert_eq!(
+            whole_local_path(r#""C:\Program Files\app.exe""#),
+            Some(r"C:\Program Files\app.exe")
+        );
+        assert_eq!(whole_local_path(r"C:\a b.txt"), None);
+        assert_eq!(whole_local_path("https://example.com/a"), None);
+        assert_eq!(whole_local_path(r"\\server\share\a.txt"), None);
+        assert_eq!(whole_local_path(r"relative\path"), None);
+        assert_eq!(whole_local_path(r"C:a.txt"), None);
+        assert_eq!(whole_local_path(r"C:\x\a.txt::$DATA"), None);
+        // A bare drive root is still a path (the Windows folder).
+        assert_eq!(local_path_suffix(r"D:\"), Some((0, r"D:\")));
+        // Multi-byte text before the path must not break the offset.
+        assert_eq!(
+            local_path_suffix("Buka C:\\Users\\Ä"),
+            Some((5, r"C:\Users\Ä"))
+        );
     }
 
     #[test]
@@ -149,5 +339,44 @@ mod tests {
             Some(id.clone())
         );
         assert_eq!(parse_note_link(&format!("{link}#anchor")), Some(id));
+    }
+}
+
+#[cfg(test)]
+mod file_url_tests {
+    use super::*;
+
+    #[test]
+    fn local_paths_become_file_urls_and_back() {
+        assert_eq!(
+            path_file_url(r"C:\Users\Public").as_deref(),
+            Some("file:///C:/Users/Public")
+        );
+        assert_eq!(
+            path_file_url(r"C:\My Docs\a b.txt").as_deref(),
+            Some("file:///C:/My%20Docs/a%20b.txt")
+        );
+        assert_eq!(
+            path_file_url(r"\\server\share\a b").as_deref(),
+            Some("file://server/share/a%20b")
+        );
+        assert_eq!(path_file_url("https://example.com"), None);
+        assert_eq!(path_file_url(r"relative\path"), None);
+        for path in [r"C:\Users\Public", r"D:\Ä ö\x#y.txt", r"\\server\share\a b"] {
+            let url = path_file_url(path).unwrap();
+            assert_eq!(file_url_path(&url).as_deref(), Some(path));
+        }
+        assert_eq!(
+            file_url_path("file:///C:/My%20Docs/a.txt").as_deref(),
+            Some(r"C:\My Docs\a.txt")
+        );
+        assert_eq!(
+            file_url_path("file://server/share/a").as_deref(),
+            Some(r"\\server\share\a")
+        );
+        assert_eq!(
+            file_url_path("FILE:///C:/A%20B").as_deref(),
+            Some(r"C:\A B")
+        );
     }
 }

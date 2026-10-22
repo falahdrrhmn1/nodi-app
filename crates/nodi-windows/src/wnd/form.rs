@@ -26,7 +26,12 @@ use crate::win;
 const CLASS: &str = "NodiForm";
 const FIRST_FIELD_ID: i32 = 1000;
 const FIRST_EXTRA_ID: i32 = 2000;
+const FIRST_CHECK_ID: i32 = 3000;
 const EM_SETSEL: u32 = 0x00B1;
+const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
+const BM_SETCHECK: u32 = 0x00F1;
+const BM_GETCHECK: u32 = 0x00F0;
+const BST_CHECKED: usize = 1;
 
 /// One labelled input.
 pub struct Field {
@@ -62,6 +67,8 @@ pub struct Form {
     /// Optional explanatory text above the fields.
     pub note: String,
     pub fields: Vec<Field>,
+    /// Check boxes below the fields: (label, checked by default).
+    pub checkboxes: Vec<(String, bool)>,
     pub extras: Vec<(String, ExtraAction)>,
 }
 
@@ -71,6 +78,7 @@ impl Form {
             title: title.to_owned(),
             note: String::new(),
             fields: Vec::new(),
+            checkboxes: Vec::new(),
             extras: Vec::new(),
         }
     }
@@ -82,6 +90,11 @@ impl Form {
 
     pub fn field(mut self, field: Field) -> Self {
         self.fields.push(field);
+        self
+    }
+
+    pub fn checkbox(mut self, label: &str, checked: bool) -> Self {
+        self.checkboxes.push((label.to_owned(), checked));
         self
     }
 
@@ -101,6 +114,7 @@ impl Form {
 struct State {
     form: Form,
     edits: Vec<HWND>,
+    checks: Vec<HWND>,
     font: HFONT,
     result: Option<Vec<String>>,
     dpi: i32,
@@ -157,6 +171,7 @@ fn content_height(form: &Form) -> i32 {
     for field in &form.fields {
         height += field_height(field) + 8;
     }
+    height += form.checkboxes.len() as i32 * ROW_H;
     height + BUTTON_H + MARGIN
 }
 
@@ -185,6 +200,7 @@ unsafe fn run(owner: HWND, form: Form) -> Option<Vec<String>> {
     let state = Box::into_raw(Box::new(State {
         form,
         edits: Vec::new(),
+        checks: Vec::new(),
         font: ptr::null_mut(),
         result: None,
         dpi,
@@ -291,7 +307,13 @@ unsafe fn read(edit: HWND) -> String {
 }
 
 unsafe fn values(state: &State) -> Vec<String> {
-    state.edits.iter().map(|edit| read(*edit)).collect()
+    let mut values: Vec<String> = state.edits.iter().map(|edit| read(*edit)).collect();
+    for check in &state.checks {
+        // SAFETY: BM_GETCHECK only reads the button's state.
+        let checked = SendMessageW(*check, BM_GETCHECK, 0, 0) as usize == BST_CHECKED;
+        values.push(if checked { "1" } else { "0" }.to_owned());
+    }
+    values
 }
 
 unsafe fn build(hwnd: HWND, state: &mut State) {
@@ -343,6 +365,25 @@ unsafe fn build(hwnd: HWND, state: &mut State) {
         );
         state.edits.push(edit);
         y += height + 8;
+    }
+
+    for (index, (label, checked)) in state.form.checkboxes.iter().enumerate() {
+        let check = control(
+            hwnd,
+            "Button",
+            label,
+            BS_AUTOCHECKBOX | WS_TABSTOP,
+            FIRST_CHECK_ID + index as i32,
+            (MARGIN + LABEL_W, y + 2, EDIT_W, ROW_H - 4),
+            dpi,
+            font,
+        );
+        if *checked && !check.is_null() {
+            // SAFETY: BM_SETCHECK only touches the button's state.
+            unsafe { SendMessageW(check, BM_SETCHECK, BST_CHECKED, 0) };
+        }
+        state.checks.push(check);
+        y += ROW_H;
     }
 
     // Buttons: extras on the left, OK/Cancel on the right.
@@ -411,6 +452,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 DestroyWindow(hwnd);
             } else if id == IDCANCEL {
                 DestroyWindow(hwnd);
+            } else if id >= FIRST_CHECK_ID {
+                // Check-box notification: the state is read on OK.
             } else if id >= FIRST_EXTRA_ID {
                 if let Some(state) = state(hwnd) {
                     let index = (id - FIRST_EXTRA_ID) as usize;

@@ -638,16 +638,19 @@ impl Writer {
             }
         }
         match paragraph.list {
-            Some(true) => format!(
+            Some(true) if !body.trim().is_empty() => format!(
                 "{}1. {}",
                 "  ".repeat(level.saturating_sub(1)),
                 body.trim_start()
             ),
-            Some(false) => format!(
+            Some(false) if !body.trim().is_empty() => format!(
                 "{}- {}",
                 "  ".repeat(level.saturating_sub(1)),
                 body.trim_start()
             ),
+            // Rich Edit inherits paragraph properties over `\par`, which can
+            // leave an empty list paragraph at the end of the document.
+            Some(_) => String::new(),
             None => {
                 // Leading tabs would turn into an indented code block; a
                 // paragraph indent does the same job with plain whitespace.
@@ -677,6 +680,26 @@ impl Writer {
             Inline::Text(text, _, _) => strip_literal_bullet(text, level).is_some(),
             Inline::Picture(_) | Inline::Math(_) | Inline::Rule => false,
         })
+    }
+
+    /// Language label of a code block's header row: the text before the tab
+    /// that separates it from the Copy link. `code` is the generic label and
+    /// does not become a fence info string.
+    fn code_label(cell: &[Paragraph]) -> String {
+        let text: String = cell
+            .iter()
+            .flat_map(|paragraph| paragraph.inlines.iter())
+            .filter_map(|inline| match inline {
+                Inline::Text(text, _, _) => Some(text.as_str()),
+                Inline::Picture(_) | Inline::Math(_) | Inline::Rule => None,
+            })
+            .collect();
+        let label = text.split('\t').next().unwrap_or("").trim();
+        if label.eq_ignore_ascii_case("code") {
+            String::new()
+        } else {
+            label.to_owned()
+        }
     }
 
     fn inlines(&mut self, inlines: &[Inline]) -> String {
@@ -726,6 +749,9 @@ impl Writer {
             body = format!("<u>{body}</u>");
         }
         if let Some(target) = link {
+            let target = target.trim();
+            // Path links are stored as file URLs so Rich Edit keeps the field.
+            let target = crate::links::file_url_path(target).unwrap_or_else(|| target.to_owned());
             let target = target.replace(' ', "%20").replace(')', "%29");
             body = format!("[{body}]({target})");
         }
@@ -749,9 +775,11 @@ impl Writer {
     }
 
     fn table(&mut self, rows: &[Vec<Vec<Paragraph>>]) -> String {
-        // One cell whose text is all code: a code block.
-        if rows.len() == 1 && rows[0].len() == 1 {
-            let cell = &rows[0][0];
+        // A one-cell table whose text is all code: a code block. Newer blocks
+        // have a header row holding the language label and a Copy link.
+        let single_column = rows.iter().all(|row| row.len() == 1);
+        if (1..=2).contains(&rows.len()) && single_column {
+            let cell = &rows[rows.len() - 1][0];
             let all_code = cell.iter().all(|paragraph| {
                 paragraph.inlines.iter().all(|inline| match inline {
                     Inline::Text(text, format, _) => format.code || text.trim().is_empty(),
@@ -780,7 +808,13 @@ impl Writer {
                     .collect();
                 let body = code.join("\n");
                 let fence = if body.contains("```") { "````" } else { "```" };
-                return format!("{fence}\n{body}\n{fence}");
+                let info = if rows.len() == 2 {
+                    Self::code_label(&rows[0][0])
+                } else {
+                    String::new()
+                };
+                let info = if info.is_empty() { String::new() } else { info };
+                return format!("{fence}{info}\n{body}\n{fence}");
             }
         }
         let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);

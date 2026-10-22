@@ -44,6 +44,56 @@ pub fn set_picture_goal(rtf: &str, width: i32, height: i32) -> Option<String> {
     Some(format!("{}{}{}", &rtf[..start], patched, &rtf[end..]))
 }
 
+/// Crop amounts (left, top, right, bottom) of the first `\pict` in twips.
+/// Missing `\piccrop*` words read as 0, the RTF default.
+pub fn picture_crop(rtf: &str) -> Option<(i32, i32, i32, i32)> {
+    let pict = pict_group(rtf)?;
+    let value = |name| control_value(pict, name).unwrap_or(0).max(0);
+    Some((
+        value("\\piccropl"),
+        value("\\piccropt"),
+        value("\\piccropr"),
+        value("\\piccropb"),
+    ))
+}
+
+/// Returns `rtf` with the first picture cropped by `left`/`top`/`right`/
+/// `bottom` twips (`\piccropl`/`\piccropt`/`\piccropr`/`\piccropb`).
+pub fn set_picture_crop(rtf: &str, left: i32, top: i32, right: i32, bottom: i32) -> Option<String> {
+    let start = rtf.find("{\\pict")?;
+    let end = start + group_len(&rtf[start..])?;
+    let pict = &rtf[start..end];
+    let mut patched = String::with_capacity(pict.len() + 64);
+    patched.push_str("{\\pict");
+    patched.push_str(&format!(
+        "\\piccropl{} \\piccropt{} \\piccropr{} \\piccropb{} ",
+        left.max(0),
+        top.max(0),
+        right.max(0),
+        bottom.max(0)
+    ));
+    let mut rest = &pict["{\\pict".len()..];
+    while let Some(index) = rest.find('\\') {
+        patched.push_str(&rest[..index]);
+        let word_end = control_word_end(&rest[index..]);
+        let word = &rest[index..index + word_end];
+        let name: String = word
+            .chars()
+            .take_while(|ch| *ch == '\\' || ch.is_ascii_alphabetic())
+            .collect();
+        let space = if word.ends_with(' ') { " " } else { "" };
+        // Existing crop values are replaced by the four words added above.
+        if name.starts_with("\\piccrop") {
+            patched.push_str(space);
+        } else {
+            patched.push_str(word);
+        }
+        rest = &rest[index + word_end..];
+    }
+    patched.push_str(rest);
+    Some(format!("{}{}{}", &rtf[..start], patched, &rtf[end..]))
+}
+
 /// The encoded bytes (PNG/JPEG/…) of the first picture, decoded from hex.
 pub fn picture_blob(rtf: &str) -> Option<Vec<u8>> {
     let pict = pict_group(rtf)?;
@@ -199,6 +249,25 @@ mod tests {
         assert!(!patched.contains("picscale"));
         assert!(patched.contains("\\picw6350"));
         assert_eq!(picture_blob(&patched), picture_blob(SAMPLE));
+    }
+
+    #[test]
+    fn rewrites_crop_amounts() {
+        let patched = set_picture_crop(SAMPLE, 120, 60, 30, 15).unwrap();
+        assert_eq!(picture_crop(&patched), Some((120, 60, 30, 15)));
+        assert_eq!(picture_goal(&patched), picture_goal(SAMPLE));
+        assert_eq!(picture_blob(&patched), picture_blob(SAMPLE));
+        // Patching again replaces the values instead of stacking them.
+        let again = set_picture_crop(&patched, 1, 2, 3, 4).unwrap();
+        assert_eq!(picture_crop(&again), Some((1, 2, 3, 4)));
+        assert_eq!(again.matches("\\piccropl").count(), 1);
+    }
+
+    #[test]
+    fn missing_crop_is_zero_and_negative_is_clamped() {
+        assert_eq!(picture_crop(SAMPLE), Some((0, 0, 0, 0)));
+        let patched = set_picture_crop(SAMPLE, -5, -6, -7, -8).unwrap();
+        assert_eq!(picture_crop(&patched), Some((0, 0, 0, 0)));
     }
 
     #[test]

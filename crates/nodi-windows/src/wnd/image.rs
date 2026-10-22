@@ -173,56 +173,199 @@ pub fn fit_width(editor: HWND) -> Result<(), String> {
     apply_size(editor, &picture, target, new_height)
 }
 
-/// Image > Size...: width/height in pixels, aspect ratio kept when one of
-/// them is left empty.
+/// Image > Size...: width/height in pixels or percent, with "Lock aspect
+/// ratio" on by default.
 pub fn resize_dialog(editor: HWND, owner: HWND) -> Result<(), String> {
     let picture = pick_picture(editor).ok_or("Select a picture first (click it).")?;
     let (goal_w, goal_h) = rtf::picture_goal(&picture).ok_or("Unknown picture size.")?;
     let natural = natural_size(&picture);
     let note = match natural {
         Some((w, h)) => format!(
-            "Original size: {w} × {h} px. Current: {} × {} px.\nLeave one field empty to keep the aspect ratio.",
+            "Original size: {w} × {h} px. Current: {} × {} px.\n\
+             Leave both fields of a unit empty to keep the current size.",
             goal_w / 15,
             goal_h / 15
         ),
-        None => "Leave one field empty to keep the aspect ratio.".to_owned(),
+        None => "Leave both fields of a unit empty to keep the current size.".to_owned(),
     };
-    let original = natural.unwrap_or(((goal_w / 15) as u32, (goal_h / 15) as u32));
+    let original = natural.unwrap_or(((goal_w / 15).max(1) as u32, (goal_h / 15).max(1) as u32));
     let form = Form::new("Image Size")
         .note(&note)
         .field(Field::new("Width (px):", (goal_w / 15).to_string()))
-        .field(Field::new("Height (px):", ""))
+        .field(Field::new("Height (px):", (goal_h / 15).to_string()))
+        .field(Field::new("Width (%):", ""))
+        .field(Field::new("Height (%):", ""))
+        .checkbox("Lock aspect ratio", true)
         .extra(
             "Original size",
             Box::new(move |_, values| {
                 values[0] = original.0.to_string();
                 values[1] = original.1.to_string();
+                values[2].clear();
+                values[3].clear();
             }),
         )
         .extra(
             "Half size",
             Box::new(move |_, values| {
-                values[0] = (original.0 / 2).to_string();
-                values[1] = (original.1 / 2).to_string();
+                values[2] = "50".to_owned();
+                values[3] = "50".to_owned();
             }),
         );
     let Some(values) = form.show(owner) else {
         return Ok(());
     };
     let parse = |text: &str| text.trim().parse::<i32>().ok().filter(|value| *value > 0);
-    let (width, height) = match (parse(&values[0]), parse(&values[1])) {
-        (Some(w), Some(h)) => (w * 15, h * 15),
-        (Some(w), None) => (
-            w * 15,
-            (goal_h as i64 * w as i64 * 15 / goal_w.max(1) as i64) as i32,
-        ),
-        (None, Some(h)) => (
-            (goal_w as i64 * h as i64 * 15 / goal_h.max(1) as i64) as i32,
-            h * 15,
-        ),
-        (None, None) => return Err("Enter a width or a height in pixels.".to_owned()),
+    let locked = values.get(4).is_none_or(|value| value == "1");
+    // The aspect ratio follows the original pixels, falling back to the
+    // current display size for formats without a usable header.
+    let aspect_w = original.0.max(1) as i64;
+    let aspect_h = original.1.max(1) as i64;
+    let derive_height = |width: i64| (width * aspect_h / aspect_w).max(1) as i32;
+    let derive_width = |height: i64| (height * aspect_w / aspect_h).max(1) as i32;
+
+    let (percent_w, percent_h) = (parse(&values[2]), parse(&values[3]));
+    let (mut width, mut height) = if percent_w.is_some() || percent_h.is_some() {
+        let percent = percent_w.or(percent_h).unwrap_or(100) as i64;
+        if locked {
+            let width = (aspect_w * percent / 100).max(1) as i32;
+            (width, derive_height(i64::from(width)))
+        } else {
+            let width = percent_w
+                .map(|value| (aspect_w * i64::from(value) / 100).max(1) as i32)
+                .unwrap_or(goal_w / 15);
+            let height = percent_h
+                .map(|value| (aspect_h * i64::from(value) / 100).max(1) as i32)
+                .unwrap_or(goal_h / 15);
+            (width, height)
+        }
+    } else {
+        match (parse(&values[0]), parse(&values[1])) {
+            (Some(width), Some(height)) => {
+                if locked {
+                    (width, derive_height(i64::from(width)))
+                } else {
+                    (width, height)
+                }
+            }
+            (Some(width), None) if locked => (width, derive_height(i64::from(width))),
+            (Some(width), None) => (width, goal_h / 15),
+            (None, Some(height)) if locked => (derive_width(i64::from(height)), height),
+            (None, Some(height)) => (goal_w / 15, height),
+            (None, None) => {
+                return Err("Enter a width or a height in pixels or percent.".to_owned())
+            }
+        }
     };
-    apply_size(editor, &picture, width, height)
+    if width <= 0 || height <= 0 {
+        return Err("The new size must be positive.".to_owned());
+    }
+    // The aspect-lock path already derives the other side; honour it for the
+    // unlocked path by keeping zero values out of the RTF.
+    width = width.max(1);
+    height = height.max(1);
+    apply_size(editor, &picture, width * 15, height * 15)
+}
+
+/// Image > Crop...: trims pixels from each side with RTF `\piccrop*`.
+pub fn crop_dialog(editor: HWND, owner: HWND) -> Result<(), String> {
+    let picture = pick_picture(editor).ok_or("Select a picture first (click it).")?;
+    let (goal_w, goal_h) = rtf::picture_goal(&picture).ok_or("Unknown picture size.")?;
+    let (natural_w, natural_h) = natural_size(&picture)
+        .map(|(w, h)| (w.max(1), h.max(1)))
+        .unwrap_or(((goal_w / 15).max(1) as u32, (goal_h / 15).max(1) as u32));
+    let crop = rtf::picture_crop(&picture).unwrap_or((0, 0, 0, 0));
+    let note = format!(
+        "Trim pixels from each side of the {natural_w} × {natural_h} px picture.\n\
+         The display size stays the same; use Image > Size to change it."
+    );
+    let form = Form::new("Crop Image")
+        .note(&note)
+        .field(Field::new("Left (px):", (crop.0 / 15).to_string()))
+        .field(Field::new("Top (px):", (crop.1 / 15).to_string()))
+        .field(Field::new("Right (px):", (crop.2 / 15).to_string()))
+        .field(Field::new("Bottom (px):", (crop.3 / 15).to_string()))
+        .extra(
+            "Reset crop",
+            Box::new(|_, values| {
+                for value in values.iter_mut() {
+                    *value = "0".to_owned();
+                }
+            }),
+        );
+    let Some(values) = form.show(owner) else {
+        return Ok(());
+    };
+    let parse = |text: &str| -> Option<i32> {
+        let text = text.trim();
+        if text.is_empty() {
+            Some(0)
+        } else {
+            text.parse::<i32>().ok().filter(|value| *value >= 0)
+        }
+    };
+    let parse_all = || -> Option<(i32, i32, i32, i32)> {
+        Some((
+            parse(&values[0])?,
+            parse(&values[1])?,
+            parse(&values[2])?,
+            parse(&values[3])?,
+        ))
+    };
+    let (left, top, right, bottom) =
+        parse_all().ok_or("Enter whole, non-negative pixel amounts.")?;
+    if left as u32 + right as u32 >= natural_w || top as u32 + bottom as u32 >= natural_h {
+        return Err(format!(
+            "That crop would remove the whole picture ({natural_w} × {natural_h} px)."
+        ));
+    }
+    let patched = rtf::set_picture_crop(&picture, left * 15, top * 15, right * 15, bottom * 15)
+        .ok_or("The picture data could not be read.")?;
+    let (from, _) = editor::selection(editor);
+    if !editor::insert_rtf(editor, patched.as_bytes()) {
+        return Err("Rich Edit refused the cropped picture.".to_owned());
+    }
+    editor::set_selection(editor, from, from + 1);
+    Ok(())
+}
+
+/// Applies a crop in pixels to the picture at the selection (test hook and
+/// the dialog share this path).
+pub fn crop_selection(
+    editor: HWND,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> Result<(), String> {
+    let picture = pick_picture(editor).ok_or("Select a picture first.")?;
+    let (goal_w, goal_h) = rtf::picture_goal(&picture).ok_or("Unknown picture size.")?;
+    let (natural_w, natural_h) = natural_size(&picture)
+        .map(|(w, h)| (w.max(1), h.max(1)))
+        .unwrap_or(((goal_w / 15).max(1) as u32, (goal_h / 15).max(1) as u32));
+    let (left, top, right, bottom) = (
+        left.max(0) as u32,
+        top.max(0) as u32,
+        right.max(0) as u32,
+        bottom.max(0) as u32,
+    );
+    if left + right >= natural_w || top + bottom >= natural_h {
+        return Err("Crop is larger than the picture.".to_owned());
+    }
+    let patched = rtf::set_picture_crop(
+        &picture,
+        left as i32 * 15,
+        top as i32 * 15,
+        right as i32 * 15,
+        bottom as i32 * 15,
+    )
+    .ok_or("The picture data could not be read.")?;
+    let (from, _) = editor::selection(editor);
+    if !editor::insert_rtf(editor, patched.as_bytes()) {
+        return Err("Rich Edit refused the cropped picture.".to_owned());
+    }
+    editor::set_selection(editor, from, from + 1);
+    Ok(())
 }
 
 /// Image > Save Image As...: writes the original encoded bytes.
@@ -368,6 +511,33 @@ pub fn clipboard_image(owner: HWND) -> Option<Vec<u8>> {
     }
 }
 
+/// True when the clipboard holds Rich Text Format (Rich Edit pastes it
+/// natively, keeping the source formatting).
+pub fn clipboard_has_rtf() -> bool {
+    // SAFETY: the format queries take no pointers.
+    unsafe { IsClipboardFormatAvailable(rtf_format()) != 0 }
+}
+
+/// The clipboard's CF_HTML bytes, when the source offered HTML.
+pub fn clipboard_html(owner: HWND) -> Option<Vec<u8>> {
+    // SAFETY: the clipboard is opened and closed here; global memory is only
+    // read while locked.
+    unsafe {
+        let format = html_format();
+        if IsClipboardFormatAvailable(format) == 0 || OpenClipboard(owner) == 0 {
+            return None;
+        }
+        let bytes = global_bytes(GetClipboardData(format));
+        CloseClipboard();
+        bytes.map(|mut bytes| {
+            while bytes.last() == Some(&0) {
+                bytes.pop();
+            }
+            bytes
+        })
+    }
+}
+
 /// Clipboard text only (for `Paste as Plain Text`).
 pub fn clipboard_text(owner: HWND) -> Option<String> {
     // SAFETY: as in `clipboard_image`.
@@ -416,6 +586,12 @@ fn png_format() -> u32 {
 
 fn rtf_format() -> u32 {
     let name = win::wide("Rich Text Format");
+    // SAFETY: NUL-terminated name; registration is idempotent.
+    unsafe { RegisterClipboardFormatW(name.as_ptr()) }
+}
+
+fn html_format() -> u32 {
+    let name = win::wide("HTML Format");
     // SAFETY: NUL-terminated name; registration is idempotent.
     unsafe { RegisterClipboardFormatW(name.as_ptr()) }
 }

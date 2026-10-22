@@ -140,6 +140,25 @@ pub fn display_size_himetric(width: u32, height: u32, max_width_px: u32) -> (i32
     (to_himetric(w), to_himetric(h.max(1)))
 }
 
+/// Size in pixels after trimming `left`/`top`/`right`/`bottom` pixels from
+/// a `width`×`height` picture. The result never drops below 1×1.
+pub fn cropped_size(
+    width: u32,
+    height: u32,
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+) -> (u32, u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    let take = |a: u32, b: u32, total: u32| a.saturating_add(b).min(total.saturating_sub(1));
+    (
+        width - take(left, right, width),
+        height - take(top, bottom, height),
+    )
+}
+
 fn be16(b: &[u8]) -> u16 {
     u16::from_be_bytes([b[0], b[1]])
 }
@@ -217,6 +236,15 @@ mod tests {
             (info.width, info.height, info.format),
             (2, 1, ImageFormat::Bmp)
         );
+    }
+
+    #[test]
+    fn crop_keeps_at_least_one_pixel() {
+        assert_eq!(cropped_size(200, 100, 10, 5, 20, 15), (170, 80));
+        assert_eq!(cropped_size(200, 100, 0, 0, 0, 0), (200, 100));
+        // Over-cropping clamps to one pixel instead of underflowing.
+        assert_eq!(cropped_size(200, 100, 250, 150, 250, 150), (1, 1));
+        assert_eq!(cropped_size(10, 10, 6, 6, 6, 6), (1, 1));
     }
 
     #[test]

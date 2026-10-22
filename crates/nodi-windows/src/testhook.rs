@@ -12,6 +12,8 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR};
 
+use nodi_core::tree::Position;
+
 use crate::app::App;
 use crate::wnd::{editkeys, editor, format, formula, image, link, menu, table, toolbar, tree};
 
@@ -88,6 +90,32 @@ fn run(app: &mut App, line: &str) -> String {
                 None => "not found".to_owned(),
             }
         }
+        ("move-rel", _) => move_rel(app, rest),
+        ("cancel-rename", _) => {
+            // SAFETY: reading the TreeView's label-edit control, if any.
+            let edit = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    app.tree_view,
+                    windows_sys::Win32::UI::Controls::TVM_GETEDITCONTROL,
+                    0,
+                    0,
+                )
+            } as HWND;
+            if edit.is_null() {
+                "no edit".to_owned()
+            } else {
+                // Esc cancels the inline label edit without renaming. Post it:
+                // a synchronous key message from inside a WM_COPYDATA handler
+                // can re-enter the tree's edit bookkeeping.
+                // SAFETY: a key message to that edit control.
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        edit, 0x0100, 0x1B, 1,
+                    );
+                }
+                "ok".to_owned()
+            }
+        }
         ("rename-selected", _) => match app.selected.clone() {
             Some(id) => {
                 app.rename_node(id, rest.to_owned());
@@ -144,8 +172,15 @@ fn run(app: &mut App, line: &str) -> String {
         ("fmt", Some(window)) => match parse_range(rest) {
             Some((from, to)) => {
                 let format = format::format_at(window, from, to);
+                let colour = if format.dw_mask & 0x4000_0000 == 0 {
+                    "unset".to_owned()
+                } else if format.dw_effects & 0x4000_0000 != 0 {
+                    "auto".to_owned()
+                } else {
+                    format!("#{:06x}", format.cr_text_color & 0x00FF_FFFF)
+                };
                 format!(
-                    "bold={} italic={} underline={} strike={} face={} size={} hidden={}",
+                    "bold={} italic={} underline={} strike={} face={} size={} hidden={} colour={colour}",
                     u8::from(format.dw_effects & editor::CFE_BOLD != 0),
                     u8::from(format.dw_effects & editor::CFE_ITALIC != 0),
                     u8::from(format.dw_effects & editor::CFE_UNDERLINE != 0),
@@ -242,6 +277,83 @@ fn run(app: &mut App, line: &str) -> String {
             let dpi = format::editor_dpi(window).max(1);
             let twips = (point.x as i64 * 1440 / dpi as i64) as i32;
             format!("px={} twips={twips}", point.x)
+        }
+        ("client", Some(window)) => {
+            // Editor client width in pixels and twips (plain text width).
+            let mut rect = windows_sys::Win32::Foundation::RECT::default();
+            // SAFETY: `rect` is a valid out parameter.
+            let ok = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(window, &mut rect)
+            };
+            let dpi = format::editor_dpi(window).max(1);
+            let twips = rect.right as i64 * 1440 / dpi as i64;
+            let _ = ok;
+            format!("px={} twips={twips}", rect.right)
+        }
+        ("picgoal", Some(window)) => {
+            let found = image::pick_picture(window).or_else(|| {
+                editor::stream_out_rtf(window)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            });
+            found
+                .and_then(|rtf| nodi_core::rtf::picture_goal(&rtf))
+                .map(|(width, height)| format!("{width} {height}"))
+                .unwrap_or_else(|| "no picture".to_owned())
+        }
+        ("piccrop", Some(window)) => {
+            let found = image::pick_picture(window).or_else(|| {
+                editor::stream_out_rtf(window)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            });
+            found
+                .and_then(|rtf| nodi_core::rtf::picture_crop(&rtf))
+                .map(|(left, top, right, bottom)| format!("{left} {top} {right} {bottom}"))
+                .unwrap_or_else(|| "no picture".to_owned())
+        }
+        ("autourl", Some(window)) => {
+            let enable = rest.trim() != "off";
+            // SAFETY: plain message to our own Rich Edit.
+            unsafe {
+                SendMessageW(window, 0x0400 + 91, usize::from(enable), 0);
+            }
+            if enable { "on" } else { "off" }.to_owned()
+        }
+        ("crop", Some(window)) => {
+            let parts: Vec<i32> = rest
+                .split_whitespace()
+                .filter_map(|part| part.parse().ok())
+                .collect();
+            match parts.as_slice() {
+                [left, top, right, bottom] => {
+                    match image::crop_selection(window, *left, *top, *right, *bottom) {
+                        Ok(()) => "ok".to_owned(),
+                        Err(message) => message,
+                    }
+                }
+                _ => "usage: crop left top right bottom (pixels)".to_owned(),
+            }
+        }
+        ("findtext", Some(window)) => {
+            let raw = editor::raw_text(window);
+            let text = String::from_utf16_lossy(&raw);
+            match text.find(rest) {
+                Some(byte_index) => {
+                    // Convert the UTF-8 byte offset of the match to UTF-16 units.
+                    let utf16: usize = text
+                        .chars()
+                        .scan(0usize, |offset, ch| {
+                            let here = *offset;
+                            *offset += ch.len_utf8();
+                            Some((here, ch.len_utf16()))
+                        })
+                        .take_while(|(offset, _)| *offset < byte_index)
+                        .map(|(_, units)| units)
+                        .sum();
+                    editor::set_selection(window, utf16 as i32, utf16 as i32);
+                    format!("{utf16}")
+                }
+                None => "not found".to_owned(),
+            }
         }
         ("style", _) => toolbar::style_text(app),
         ("style-set", _) => match rest.trim().parse::<usize>() {
@@ -436,3 +548,46 @@ fn parse_range(text: &str) -> Option<(i32, i32)> {
 }
 
 const _: () = assert!(size_of::<COPYDATASTRUCT>() == 24);
+
+/// `move-rel <source title> before|after|inside <target title>` drives the
+/// same model call as a tree drag & drop.
+fn move_rel(app: &mut App, rest: &str) -> String {
+    const MARKERS: [(&str, Position); 3] = [
+        (" before ", Position::Before),
+        (" after ", Position::After),
+        (" inside ", Position::Inside),
+    ];
+    let Some((source_title, position, target_title)) =
+        MARKERS.iter().find_map(|(needle, position)| {
+            let at = rest.find(needle)?;
+            Some((
+                rest[..at].trim(),
+                *position,
+                rest[at + needle.len()..].trim(),
+            ))
+        })
+    else {
+        return "usage: move-rel <source> before|after|inside <target>".to_owned();
+    };
+    let find = |tree: &nodi_core::Tree, title: &str| {
+        tree.iter_ordered()
+            .into_iter()
+            .find(|node| !node.trashed && node.title == title)
+            .map(|node| node.id.clone())
+    };
+    let Some(source) = find(&app.tree, source_title) else {
+        return "source not found".to_owned();
+    };
+    let Some(target) = find(&app.tree, target_title) else {
+        return "target not found".to_owned();
+    };
+    match app.tree.move_relative(&source, &target, position) {
+        Ok(()) => {
+            app.tree_save();
+            app.selected = Some(source);
+            app.rebuild_tree();
+            "ok".to_owned()
+        }
+        Err(err) => format!("error: {err}"),
+    }
+}

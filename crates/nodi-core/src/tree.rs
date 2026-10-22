@@ -72,6 +72,17 @@ impl fmt::Display for TreeError {
 
 impl std::error::Error for TreeError {}
 
+/// Where a dragged node lands relative to the node under the cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Position {
+    /// Just above the target, as its previous sibling.
+    Before,
+    /// Just below the target, as its next sibling.
+    After,
+    /// As the last child of the target.
+    Inside,
+}
+
 /// The whole note tree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tree {
@@ -245,6 +256,51 @@ impl Tree {
             self.renumber(old_parent.as_ref());
         }
         Ok(())
+    }
+
+    /// Moves `id` next to `target` ([`Position::Before`] / [`Position::After`])
+    /// or as its last child ([`Position::Inside`]). Dropping a node inside its
+    /// own subtree is refused with [`TreeError::Cycle`], and a trashed target
+    /// is treated as missing (it is not part of the visible tree).
+    ///
+    /// The whole sibling strip is renumbered densely, trashed siblings
+    /// included, so a moved node never leaves holes or duplicate orders.
+    pub fn move_relative(
+        &mut self,
+        id: &NoteId,
+        target: &NoteId,
+        position: Position,
+    ) -> Result<(), TreeError> {
+        if !self.nodes.contains_key(id) {
+            return Err(TreeError::NotFound(id.clone()));
+        }
+        let target_node = match self.nodes.get(target) {
+            Some(node) if !node.trashed => node,
+            _ => return Err(TreeError::NotFound(target.clone())),
+        };
+        if position == Position::Inside {
+            return self.move_node(id, Some(target.clone()), usize::MAX);
+        }
+        let parent = target_node.parent.clone();
+        // `move_node` counts the index after taking `id` out, so translate the
+        // index in the full strip.
+        let siblings = self.all_children(parent.as_ref());
+        let Some(target_index) = siblings.iter().position(|node| &node.id == target) else {
+            return Err(TreeError::NotFound(target.clone()));
+        };
+        let mut index = match position {
+            Position::Before => target_index,
+            Position::After => target_index + 1,
+            Position::Inside => unreachable!(),
+        };
+        if siblings
+            .iter()
+            .position(|node| &node.id == id)
+            .is_some_and(|own| own < index)
+        {
+            index -= 1;
+        }
+        self.move_node(id, parent, index)
     }
 
     /// Moves `id` one place up (`delta < 0`) or down among its *visible*
@@ -607,5 +663,136 @@ impl<'de> Deserialize<'de> for Tree {
         }
         tree.sanitize();
         Ok(tree)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A root folder with two notes, plus two more root notes.
+    fn sample() -> (Tree, NoteId, NoteId, NoteId, NoteId, NoteId) {
+        let mut tree = Tree::new();
+        let a = tree.new_node(NodeKind::Folder, "A", None);
+        let b = tree.new_node(NodeKind::Note, "B", None);
+        let c = tree.new_node(NodeKind::Note, "C", None);
+        let a1 = tree.new_node(NodeKind::Note, "A1", Some(a.clone()));
+        let a2 = tree.new_node(NodeKind::Note, "A2", Some(a.clone()));
+        (tree, a, b, c, a1, a2)
+    }
+
+    fn titles(tree: &Tree, parent: Option<&NoteId>) -> Vec<String> {
+        tree.children(parent)
+            .into_iter()
+            .map(|node| node.title.clone())
+            .collect()
+    }
+
+    /// Every parent's strip is numbered 0..n without holes or duplicates.
+    fn assert_dense(tree: &Tree) {
+        let mut parents: Vec<Option<NoteId>> = vec![None];
+        parents.extend(tree.iter().map(|node| Some(node.id.clone())));
+        for parent in parents {
+            let strip = tree.all_children(parent.as_ref());
+            let orders: Vec<i64> = strip.iter().map(|node| node.order).collect();
+            let expected: Vec<i64> = (0..strip.len() as i64).collect();
+            assert_eq!(orders, expected, "orders are not dense");
+        }
+    }
+
+    #[test]
+    fn moves_before_and_after_siblings() {
+        let (mut tree, a, b, c, _, _) = sample();
+        tree.move_relative(&c, &a, Position::Before).unwrap();
+        assert_eq!(titles(&tree, None), ["C", "A", "B"]);
+        tree.move_relative(&c, &b, Position::After).unwrap();
+        assert_eq!(titles(&tree, None), ["A", "B", "C"]);
+        tree.move_relative(&c, &a, Position::Before).unwrap();
+        assert_eq!(titles(&tree, None), ["C", "A", "B"]);
+        assert_dense(&tree);
+    }
+
+    #[test]
+    fn moves_inside_as_last_child() {
+        let (mut tree, a, b, c, _, _) = sample();
+        tree.move_relative(&b, &a, Position::Inside).unwrap();
+        assert_eq!(tree.get(&b).unwrap().parent, Some(a.clone()));
+        assert_eq!(titles(&tree, Some(&a)), ["A1", "A2", "B"]);
+        tree.move_relative(&b, &c, Position::Inside).unwrap();
+        assert_eq!(titles(&tree, None), ["A", "C"]);
+        assert_eq!(titles(&tree, Some(&a)), ["A1", "A2"]);
+        assert_eq!(titles(&tree, Some(&c)), ["B"]);
+        // A folder can go inside a note too (notes may have sub-notes).
+        tree.move_relative(&a, &c, Position::Inside).unwrap();
+        assert_eq!(titles(&tree, None), ["C"]);
+        assert_eq!(titles(&tree, Some(&c)), ["B", "A"]);
+        assert_dense(&tree);
+    }
+
+    #[test]
+    fn refuses_cycles() {
+        let (mut tree, a, _, _, a1, _) = sample();
+        assert_eq!(
+            tree.move_relative(&a, &a1, Position::Inside),
+            Err(TreeError::Cycle)
+        );
+        assert_eq!(
+            tree.move_relative(&a, &a1, Position::Before),
+            Err(TreeError::Cycle)
+        );
+        assert_eq!(
+            tree.move_relative(&a, &a, Position::Inside),
+            Err(TreeError::Cycle)
+        );
+        // The tree did not change.
+        assert_eq!(titles(&tree, None), ["A", "B", "C"]);
+        assert_eq!(titles(&tree, Some(&a)), ["A1", "A2"]);
+    }
+
+    #[test]
+    fn refuses_trashed_targets() {
+        let (mut tree, _, b, c, _, _) = sample();
+        tree.trash(&b);
+        assert_eq!(
+            tree.move_relative(&c, &b, Position::Inside),
+            Err(TreeError::NotFound(b.clone()))
+        );
+        assert_eq!(
+            tree.move_relative(&c, &b, Position::After),
+            Err(TreeError::NotFound(b.clone()))
+        );
+        let missing = NoteId::generate();
+        assert_eq!(
+            tree.move_relative(&c, &missing, Position::Before),
+            Err(TreeError::NotFound(missing))
+        );
+        assert_dense(&tree);
+    }
+
+    #[test]
+    fn moves_around_trashed_siblings_densely() {
+        let (mut tree, a, b, c, _, _) = sample();
+        tree.trash(&b);
+        tree.move_relative(&c, &a, Position::Before).unwrap();
+        assert_eq!(titles(&tree, None), ["C", "A"]);
+        // The trashed sibling keeps a slot in the full strip, without holes.
+        let strip: Vec<String> = tree
+            .all_children(None)
+            .into_iter()
+            .map(|node| node.title.clone())
+            .collect();
+        assert_eq!(strip, ["C", "A", "B"]);
+        assert!(tree.get(&b).unwrap().trashed);
+        assert_dense(&tree);
+    }
+
+    #[test]
+    fn relative_to_itself_is_a_no_op() {
+        let (mut tree, a, b, _, _, _) = sample();
+        tree.move_relative(&b, &b, Position::Before).unwrap();
+        tree.move_relative(&b, &b, Position::After).unwrap();
+        assert_eq!(titles(&tree, None), ["A", "B", "C"]);
+        assert_eq!(tree.get(&a).unwrap().parent, None);
+        assert_dense(&tree);
     }
 }

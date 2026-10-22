@@ -39,6 +39,26 @@ pub fn set_text_and_rtf(owner: HWND, text: &str, rtf: &str) -> bool {
     true
 }
 
+/// Puts `text` on the clipboard as plain text (CF_UNICODETEXT).
+pub fn set_text(owner: HWND, text: &str) -> bool {
+    let mut wide: Vec<u8> = text
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    // SAFETY: the clipboard is opened and closed here; a successful
+    // SetClipboardData hands the memory block to the clipboard.
+    unsafe {
+        if OpenClipboard(owner) == 0 {
+            return false;
+        }
+        EmptyClipboard();
+        put(CF_UNICODETEXT, &mut wide);
+        CloseClipboard();
+    }
+    true
+}
+
 unsafe fn put(format: u32, bytes: &mut [u8]) {
     let memory = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
     if memory.is_null() {

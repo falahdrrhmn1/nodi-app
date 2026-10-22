@@ -76,6 +76,7 @@ pub const IDM_IMAGE_75: u16 = 243;
 pub const IDM_IMAGE_100: u16 = 244;
 pub const IDM_IMAGE_FIT: u16 = 245;
 pub const IDM_IMAGE_SAVE: u16 = 246;
+pub const IDM_IMAGE_CROP: u16 = 247;
 
 pub const IDM_VIEW_TOOLBAR: u16 = 130;
 pub const IDM_VIEW_STATUS: u16 = 131;
@@ -116,6 +117,7 @@ pub const IDM_NOTES_MOVE_DOWN: u16 = 182;
 pub const IDM_NOTES_COPY_LINK: u16 = 183;
 pub const IDM_NOTES_MOVE_ROOT: u16 = 184;
 pub const IDM_NOTES_TRASH_EMPTY: u16 = 185;
+pub const IDM_NOTES_MOVE_TO: u16 = 186;
 
 pub const IDM_TOOLS_BACKUP: u16 = 190;
 pub const IDM_TOOLS_OPEN_DATA: u16 = 191;
@@ -127,6 +129,7 @@ pub const IDM_INSERT_LINK: u16 = 204;
 pub const IDM_INSERT_CODE_BLOCK: u16 = 205;
 pub const IDM_INSERT_FORMULA: u16 = 206;
 pub const IDM_INSERT_SEPARATOR: u16 = 207;
+pub const IDM_INSERT_OUTPUT_BLOCK: u16 = 208;
 
 /// Every documented shortcut: (keys, action). Shown by Help > Keyboard
 /// Shortcuts and mirrored in docs/SHORTCUTS.md.
@@ -167,6 +170,11 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Click", "Follow a link"),
     ("Ctrl+Shift+I", "Insert image"),
     ("Ctrl+Shift+T", "Insert table"),
+    (
+        "Ctrl+Shift+C",
+        "Insert code block (Copy link copies the code)",
+    ),
+    ("Ctrl+Shift+O", "Insert output block"),
     ("Alt+=", "Insert formula"),
     ("Ctrl+Shift+-", "Insert separator"),
     ("- / * / 1. + Space", "Start a bulleted / numbered list"),
@@ -270,6 +278,7 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_INSERT_TABLE, "&Table...\tCtrl+Shift+T"),
             Item::Cmd(IDM_INSERT_LINK, "&Link...\tCtrl+K"),
             Item::Cmd(IDM_INSERT_CODE_BLOCK, "&Code Block\tCtrl+Shift+C"),
+            Item::Cmd(IDM_INSERT_OUTPUT_BLOCK, "&Output Block\tCtrl+Shift+O"),
             Item::Cmd(IDM_INSERT_FORMULA, "&Formula...\tAlt+="),
             Item::Cmd(IDM_INSERT_SEPARATOR, "&Separator\tCtrl+Shift+-"),
             Item::Sep,
@@ -293,6 +302,7 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_IMAGE_75, "&75%"),
             Item::Cmd(IDM_IMAGE_100, "&100% (original)"),
             Item::Cmd(IDM_IMAGE_FIT, "&Fit to Width"),
+            Item::Cmd(IDM_IMAGE_CROP, "&Crop..."),
             Item::Sep,
             Item::Cmd(IDM_IMAGE_SAVE, "Save Image &As..."),
         ]);
@@ -341,6 +351,7 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_NOTES_DUPLICATE, "&Duplicate"),
             Item::Cmd(IDM_NOTES_MOVE_UP, "Move &Up\tAlt+Up"),
             Item::Cmd(IDM_NOTES_MOVE_DOWN, "Move Do&wn\tAlt+Down"),
+            Item::Cmd(IDM_NOTES_MOVE_TO, "Move &to..."),
             Item::Cmd(IDM_NOTES_MOVE_ROOT, "Move to &Top Level"),
             Item::Cmd(IDM_NOTES_COPY_LINK, "Copy Internal &Link"),
             Item::Sep,
@@ -434,6 +445,7 @@ pub fn create_accel() -> HACCEL {
         accel(FALT | FSHIFT, key(b'5'), IDM_FORMAT_STRIKEOUT),
         accel(ctrl, VK_OEM_3, IDM_FORMAT_INLINE_CODE),
         accel(ctrl_shift, key(b'C'), IDM_INSERT_CODE_BLOCK),
+        accel(ctrl_shift, key(b'O'), IDM_INSERT_OUTPUT_BLOCK),
         accel(ctrl_shift, key(b'H'), IDM_FORMAT_HIGHLIGHT),
         accel(ctrl, VK_OEM_6, IDM_FORMAT_BIGGER),
         accel(ctrl, VK_OEM_4, IDM_FORMAT_SMALLER),
@@ -571,6 +583,10 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_IMAGE_75 => editor_result(app, |editor| image::resize_percent(editor, 75)),
         IDM_IMAGE_100 => editor_result(app, |editor| image::resize_percent(editor, 100)),
         IDM_IMAGE_FIT => editor_result(app, image::fit_width),
+        IDM_IMAGE_CROP => {
+            let owner = app.hwnd;
+            editor_result(app, |editor| image::crop_dialog(editor, owner));
+        }
         IDM_IMAGE_SAVE => {
             let owner = app.hwnd;
             if let Some(editor) = app.active_editor() {
@@ -582,6 +598,7 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_INSERT_TABLE => app::insert_table(app),
         IDM_INSERT_LINK => link::insert_or_edit(app),
         IDM_INSERT_CODE_BLOCK => with_editor(app, format::insert_code_block),
+        IDM_INSERT_OUTPUT_BLOCK => with_editor(app, format::insert_output_block),
         IDM_INSERT_FORMULA => app::insert_formula(app),
         IDM_INSERT_SEPARATOR => with_editor(app, format::insert_separator),
         IDM_INSERT_DATETIME => with_editor(app, |editor| {
@@ -645,6 +662,7 @@ pub fn on_command(app: &mut App, id: u16) {
         }
         IDM_NOTES_MOVE_UP => app.move_selected(-1),
         IDM_NOTES_MOVE_DOWN => app.move_selected(1),
+        IDM_NOTES_MOVE_TO => app.move_selected_to_picker(),
         IDM_NOTES_MOVE_ROOT => app.move_selected_to_root(),
         IDM_NOTES_COPY_LINK => app::copy_internal_link(app),
         IDM_NOTES_TRASH => {

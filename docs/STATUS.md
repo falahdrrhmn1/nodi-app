@@ -33,17 +33,29 @@ same handlers as the menus.
 | extra — paragraph indent | Tab indents the paragraph, Enter keeps it, wrapped lines align, restart | **PASS** (e2e V) |
 | extra — headings | `## ` → H2, grey marker visible while editing and hidden after leaving, level changes, restart, markdown | **PASS** (e2e W) |
 | extra — separator | `---` + Enter, Insert > Separator (Ctrl+Shift+-), restart, markdown `---` | **PASS** (e2e X) |
+| extra — heading colour / list numbering | typed `#` heading gets automatic colour, Tab nests a list item correctly, separator width in twips | **PASS** (e2e Y) |
+| extra — paste Markdown | Markdown on the clipboard becomes headings, lists, a code table, a GFM table and links | **PASS** (e2e Z) |
+| extra — paste HTML | browser CF_HTML becomes the same structure (no network) | **PASS** (e2e AA) |
+| extra — code Copy link | plain click on “Copy” copies exactly the code block text | **PASS** (e2e AB) |
+| extra — output block | dark block inserts, persists and exports as ```` ```output ```` | **PASS** (e2e AC) |
+| extra — picture crop | crop left/top/right/bottom survives save and restart | **PASS** (e2e AD) |
+| extra — local path links | typed, quoted and pasted `C:\…` paths become links and export back as paths | **PASS** (e2e AE) |
+| extra — tree drag & drop | `before` / `after` / `inside`, cycle refusal, dense order, Move Up/Top Level, restart | **PASS** (e2e AF) |
 
-Unit and integration tests: `cargo test` — 91 tests pass (nodi-core: tree,
-storage, autosave, backup, search, links, image, RTF, Markdown, LaTeX parser,
-math layout, PNG; nodi-windows: table structure, link parsing/safety).
-`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean.
+Unit and integration tests: `cargo test` — 115 tests pass (nodi-core: tree,
+storage, autosave, backup, search, links, image, RTF, Markdown import/export,
+HTML import, LaTeX parser, math layout, PNG; nodi-windows: table structure,
+link parsing/safety). `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` are clean.
 
 **NOT TESTED automatically:** physical mouse input (the tests never move the
 real pointer). Still to be tried by hand: dragging a picture's resize handles,
-drag-and-drop of notes in the tree, right-click menus, the common dialogs
-(open/save/colour/font/find). Real keyboard input is covered by e2e R, which
-sends keystrokes through `SendKeys` to the foreground window.
+the visual drag feedback (insertion line / row highlight / hover-expand /
+auto-scroll are driven by `WM_MOUSEMOVE`, while e2e AF tests the same model
+move through a hook), right-click menus, the common dialogs
+(open/save/folder/colour/font/find) and the “Move to...” picker. Real keyboard
+input is covered by e2e R, which sends keystrokes through `SendKeys` to the
+foreground window.
 
 ## Measurements (release build)
 
@@ -69,8 +81,11 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   tree, resizable sidebar, tabs, status bar, Per-Monitor DPI.
 - Notes tree: folders and notes, notes with child notes, context menus,
   inline rename (F2, context menu, Notes > Rename), 8 built-in icons, duplicate,
-  drag & drop (drop on empty space → top level), Move Up/Down, Move to Top
-  Level, Copy Internal Link, Move to Trash with a confirmation that names the
+  drag & drop with a visible drop indicator (insertion line before/after,
+  highlighted row to drop inside as the last child), auto-scroll near the
+  edges, hover-expand after ~0.7 s, Esc to cancel, Move Up/Down, **Move to...**
+  picker (any parent or Top level), Move to Top Level, Copy Internal Link,
+  Move to Trash with a confirmation that names the
   sub-note count, a permanent `Trash (N)` item at the bottom (click/Enter opens
   the Trash, right-click → Open Trash / Empty Trash…), restore and permanent
   delete (files moved to `recovery/`), properties, Go to Note by title.
@@ -97,14 +112,28 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   code blocks use 480 twips. Double-clicking a picture opens Image > Size….
 - Code blocks keep Notepad++-style Enter/Tab: Enter copies the indentation,
   Tab inserts a tab, Shift+Tab removes one indent level.
-- Code blocks: grey bordered box, Consolas, code-editor Enter/Tab.
+- Code blocks: two-row table with a language header and a **Copy** link (plain
+  click copies the code), grey bordered body, Consolas, code-editor Enter/Tab;
+  the header label becomes the Markdown fence info string. **Insert > Output
+  Block** (Ctrl+Shift+O) makes the same block with a dark body and the
+  `output` label.
+- Paste: RTF keeps its native formatting; HTML from a browser (CF_HTML) is
+  converted through a small tag scanner; plain text that looks like Markdown
+  (two signals or a fence) becomes headings, lists, code tables, GFM tables,
+  quotes and links; Ctrl+Shift+V always pastes plain text.
 - Pictures: insert from file, paste screenshots/copied images, Rich Edit's
-  own resize handles, exact size dialog, 25/50/75/100 %, fit to width,
-  alignment, save as file. Stored inside the note (no external paths).
+  own resize handles, exact size dialog (pixels or percent, lock aspect ratio),
+  **crop** (left/top/right/bottom in pixels, stored as RTF crop amounts),
+  25/50/75/100 %, fit to width, alignment, save as file. Stored inside the note
+  (no external paths).
 - Tables: insert, add rows above/below, add columns left/right, delete rows
   and columns. Real Rich Edit tables, not ASCII.
-- Links: web, local file, internal `nodi://note/<id>` (survive renames),
-  Ctrl+Click to follow, automatic URL detection, link safety policy (below).
+- Links: web, local file and folder (Browse File / **Browse Folder...**),
+  internal `nodi://note/<id>` (survive renames), Ctrl+Click to follow,
+  automatic URL detection. A typed quoted/unquoted local path or a pasted path
+  becomes a path link; Rich Edit only persists such fields as `file:` URLs, so
+  targets are stored that way and shown/exported as the real path. Link safety
+  policy below.
 - Formulas: LaTeX dialog (Alt+=), rendered with a TeX-like layout in Cambria
   Math: fractions, roots, scripts, ∑/∏/∫ with limits, `\left…\right`,
   matrices, cases, accents, Greek, ℝ/ℕ/ℤ, operators. Editable again by
@@ -122,15 +151,14 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
 - Portable build (`scripts/build.ps1` → `dist\Nodi`), data next to the exe.
 
 ### Not done yet / limitations
-- **Markdown source editing** covers list markers, headings, separators and
-  indentation only. Inline syntax typed as text (`**bold**`, `` `code` ``,
-  `> quotes`, fenced code, link syntax) is not converted; the Markdown view
-  stays read-only and the note itself is the source of truth.
-- Picture rotate/crop and editing in an external program are not implemented.
+- **Typing** inline Markdown (`**bold**`, `` `code` ``) still does not convert;
+  pasting Markdown does (see above). The Markdown view stays read-only and the
+  note itself is the source of truth.
+- Picture rotate and editing in an external program are not implemented
+  (crop and exact size are).
 - Dragging picture files from Explorer into a note is not implemented
   (Insert > Image and paste work).
 - Custom icons from local files are not implemented (8 built-in icons).
-- No "Move to…" picker dialog (use drag & drop / Move Up/Down / Top Level).
 - No restore-from-backup menu yet (backups are plain folders in
   `data\backups`; the app offers a restore only when `tree.json` is corrupt).
 - Formula evaluation (calculating results) is not implemented — rendering only.

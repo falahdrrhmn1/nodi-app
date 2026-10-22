@@ -48,6 +48,46 @@ public static class NodiHook {
     [DllImport("user32.dll")] static extern void SwitchToThisWindow(IntPtr hwnd, bool altTab);
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
 
+    // Raw clipboard write: .NET's DataObject turns a custom-format byte[] into
+    // the string "System.Byte[]", so CF_HTML is put there with Win32 calls.
+    [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool EmptyClipboard();
+    [DllImport("user32.dll")] static extern bool CloseClipboard();
+    [DllImport("user32.dll")] static extern IntPtr SetClipboardData(uint format, IntPtr memory);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern uint RegisterClipboardFormatW(string name);
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalAlloc(uint flags, UIntPtr size);
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr memory);
+    [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr memory);
+
+    static IntPtr CopyBytes(byte[] bytes) {
+        IntPtr memory = GlobalAlloc(0x0042, (UIntPtr)(bytes.Length + 1));
+        if (memory == IntPtr.Zero) return IntPtr.Zero;
+        IntPtr target = GlobalLock(memory);
+        Marshal.Copy(bytes, 0, target, bytes.Length);
+        Marshal.WriteByte(target, bytes.Length, 0);
+        GlobalUnlock(memory);
+        return memory;
+    }
+
+    /// Puts CF_HTML (bytes) and CF_UNICODETEXT on the clipboard.
+    public static bool SetHtml(byte[] html, string text) {
+        if (!OpenClipboard(IntPtr.Zero)) return false;
+        try {
+            EmptyClipboard();
+            IntPtr htmlMemory = CopyBytes(html);
+            if (htmlMemory != IntPtr.Zero) {
+                SetClipboardData(RegisterClipboardFormatW("HTML Format"), htmlMemory);
+            }
+            byte[] utf16 = Encoding.Unicode.GetBytes(text + "\0");
+            IntPtr textMemory = CopyBytes(utf16);
+            if (textMemory != IntPtr.Zero) SetClipboardData(13, textMemory); // CF_UNICODETEXT
+            return true;
+        } finally {
+            CloseClipboard();
+        }
+    }
+
     /// Clicks button `id` of a dialog (BM_CLICK), like a user would.
     public static bool Click(IntPtr dialog, int id) {
         IntPtr button = GetDlgItem(dialog, id);
@@ -197,6 +237,44 @@ function Stop-Nodi($nodi, [int]$answerDialog = 0) {
 
 function Read-Tree([string]$data) {
     Get-Content -Raw -Encoding utf8 (Join-Path $data 'tree.json') | ConvertFrom-Json
+}
+
+# tree.json is written by a background thread, so a read right after a command
+# can still see the previous state. Poll until the check passes.
+function Wait-Tree([string]$data, [scriptblock]$check, [int]$timeoutMs = 3000) {
+    $deadline = [DateTime]::Now.AddMilliseconds($timeoutMs)
+    $nodes = @()
+    while ([DateTime]::Now -lt $deadline) {
+        try {
+            $nodes = @((Read-Tree $data).nodes)
+        } catch {
+            $nodes = @()
+        }
+        if ($nodes.Count -gt 0 -and (& $check $nodes)) { break }
+        Start-Sleep -Milliseconds 50
+    }
+    return , $nodes
+}
+
+function Root-Titles($nodes) {
+    return (@($nodes | Where-Object { $null -eq $_.parent } | Sort-Object order |
+        ForEach-Object title) -join ',')
+}
+
+# Puts a CF_HTML stream (with real StartFragment/EndFragment offsets) on the
+# clipboard, the way a browser does when copying a selection.
+function Set-ClipboardHtml([string]$fragment) {
+    Add-Type -AssemblyName System.Windows.Forms
+    $body = "<html><body><!--StartFragment-->$fragment<!--EndFragment--></body></html>"
+    $template = "Version:0.9`r`nStartHTML:{0:D10}`r`nEndHTML:{1:D10}`r`nStartFragment:{2:D10}`r`nEndFragment:{3:D10}`r`n"
+    $headerLength = $template.Length
+    $start = $headerLength + $body.IndexOf('<!--StartFragment-->') + 20
+    $end = $headerLength + $body.IndexOf('<!--EndFragment-->')
+    $header = [string]::Format($template, $headerLength, $headerLength + $body.Length, $start, $end)
+    $text = $fragment -replace '<[^>]+>', ' '
+    if (-not [NodiHook]::SetHtml([Text.Encoding]::UTF8.GetBytes($header + $body), $text)) {
+        throw 'could not write CF_HTML to the clipboard'
+    }
 }
 
 $results = [ordered]@{}
@@ -804,6 +882,303 @@ Test-Case 'X' 'separator: --- + Enter, Insert menu, restart and markdown' {
     ''
 }
 
+# --------------------------------------------------------------- batch 3 (Y)
+# Real keyboard reproduction of the batch-2 bugs: heading colour, Tab inside a
+# list item and the `---` separator width/indent.
+Test-Case 'Y' 'real keys: heading colour, list Tab nesting, separator width' {
+    $data = New-DataDir 'Y'
+    $nodi = Start-Nodi $data
+    if (-not [NodiHook]::Foreground($nodi.Hwnd)) {
+        Stop-Nodi $nodi
+        return 'NOT TESTED: nodi.exe could not be brought to the foreground'
+    }
+    Add-Type -AssemblyName System.Windows.Forms
+    Start-Sleep -Milliseconds 250
+    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    Start-Sleep -Milliseconds 100
+    [System.Windows.Forms.SendKeys]::SendWait('## Bagian satu{ENTER}')
+    Start-Sleep -Milliseconds 150
+    [System.Windows.Forms.SendKeys]::SendWait('- long text yang cukup panjang untuk membungkus{ENTER}')
+    Start-Sleep -Milliseconds 150
+    [System.Windows.Forms.SendKeys]::SendWait('{TAB}sub poin{ENTER}')
+    Start-Sleep -Milliseconds 150
+    [System.Windows.Forms.SendKeys]::SendWait('+{TAB}poin kedua{ENTER}{ENTER}')
+    Start-Sleep -Milliseconds 150
+    [System.Windows.Forms.SendKeys]::SendWait('---{ENTER}Teks')
+    Start-Sleep -Milliseconds 400
+
+    $text = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
+    # The heading body (after `## `) must use the normal text colour.
+    $colour = Invoke-Nodi $nodi 'fmt 3 9'
+    # The sub-item: a level-2 bullet (◦) with the bullet kept.
+    $at = Invoke-Nodi $nodi 'findtext sub poin'
+    $sub = Invoke-Nodi $nodi 'para'
+    Assert ($at -ne 'not found') "sub item missing: '$text'"
+    Assert ($colour -match 'colour=(auto|#000000)') "heading text is not black: $colour"
+    Assert ($sub -match 'numbering=0' -and $sub -match 'level=2' -and $sub -match 'start=360') "Tab did not nest the list item: $sub (text='$text')"
+    Invoke-Nodi $nodi 'findtext poin kedua' | Out-Null
+    $back = Invoke-Nodi $nodi 'para'
+    Assert ($back -match 'numbering=1' -and $back -match 'level=1' -and $back -match 'start=0' -and $back -match 'text="poin kedua"') "Shift+Tab did not return to the level-1 bullet: $back"
+    # The separator must span the editor and be followed by an unindented
+    # paragraph.
+    Assert ((Invoke-Nodi $nodi 'pictures') -eq '1') "separator picture missing: '$text'"
+    $goal = Invoke-Nodi $nodi 'picgoal'
+    $client = Invoke-Nodi $nodi 'client'
+    $goalWidth = [int](($goal -split ' ')[0])
+    $clientWidth = [int]([regex]::Match($client, 'twips=(-?\d+)').Groups[1].Value)
+    Assert ($goalWidth -ge $clientWidth * 0.9) "separator is $goalWidth twips wide, editor $clientWidth"
+    $at = Invoke-Nodi $nodi 'findtext Teks'
+    $after = Invoke-Nodi $nodi 'para'
+    Assert ($after -match 'start=0' -and $after -match 'numbering=0' -and $after -match 'text="Teks"') "paragraph after the separator is not normal: $after"
+    Stop-Nodi $nodi
+    "(heading $colour; sub $sub; separator $goalWidth/$clientWidth twips)"
+}
+
+# --------------------------------------------------------------- batch 3 (Z, AA)
+Test-Case 'Z' 'paste Markdown keeps headings, lists, code, table and links' {
+    $data = New-DataDir 'Z'
+    $nodi = Start-Nodi $data
+    $markdown = @'
+# Judul
+
+Teks **tebal** dan `kode`.
+
+- satu
+  - anak
+
+```rust
+fn main() {}
+```
+
+| Nama | Nilai |
+| --- | --- |
+| A | 92% |
+
+[Lihat](https://example.com)
+'@
+    Set-Clipboard -Value $markdown
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null          # Edit > Paste
+    Assert ((Wait-State $nodi 'Saved' 4000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $out = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($out.Contains('# Judul')) "heading lost:`n$out"
+    Assert ($out.Contains('**tebal**')) "bold lost:`n$out"
+    Assert ($out.Contains('`kode`')) "inline code lost:`n$out"
+    Assert ($out.Contains('- satu')) "list lost:`n$out"
+    Assert ($out.Contains('  - anak')) "nested list lost:`n$out"
+    Assert ($out.Contains('fn main() {}')) "code block lost:`n$out"
+    Assert ($out.Contains('```rust')) "fence language lost:`n$out"
+    Assert ($out.Contains('| Nama | Nilai |') -and $out.Contains('| A | 92% |')) "table lost:`n$out"
+    Assert ($out.Contains('[Lihat](https://example.com)')) "link lost:`n$out"
+    ''
+}
+
+Test-Case 'AA' 'paste HTML (CF_HTML) keeps structure' {
+    $data = New-DataDir 'AA'
+    $nodi = Start-Nodi $data
+    $fragment = '<h2>Bagian</h2><p>Teks <strong>tebal</strong> dan <a href="https://example.com">tautan</a>.</p><ul><li>satu</li><li>dua</li></ul><pre><code class="language-rust">fn main() {}</code></pre>'
+    Set-ClipboardHtml $fragment
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 4000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $out = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($out.Contains('## Bagian')) "heading lost:`n$out"
+    Assert ($out.Contains('**tebal**')) "bold lost:`n$out"
+    Assert ($out.Contains('[tautan](https://example.com)')) "link lost:`n$out"
+    Assert ($out.Contains('- satu')) "list lost:`n$out"
+    Assert ($out.Contains('fn main() {}')) "code lost:`n$out"
+    ''
+}
+
+Test-Case 'AB' 'code block Copy link copies the code as plain text' {
+    $data = New-DataDir 'AB'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 205' | Out-Null            # code block
+    Invoke-Nodi $nodi 'type fn main() {}' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'type x();' | Out-Null
+    $target = Invoke-Nodi $nodi 'findtext Copy'
+    Assert ($target -ne 'not found') "Copy link missing: '$target'"
+    Invoke-Nodi $nodi "select $target $([int]$target + 4)" | Out-Null
+    $link = Invoke-Nodi $nodi 'link-target'
+    Assert ($link -eq 'nodi-copy:') "Copy link target is '$link'"
+    $at = Invoke-Nodi $nodi 'findtext Copy'
+    $point = (Invoke-Nodi $nodi "pos $at") -split ' '
+    $x = [int]$point[0] + 4
+    $y = [int]$point[1] + 6
+    Set-Clipboard -Value 'unchanged'
+    Invoke-Nodi $nodi "drag $x $y $x $y" | Out-Null
+    Start-Sleep -Milliseconds 400
+    $copied = ((Get-Clipboard) -join "`n") -replace "`r`n", "`n"
+    Stop-Nodi $nodi
+    Assert ($copied -eq "fn main() {}`nx();") "clipboard holds '$copied'"
+    ''
+}
+
+Test-Case 'AC' 'output block inserts, persists and exports ```output' {
+    $data = New-DataDir 'AC'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 208' | Out-Null            # output block
+    Invoke-Nodi $nodi 'type loss: 0.1' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $out = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($out.Contains('```output')) "output fence lost:`n$out"
+    Assert ($out.Contains('loss: 0.1')) "output text lost:`n$out"
+    ''
+}
+
+# --------------------------------------------------------------- batch 3 (AD)
+Test-Case 'AD' 'image crop survives save and restart' {
+    . "$PSScriptRoot\probe-lib.ps1"
+    $png = New-TestPng (Join-Path $Root 'e2e-crop.png') 200 100
+    $data = New-DataDir 'AD'
+    $nodi = Start-Nodi $data
+    Assert ((Invoke-Nodi $nodi "insert-image $png") -eq 'ok') 'insert failed'
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    $goalBefore = Invoke-Nodi $nodi 'picgoal'
+    $applied = Invoke-Nodi $nodi 'crop 10 5 20 15'
+    Assert ($applied -eq 'ok') "crop failed: $applied"
+    $crop = Invoke-Nodi $nodi 'piccrop'
+    Assert ($crop -eq '150 75 300 225') "crop in RTF is '$crop' twips"
+    $goalAfter = Invoke-Nodi $nodi 'picgoal'
+    Assert ($goalAfter -eq $goalBefore) "crop changed the display size: $goalBefore -> $goalAfter"
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    $crop = Invoke-Nodi $nodi 'piccrop'
+    $pictures = Invoke-Nodi $nodi 'pictures'
+    Stop-Nodi $nodi
+    Assert ($pictures -eq '1') "picture lost after restart: $pictures"
+    Assert ($crop -eq '150 75 300 225') "crop lost after restart: '$crop'"
+    ''
+}
+
+# --------------------------------------------------------------- batch 3 (AE)
+Test-Case 'AE' 'typed and pasted local paths become links' {
+    $data = New-DataDir 'AE'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    # Typed: the trailing space completes the path and conversion.
+    Invoke-Nodi $nodi 'keys Buka C:\\Windows ' | Out-Null
+    $at = Invoke-Nodi $nodi 'findtext C:\Windows'
+    Assert ($at -ne 'not found') "typed path not found: '$at'"
+    Invoke-Nodi $nodi "select $at $([int]$at + 10)" | Out-Null
+    $target = Invoke-Nodi $nodi 'link-target'
+    Assert ($target -eq 'C:\Windows') "typed path target is '$target'"
+    # Collapse the selection (Right arrow) before typing on: Enter must land
+    # after the link, not replace it.
+    Invoke-Nodi $nodi 'raw-key both 39' | Out-Null
+    # A quoted path with spaces is completed by the closing quote.
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys "C:\\Program Files" ' | Out-Null
+    $at = Invoke-Nodi $nodi 'findtext C:\Program Files'
+    Assert ($at -ne 'not found') "quoted path not found: '$at'; text='$((Invoke-Nodi $nodi 'text') -replace "`r", '|')'"
+    Invoke-Nodi $nodi "select $at $([int]$at + 16)" | Out-Null
+    $target = Invoke-Nodi $nodi 'link-target'
+    Assert ($target -eq 'C:\Program Files') "quoted path target is '$target'; text='$((Invoke-Nodi $nodi 'text') -replace "`r", '|')'"
+    Invoke-Nodi $nodi 'raw-key both 39' | Out-Null
+    # Pasting one path becomes a link too.
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Set-Clipboard -Value 'D:\Data\notes'
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null
+    $at = Invoke-Nodi $nodi 'findtext D:\Data\notes'
+    Assert ($at -ne 'not found') "pasted path not found: '$at'"
+    Invoke-Nodi $nodi "select $at $([int]$at + 13)" | Out-Null
+    $target = Invoke-Nodi $nodi 'link-target'
+    Assert ($target -eq 'D:\Data\notes') "pasted path target is '$target'"
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $out = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($out.Contains('[C:\\Windows](C:\Windows)')) "typed link lost:`n$out"
+    Assert ($out.Contains('[C:\\Program Files](C:\Program%20Files)')) "quoted link lost:`n$out"
+    Assert ($out.Contains('[D:\\Data\\notes](D:\Data\notes)')) "pasted link lost:`n$out"
+    ''
+}
+
+# --------------------------------------------------------------- batch 3 (AF)
+Test-Case 'AF' 'tree drag and drop before / after / inside' {
+    $data = New-DataDir 'AF'
+    $nodi = Start-Nodi $data
+    # The first run opens with one "Untitled" note: reuse it as Alpha.
+    Invoke-Nodi $nodi 'rename-selected Alpha' | Out-Null
+    foreach ($title in @('Beta', 'Gamma')) {
+        Invoke-Nodi $nodi 'cmd 170' | Out-Null        # New Note
+        Invoke-Nodi $nodi "rename-selected $title" | Out-Null
+    }
+    Invoke-Nodi $nodi 'cmd 174' | Out-Null            # New Folder
+    Invoke-Nodi $nodi "rename-selected Box" | Out-Null
+    Invoke-Nodi $nodi 'cancel-rename' | Out-Null
+
+    # before: Gamma becomes the first root sibling.
+    Assert ((Invoke-Nodi $nodi 'move-rel Gamma before Alpha') -eq 'ok') 'move before failed'
+    $nodes = Wait-Tree $data { param($n) (Root-Titles $n) -eq 'Gamma,Alpha,Beta,Box' }
+    Assert ((Root-Titles $nodes) -eq 'Gamma,Alpha,Beta,Box') "before order is $(Root-Titles $nodes)"
+    Assert (@($nodes | Where-Object title -eq 'Gamma')[0].order -eq 0) 'Gamma is not first'
+
+    # after: Beta goes to the very end of the root.
+    Assert ((Invoke-Nodi $nodi 'move-rel Beta after Box') -eq 'ok') 'move after failed'
+    $nodes = Wait-Tree $data { param($n) (Root-Titles $n) -eq 'Gamma,Alpha,Box,Beta' }
+    Assert ((Root-Titles $nodes) -eq 'Gamma,Alpha,Box,Beta') "after order is $(Root-Titles $nodes)"
+
+    # inside: Alpha becomes the last child of the Box folder.
+    Assert ((Invoke-Nodi $nodi 'move-rel Alpha inside Box') -eq 'ok') 'move inside failed'
+    $nodes = Wait-Tree $data {
+        param($n)
+        @($n | Where-Object title -eq 'Alpha')[0].parent -eq @($n | Where-Object title -eq 'Box')[0].id
+    }
+    $alpha = @($nodes | Where-Object title -eq 'Alpha')[0]
+    $box = @($nodes | Where-Object title -eq 'Box')[0]
+    Assert ($alpha.parent -eq $box.id) 'Alpha is not inside Box'
+
+    # inside a note too, then a cycle is refused without changing anything.
+    Assert ((Invoke-Nodi $nodi 'move-rel Beta inside Alpha') -eq 'ok') 'move into note failed'
+    $nodes = Wait-Tree $data {
+        param($n)
+        @($n | Where-Object title -eq 'Beta')[0].parent -eq @($n | Where-Object title -eq 'Alpha')[0].id
+    }
+    $cycle = Invoke-Nodi $nodi 'move-rel Box inside Alpha'
+    Assert ($cycle -like 'error*') "cycle was not refused: '$cycle'"
+    $nodes = (Read-Tree $data).nodes
+    $beta = @($nodes | Where-Object title -eq 'Beta')[0]
+    $alpha = @($nodes | Where-Object title -eq 'Alpha')[0]
+    $box = @($nodes | Where-Object title -eq 'Box')[0]
+    Assert ($beta.parent -eq $alpha.id) 'Beta is not inside Alpha'
+    Assert ($alpha.parent -eq $box.id) 'the refused move changed the tree'
+
+    # Move Up / Down / Top Level still work.
+    Invoke-Nodi $nodi 'select-title Gamma' | Out-Null
+    Invoke-Nodi $nodi 'cmd 182' | Out-Null            # Move Down
+    $nodes = Wait-Tree $data { param($n) (Root-Titles $n) -eq 'Box,Gamma' }
+    Assert ((Root-Titles $nodes) -eq 'Box,Gamma') "move down order is $(Root-Titles $nodes)"
+    Invoke-Nodi $nodi 'select-title Alpha' | Out-Null
+    Invoke-Nodi $nodi 'cmd 184' | Out-Null            # Move to Top Level
+    $nodes = Wait-Tree $data { param($n) (Root-Titles $n) -eq 'Box,Gamma,Alpha' }
+    $alpha = @($nodes | Where-Object title -eq 'Alpha')[0]
+    $root = Root-Titles $nodes
+    Assert ($null -eq $alpha.parent) 'Move to Top Level did not work'
+    Assert ($root -eq 'Box,Gamma,Alpha') "top level order is $root"
+
+    # Everything survives a restart.
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    Stop-Nodi $nodi
+    $nodes = (Read-Tree $data).nodes
+    $beta = @($nodes | Where-Object title -eq 'Beta')[0]
+    $alpha = @($nodes | Where-Object title -eq 'Alpha')[0]
+    Assert ($beta.parent -eq $alpha.id) 'Beta/Alpha link lost after restart'
+    Assert (@($nodes | Where-Object title -eq 'Gamma')[0].order -eq 1) 'Gamma order changed'
+    ''
+}
 # --------------------------------------------------------------------- report
 
 $failed = 0

@@ -197,12 +197,14 @@ fn heading_marker_len(text: &str) -> usize {
     heading_prefix(text).map_or(0, |(_, len)| len)
 }
 
-/// `(level, UTF-16 length)` of a literal deeper bullet (`◦` + tab).
-fn literal_bullet(text: &str) -> Option<(usize, usize)> {
+/// `(level, marker)` of a literal deeper bullet (`◦` + tab). The marker slice
+/// is what is stored in the text, so callers can measure it in bytes or UTF-16
+/// units as needed.
+fn literal_bullet(text: &str) -> Option<(usize, &str)> {
     for (index, glyph) in BULLET_GLYPHS.iter().enumerate() {
         if let Some(rest) = text.strip_prefix(glyph) {
             if rest.starts_with('\t') {
-                return Some((index + 1, glyph.encode_utf16().count() + 1));
+                return Some((index + 1, &text[..glyph.len() + 1]));
             }
         }
     }
@@ -228,8 +230,8 @@ fn format_heading_body(editor: HWND, start: i32, end: i32, level: usize) {
         _ => (BODY_SIZE, 0),
     };
     let mut format = CharFormat2W {
-        dw_mask: CFM_SIZE | CFM_BOLD | CFM_FACE,
-        dw_effects: bold,
+        dw_mask: CFM_SIZE | CFM_BOLD | CFM_FACE | CFM_COLOR,
+        dw_effects: bold | CFE_AUTOCOLOR,
         y_height: size,
         ..CharFormat2W::default()
     };
@@ -290,9 +292,51 @@ fn set_marker_visibility(editor: HWND, start: i32, visible: bool) {
     editor::set_selection(editor, from, to);
 }
 
+/// After the `# ` marker has been painted grey, typing continues right after
+/// it and would inherit that grey. This resets the heading body to the normal
+/// text colour (when it inherited the marker's grey) and sets the insertion
+/// colour at a caret that sits at the start of the body.
+fn normalise_heading_colour(editor: HWND, caret: i32) {
+    if editor::in_table(editor) {
+        return;
+    }
+    let start = editor::paragraph_start(editor, caret);
+    let end = editor::paragraph_end(editor, caret);
+    let text = editor::text_range(editor, start, end);
+    let marker = heading_marker_len(&text) as i32;
+    if marker == 0 {
+        return;
+    }
+    let body = start + marker;
+    let auto = CharFormat2W {
+        dw_mask: CFM_COLOR,
+        dw_effects: CFE_AUTOCOLOR,
+        ..CharFormat2W::default()
+    };
+    let mut fixed = false;
+    if end > body {
+        let saved = editor::selection(editor);
+        editor::set_selection(editor, body, body + 1);
+        let first = editor::selection_format(editor);
+        editor::set_selection(editor, saved.0, saved.1);
+        let grey = first.dw_mask & CFM_COLOR != 0
+            && first.dw_effects & CFE_AUTOCOLOR == 0
+            && first.cr_text_color == HEADING_MARKER_GREY;
+        if grey {
+            editor::set_selection(editor, body, end);
+            editor::set_selection_format(editor, &auto);
+            fixed = true;
+        }
+    }
+    if fixed || caret <= body + 1 {
+        editor::set_selection(editor, caret, caret);
+        editor::set_selection_format(editor, &auto);
+    }
+}
+
 /// Where a position moves when the marker at a paragraph start is replaced.
 fn shifted(pos: i32, start: i32, end: i32, old_len: i32, new_len: i32) -> i32 {
-    if pos <= start {
+    if pos < start {
         pos
     } else if pos >= end {
         pos + new_len - old_len
@@ -354,6 +398,9 @@ pub fn heading(editor: HWND, level: usize) {
         new_to = shifted(new_to, start, end, old_len, marker_len);
     }
     editor::set_selection(editor, new_from, new_to);
+    if new_from == new_to {
+        normalise_heading_colour(editor, new_from);
+    }
 }
 
 /// Called on `EN_CHANGE`: keeps the marker of the caret's paragraph in sync
@@ -392,6 +439,7 @@ pub fn maintain_heading(editor: HWND) {
         }
     }
     editor::set_selection(editor, from, from);
+    normalise_heading_colour(editor, from);
 }
 
 /// Called on `EN_SELCHANGE`: shows the marker of the new paragraph and hides
@@ -587,24 +635,24 @@ pub fn apply_list_level(editor: HWND, numbered: bool, level: usize) {
     for &start in starts.iter().rev() {
         let end = paragraph_end_in(&raw, start);
         let text = text_in(&raw, start, end);
-        let old_len = literal_bullet(&text).map_or(0, |(_, len)| len as i32);
+        let old_len =
+            literal_bullet(&text).map_or(0, |(_, marker)| marker.encode_utf16().count() as i32);
         if old_len > 0 {
             editor::set_selection(editor, start, start + old_len);
             editor::replace_selection(editor, "", true);
         }
+        // Switch to the target format first: as long as the paragraph is a
+        // native list item, a typed/inserted tab changes the level instead of
+        // inserting a character.
+        editor::set_selection(editor, start, end - old_len);
+        editor::set_para_format(editor, &list_para_format(numbered, level));
         let mut new_len = 0;
         if !numbered && level > 1 {
             let marker = format!("{}\t", BULLET_GLYPHS[level - 1]);
+            new_len = marker.encode_utf16().count() as i32;
             editor::set_selection(editor, start, start);
             editor::replace_selection(editor, &marker, true);
-            new_len = marker.len() as i32;
         }
-        editor::set_selection(
-            editor,
-            start,
-            paragraph_end_in(&raw, start) + new_len - old_len,
-        );
-        editor::set_para_format(editor, &list_para_format(numbered, level));
         new_from = shifted(new_from, start, end, old_len, new_len);
         new_to = shifted(new_to, start, end, old_len, new_len);
     }
@@ -633,15 +681,15 @@ pub fn end_list(editor: HWND) -> bool {
         return false;
     }
     let content = match literal {
-        Some((_, len)) => &text[len..],
+        Some((_, marker)) => &text[marker.len()..],
         None => &text[..],
     };
     if !content.trim().is_empty() {
         return false;
     }
     let mut indent = format.dx_start_indent.max(0) + INDENT_STEP_TWIPS;
-    if let Some((_, len)) = literal {
-        editor::set_selection(editor, start, start + len as i32);
+    if let Some((_, marker)) = literal {
+        editor::set_selection(editor, start, start + marker.encode_utf16().count() as i32);
         editor::replace_selection(editor, "", true);
         indent = format.dx_start_indent.max(0) + INDENT_STEP_TWIPS;
     }
@@ -700,8 +748,8 @@ pub fn remove_list_marker(editor: HWND) -> bool {
         return false;
     }
     let mut indent = format.dx_start_indent.max(0) + INDENT_STEP_TWIPS;
-    if let Some((_, len)) = literal {
-        editor::set_selection(editor, start, start + len as i32);
+    if let Some((_, marker)) = literal {
+        editor::set_selection(editor, start, start + marker.encode_utf16().count() as i32);
         editor::replace_selection(editor, "", true);
         indent = format.dx_start_indent.max(0) + INDENT_STEP_TWIPS;
     }
@@ -736,15 +784,40 @@ fn separator_png() -> Vec<u8> {
     nodi_core::math::encode_png(WIDTH, HEIGHT, &pixels, "")
 }
 
+/// Resets the caret paragraph to plain body geometry (no list, no indent), so a
+/// block inserted at the caret starts at the left margin.
+fn plain_paragraph(editor: HWND) {
+    let (from, _) = editor::selection(editor);
+    let start = editor::paragraph_start(editor, from);
+    let end = editor::paragraph_end(editor, from);
+    editor::set_selection(editor, start, end);
+    editor::set_para_format(
+        editor,
+        &ParaFormat2 {
+            dw_mask: PFM_NUMBERING
+                | PFM_NUMBERINGSTYLE
+                | PFM_NUMBERINGSTART
+                | PFM_NUMBERINGTAB
+                | PFM_STARTINDENT
+                | PFM_OFFSET,
+            ..ParaFormat2::default()
+        },
+    );
+    editor::set_selection(editor, from, from);
+}
+
 /// Inserts the horizontal rule picture wrapped in a `nodi-hr:` hyperlink.
 fn insert_separator_impl(editor: HWND) {
+    plain_paragraph(editor);
     let (from, to) = editor::selection(editor);
     if to > from {
         editor::set_selection(editor, from, from);
         editor::replace_selection(editor, "", true);
     }
-    let width = full_width_twips(editor);
-    let height = 30;
+    // `EM_INSERTIMAGE` takes HIMETRIC (0.01 mm); the editor width is in twips.
+    let width_twips = full_width_twips(editor);
+    let width = (width_twips as i64 * 2540 / 1440) as i32;
+    let height = (30i64 * 2540 / 1440) as i32;
     if image::insert_sized(editor, &separator_png(), width, height, height, "separator").is_err() {
         return;
     }
@@ -823,7 +896,8 @@ fn remove_lists(editor: HWND) {
     let start = starts[0];
     let end = paragraph_end_in(&raw, start);
     let text = text_in(&raw, start, end);
-    let literal = literal_bullet(&text).map_or(0, |(_, len)| len as i32);
+    let literal =
+        literal_bullet(&text).map_or(0, |(_, marker)| marker.encode_utf16().count() as i32);
     if literal > 0 {
         editor::set_selection(editor, start, start + literal);
         editor::replace_selection(editor, "", true);
@@ -1077,7 +1151,7 @@ pub fn full_width_twips(editor: HWND) -> i32 {
         return 9000;
     }
     // Leave room for the margins and the vertical scrollbar.
-    (win::mul_div(rect.right, 1440, dpi) - 900).clamp(3000, 20000)
+    (win::mul_div(rect.right, 1440, dpi) - 300).clamp(3000, 20000)
 }
 
 /// DPI of the device context Rich Edit lays text out with (falls back to the
@@ -1215,10 +1289,21 @@ pub fn prepare_block(editor: HWND) -> i32 {
     at
 }
 
-/// Insert > Code Block: a one-cell, grey, bordered table in Consolas. Plain
-/// paragraph shading and borders are not rendered by Rich Edit; table cells
-/// are, so the cell is the box. The selected text (if any) becomes the code.
+/// Insert > Code Block: a two-row, bordered table — a header strip with the
+/// language label and a Copy link, then the Consolas code cell. Plain
+/// paragraph shading is not rendered by Rich Edit; table cells are, so the
+/// rows are the box. The selected text (if any) becomes the code.
 pub fn insert_code_block(editor: HWND) {
+    insert_code(editor, "", false);
+}
+
+/// Insert > Output Block (Ctrl+Shift+O): the same structure with a dark
+/// background, light monospace text and the label `output`.
+pub fn insert_output_block(editor: HWND) {
+    insert_code(editor, "", true);
+}
+
+fn insert_code(editor: HWND, language: &str, output: bool) {
     let (from, to) = editor::selection(editor);
     let code = if from != to {
         editor::text_range(editor, from, to)
@@ -1226,22 +1311,130 @@ pub fn insert_code_block(editor: HWND) {
         String::new()
     };
     let at = prepare_block(editor);
+    let width = full_width_twips(editor);
+    let rtf = code_block_rtf(language, &code, width, output);
+    if editor::insert_rtf(editor, rtf.as_bytes()) {
+        if let Some(start) = code_start_after(&editor::raw_text(editor), at.max(0) as usize) {
+            let caret = start as i32 + code.trim_end_matches('\r').encode_utf16().count() as i32;
+            editor::set_selection(editor, caret, caret);
+        }
+    }
+}
 
+/// Colours of a code-block table (see [`code_block_rtf`]).
+fn code_colours() -> String {
     let (br, bg, bb) = CODE_BLOCK_BACK;
     let (lr, lg, lb) = CODE_BLOCK_BORDER;
-    let border = "\\brdrs\\brdrw10\\brdrcf2";
-    let tabs = code_tab_stops_rtf();
-    let rtf = format!(
-        "{{\\rtf1\\ansi\\uc1\\deff0{{\\fonttbl{{\\f0\\fnil {BODY_FONT};}}{{\\f1\\fmodern {CODE_FONT};}}}}\
-         {{\\colortbl ;\\red{br}\\green{bg}\\blue{bb};\\red{lr}\\green{lg}\\blue{lb};}}\
-         \\trowd\\trgaph144\\trleft0\\clcbpat1\\clbrdrt{border}\\clbrdrl{border}\\clbrdrb{border}\\clbrdrr{border}\\cellx{width}\
-         \\pard\\intbl\\f1\\fs20{tabs} {body}\\cell\\row}}",
-        width = full_width_twips(editor),
-        body = rtf_escape(code.trim_end_matches('\r')),
-    );
-    if editor::insert_rtf(editor, rtf.as_bytes()) {
-        // Row start (U+FFF9) + its paragraph mark, then the cell text.
-        let caret = at + 2 + code.trim_end_matches('\r').encode_utf16().count() as i32;
-        editor::set_selection(editor, caret, caret);
+    let mut out = String::from("{\\colortbl ;");
+    // 1..=5: light block, 6..=11: output block.
+    for (red, green, blue) in [
+        (br, bg, bb),
+        (lr, lg, lb),
+        (235, 238, 241),
+        (110, 118, 129),
+        (0, 102, 204),
+        (30, 30, 30),
+        (60, 60, 60),
+        (45, 45, 45),
+        (200, 200, 200),
+        (220, 220, 220),
+        (110, 170, 255),
+    ] {
+        out.push_str(&format!("\\red{red}\\green{green}\\blue{blue};"));
     }
+    out.push('}');
+    out
+}
+
+/// RTF for a code block: header row (label + `nodi-copy:` link) and code row.
+fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> String {
+    let (code_back, _border, header_back, label_colour, link_colour, text_colour) = if output {
+        (6, 7, 8, 9, 11, "\\cf10")
+    } else {
+        (1, 2, 3, 4, 5, "")
+    };
+    let label = match language.trim() {
+        "" if output => "output",
+        "" => "code",
+        other => other,
+    };
+    let edge = if output { 7 } else { 2 };
+    let border = format!("\\brdrs\\brdrw10\\brdrcf{edge}");
+    let mut rtf = String::from("{\\rtf1\\ansi\\uc1\\deff0");
+    rtf.push_str(&format!(
+        "{{\\fonttbl{{\\f0\\fnil {BODY_FONT};}}{{\\f1\\fmodern {CODE_FONT};}}}}"
+    ));
+    rtf.push_str(&code_colours());
+
+    // Header row: label on the left, Copy at the right tab stop.
+    rtf.push_str("\\trowd\\trgaph108\\trleft0");
+    rtf.push_str(&format!(
+        "\\clcbpat{header_back}\\clbrdrt{border}\\clbrdrl{border}\
+         \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}"
+    ));
+    rtf.push_str(&format!(
+        "\\pard\\intbl\\tqr\\tx{}\\f1\\fs16\\cf{label_colour} ",
+        (width - 200).max(0)
+    ));
+    rtf.push_str(&rtf_escape(label));
+    rtf.push_str("\\tab{\\field{\\*\\fldinst{HYPERLINK \"");
+    rtf.push_str(&nodi_core::links::format_copy_link());
+    rtf.push_str("\"}}{\\fldrslt{\\ul\\cf");
+    rtf.push_str(&link_colour.to_string());
+    rtf.push_str(" Copy}}}\\cell\\row");
+
+    // Code row.
+    rtf.push_str("\\trowd\\trgaph108\\trleft0");
+    rtf.push_str(&format!(
+        "\\clcbpat{code_back}\\clbrdrt{border}\\clbrdrl{border}\
+         \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}"
+    ));
+    rtf.push_str(&format!(
+        "\\pard\\intbl\\f1\\fs20{text_colour}{} ",
+        code_tab_stops_rtf()
+    ));
+    rtf.push_str(&rtf_escape(code.trim_end_matches('\r')));
+    rtf.push_str("\\cell\\row}");
+    rtf
+}
+
+/// Start of the code text: after the second row marker (`U+FFF9`).
+fn code_start_after(raw: &[u16], from: usize) -> Option<usize> {
+    let from = from.min(raw.len());
+    let first = raw[from..].iter().position(|unit| *unit == 0xFFF9)? + from;
+    let second = raw[first + 1..].iter().position(|unit| *unit == 0xFFF9)? + first + 1;
+    let mut start = second + 1;
+    while start < raw.len() && raw[start] == 0x0D {
+        start += 1;
+    }
+    Some(start)
+}
+
+/// The code text of the block whose header contains `at` (the Copy link).
+pub fn code_block_text(editor: HWND, at: i32) -> Option<String> {
+    let raw = editor::raw_text(editor);
+    let at = at.max(0) as usize;
+    let header_end = raw.get(at..)?.iter().position(|unit| *unit == 0x0007)? + at;
+    let row = raw[header_end + 1..]
+        .iter()
+        .position(|unit| *unit == 0xFFF9)?
+        + header_end
+        + 1;
+    let mut start = row + 1;
+    while start < raw.len() && raw[start] == 0x0D {
+        start += 1;
+    }
+    let mut units = Vec::new();
+    for unit in &raw[start..] {
+        match *unit {
+            0x0007 => break,
+            0x000D => units.push(0x000A),
+            0xFFF9 | 0xFFFB | 0xFFFC => {}
+            unit => units.push(unit),
+        }
+    }
+    while units.last() == Some(&0x000A) {
+        units.pop();
+    }
+    Some(String::from_utf16_lossy(&units))
 }
