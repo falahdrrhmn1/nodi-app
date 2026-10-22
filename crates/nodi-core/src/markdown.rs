@@ -34,6 +34,7 @@ struct Format {
     strike: bool,
     underline: bool,
     code: bool,
+    hidden: bool,
     size: i32,
 }
 
@@ -43,12 +44,16 @@ enum Inline {
     Picture(Vec<u8>),
     /// A formula picture (LaTeX from its `nodi-math:` link).
     Math(String),
+    /// The `---` separator picture (`nodi-hr:` link).
+    Rule,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Paragraph {
     inlines: Vec<Inline>,
     list: Option<bool>, // Some(true) = numbered
+    /// Left indent in twips (`\li`), used for indented text and list levels.
+    indent: i32,
 }
 
 #[derive(Debug)]
@@ -177,8 +182,10 @@ impl<'a> Reader<'a> {
             self.picture_depth = None;
             let hex = std::mem::take(&mut self.picture_hex);
             let bytes = decode_hex(&hex);
-            let math = self.link.as_deref().and_then(crate::links::parse_math_link);
-            if let Some(latex) = math {
+            let target = self.link.as_deref();
+            if target.is_some_and(crate::links::is_rule_link) {
+                self.push_inline(Inline::Rule);
+            } else if let Some(latex) = target.and_then(crate::links::parse_math_link) {
                 self.push_inline(Inline::Math(latex));
             } else if !bytes.is_empty() {
                 self.push_inline(Inline::Picture(bytes));
@@ -276,6 +283,8 @@ impl<'a> Reader<'a> {
                 self.font_name.push_str("monospace:");
             }
             "fs" => self.state.format.size = param.unwrap_or(22),
+            "v" => self.state.format.hidden = on,
+            "li" => self.paragraph.indent = param.unwrap_or(0).max(0),
             "b" => self.state.format.bold = on,
             "i" => self.state.format.italic = on,
             "strike" | "striked" => self.state.format.strike = on,
@@ -323,6 +332,7 @@ impl<'a> Reader<'a> {
             "pard" => {
                 self.in_table = false;
                 self.paragraph.list = None;
+                self.paragraph.indent = 0;
             }
             "intbl" => self.in_table = true,
             "pntext" => {
@@ -409,6 +419,10 @@ impl<'a> Reader<'a> {
         if self.state.skip {
             return;
         }
+        if self.state.format.hidden {
+            // `\v`: hidden text (a heading's `# ` marker while editing).
+            return;
+        }
         let format = self.state.format.clone();
         let link = if self.state.destination == Destination::FieldResult {
             self.link.clone()
@@ -438,6 +452,11 @@ impl<'a> Reader<'a> {
         }
         self.close_table();
         let paragraph = std::mem::take(&mut self.paragraph);
+        // Paragraph properties are inherited in RTF: a paragraph after `\par`
+        // keeps the `\li` and list of the one before it until `\pard` resets
+        // them. Rich Edit relies on that and writes `\pard` only once.
+        self.paragraph.indent = paragraph.indent;
+        self.paragraph.list = paragraph.list;
         self.blocks.push(Block::Paragraph(paragraph));
     }
 
@@ -529,7 +548,7 @@ impl Writer {
             match block {
                 Block::Paragraph(paragraph) => {
                     let line = self.paragraph(paragraph);
-                    let is_list = paragraph.list.is_some();
+                    let is_list = Self::is_list(paragraph);
                     let empty = line.trim().is_empty();
                     if empty {
                         previous_list = false;
@@ -597,26 +616,67 @@ impl Writer {
                 .iter()
                 .filter_map(|inline| match inline {
                     Inline::Text(text, _, _) => Some(text.as_str()),
-                    Inline::Picture(_) | Inline::Math(_) => None,
+                    Inline::Picture(_) | Inline::Math(_) | Inline::Rule => None,
                 })
                 .collect();
-            return format!("{} {}", "#".repeat(level), escape(text.trim()));
+            // The editable heading keeps a `# ` marker in its own text; it must
+            // not be duplicated in the export (`# Title`, not `# # Title`).
+            let text = strip_heading_marker(text.trim());
+            return format!("{} {}", "#".repeat(level), escape(text));
         }
         let body = self.inlines(&paragraph.inlines);
+        let level = Self::indent_level(paragraph.indent);
+        // A deeper bullet level is stored as a literal glyph + tab (Rich Edit
+        // only has one native bullet glyph), see `format::list_level_marker`.
+        if paragraph.list.is_none() {
+            if let Some((glyph_level, rest)) = strip_literal_bullet(&body, level) {
+                return format!(
+                    "{}- {}",
+                    "  ".repeat(glyph_level.saturating_sub(1)),
+                    rest.trim_start()
+                );
+            }
+        }
         match paragraph.list {
-            Some(true) => format!("1. {}", body.trim_start()),
-            Some(false) => format!("- {}", body.trim_start()),
+            Some(true) => format!(
+                "{}1. {}",
+                "  ".repeat(level.saturating_sub(1)),
+                body.trim_start()
+            ),
+            Some(false) => format!(
+                "{}- {}",
+                "  ".repeat(level.saturating_sub(1)),
+                body.trim_start()
+            ),
             None => {
-                // Leading tabs would turn into an indented code block.
+                // Leading tabs would turn into an indented code block; a
+                // paragraph indent does the same job with plain whitespace.
                 let trimmed = body.trim_start_matches(['\t', ' ']);
-                let indent = body.len() - trimmed.len();
-                if indent > 0 {
-                    format!("{}{}", "\u{00A0}\u{00A0}".repeat(indent), trimmed)
+                let tabs = body.len() - trimmed.len();
+                let levels = level + tabs;
+                if levels > 0 {
+                    format!("{}{}", "\u{00A0}\u{00A0}".repeat(levels), trimmed)
                 } else {
                     body
                 }
             }
         }
+    }
+
+    /// 360 twips (Nodi's tab step) per indentation level.
+    fn indent_level(twips: i32) -> usize {
+        (twips.max(0) / 360) as usize
+    }
+
+    fn is_list(paragraph: &Paragraph) -> bool {
+        if paragraph.list.is_some() {
+            return true;
+        }
+        let level = Self::indent_level(paragraph.indent);
+        paragraph.inlines.iter().any(|inline| match inline {
+            Inline::Text(text, _, _) => strip_literal_bullet(text, level).is_some(),
+            Inline::Picture(_) | Inline::Math(_) | Inline::Rule => false,
+        })
     }
 
     fn inlines(&mut self, inlines: &[Inline]) -> String {
@@ -628,6 +688,7 @@ impl Writer {
                 }
                 Inline::Picture(bytes) => out.push_str(&self.picture(bytes)),
                 Inline::Math(latex) => out.push_str(&format!("${}$", latex.trim())),
+                Inline::Rule => out.push_str("---"),
             }
         }
         out
@@ -694,7 +755,7 @@ impl Writer {
             let all_code = cell.iter().all(|paragraph| {
                 paragraph.inlines.iter().all(|inline| match inline {
                     Inline::Text(text, format, _) => format.code || text.trim().is_empty(),
-                    Inline::Picture(_) | Inline::Math(_) => false,
+                    Inline::Picture(_) | Inline::Math(_) | Inline::Rule => false,
                 })
             });
             let any_code = cell.iter().any(|paragraph| {
@@ -712,7 +773,7 @@ impl Writer {
                             .iter()
                             .filter_map(|inline| match inline {
                                 Inline::Text(text, _, _) => Some(text.as_str()),
-                                Inline::Picture(_) | Inline::Math(_) => None,
+                                Inline::Picture(_) | Inline::Math(_) | Inline::Rule => None,
                             })
                             .collect()
                     })
@@ -745,6 +806,36 @@ impl Writer {
         }
         lines.join("\n")
     }
+}
+
+/// Strips the editable heading marker (`## `) from a heading's text.
+fn strip_heading_marker(text: &str) -> &str {
+    let hashes = text.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=4).contains(&hashes) {
+        return text;
+    }
+    match text.char_indices().nth(hashes) {
+        Some((index, ' ')) => &text[index + 1..],
+        _ => text,
+    }
+}
+
+/// Recognises a deeper bullet stored as `glyph<TAB>text`; returns its level and
+/// the text after the marker.
+fn strip_literal_bullet(body: &str, indent_level: usize) -> Option<(usize, &str)> {
+    const GLYPHS: [char; 3] = ['•', '◦', '▪'];
+    let first = body.chars().next()?;
+    let index = GLYPHS.iter().position(|glyph| *glyph == first)?;
+    let after = first.len_utf8();
+    if !body[after..].starts_with('\t') {
+        return None;
+    }
+    let level = if indent_level > 0 {
+        indent_level
+    } else {
+        index + 1
+    };
+    Some((level, &body[after + 1..]))
 }
 
 /// Escapes characters that would otherwise start Markdown syntax.
@@ -880,5 +971,65 @@ mod tests {
             "{}",
             out.markdown
         );
+    }
+
+    #[test]
+    fn hidden_heading_marker_is_not_duplicated() {
+        let hidden = convert(r"\pard\f0\fs40\b {\v # }Title\b0\fs22\par");
+        assert!(
+            hidden.markdown.starts_with("# Title\n"),
+            "{}",
+            hidden.markdown
+        );
+        // Saving while the caret is inside the heading stores the marker
+        // visible; the converter strips it anyway.
+        let visible = convert(r"\pard\f0\fs32\b ## Sub\b0\fs22\par");
+        assert!(
+            visible.markdown.starts_with("## Sub\n"),
+            "{}",
+            visible.markdown
+        );
+    }
+
+    #[test]
+    fn paragraph_indent_and_literal_bullet_levels() {
+        let out = convert(
+            r"\pard\f0\fs22\li360 indented\par\pard\f0\fs22\li720\fi-360 \u9702?\tab nested\par\pard\f0\fs22\li1080\fi-360 \u9642?\tab deep\par",
+        );
+        assert!(
+            out.markdown.contains("\u{00A0}\u{00A0}indented"),
+            "{}",
+            out.markdown
+        );
+        assert!(out.markdown.contains("  - nested"), "{}", out.markdown);
+        assert!(out.markdown.contains("    - deep"), "{}", out.markdown);
+    }
+
+    #[test]
+    fn paragraph_properties_are_inherited_until_pard() {
+        // Rich Edit writes `\pard` once and lets later paragraphs inherit.
+        let out = convert(r"\pard\f0\fs22\li360 first\par second\par\pard\f0\fs22 plain\par");
+        assert!(
+            out.markdown
+                .contains("\u{00A0}\u{00A0}first\n\n\u{00A0}\u{00A0}second"),
+            "{}",
+            out.markdown
+        );
+        assert!(out.markdown.ends_with("\n\nplain\n"), "{}", out.markdown);
+    }
+
+    #[test]
+    fn separator_picture_becomes_a_rule() {
+        let plain: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0";
+        let plain_hex: String = plain.iter().map(|byte| format!("{byte:02x}")).collect();
+        let out = convert(&format!(
+            r#"\pard Above\par{{\field{{\*\fldinst{{HYPERLINK "nodi-hr:"}}}}{{\fldrslt{{\pict\pngblip\picwgoal9000 {plain_hex}}}}}}}\par Below\par"#
+        ));
+        assert!(
+            out.markdown.contains("Above\n\n---\n\nBelow"),
+            "{}",
+            out.markdown
+        );
+        assert!(out.assets.is_empty(), "the rule became an image asset");
     }
 }

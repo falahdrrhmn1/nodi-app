@@ -62,6 +62,10 @@ pub const CFM_STRIKEOUT: u32 = 0x0000_0008;
 pub const CFM_FACE: u32 = 0x2000_0000;
 pub const CFM_SIZE: u32 = 0x8000_0000;
 pub const CFM_CHARSET: u32 = 0x0800_0000;
+/// `CFM_HIDDEN` / `CFE_HIDDEN`: text that is not displayed or printed (used
+/// for the editable `# ` heading marker).
+pub const CFM_HIDDEN: u32 = 0x0000_0100;
+pub const CFE_HIDDEN: u32 = 0x0000_0100;
 
 pub const CFE_BOLD: u32 = 0x0000_0001;
 pub const CFE_ITALIC: u32 = 0x0000_0002;
@@ -555,13 +559,6 @@ pub fn set_para_format(editor: HWND, format: &ParaFormat2) {
     }
 }
 
-/// True inside a table cell or a bulleted/numbered paragraph, where Enter and
-/// Tab keep their native Rich Edit meaning.
-pub fn in_table_or_list(editor: HWND) -> bool {
-    let format = para_format(editor);
-    format.w_effects & PFE_TABLE != 0 || format.w_numbering != 0
-}
-
 pub fn in_table(editor: HWND) -> bool {
     para_format(editor).w_effects & PFE_TABLE != 0
 }
@@ -800,7 +797,11 @@ pub fn command(app: &mut App, id: u16) {
     unsafe {
         match id {
             menu::IDM_EDIT_UNDO => {
-                SendMessageW(editor, EM_UNDO, 0, 0);
+                // A `- ` list conversion is undone as one step (back to the
+                // typed text) instead of Rich Edit's separate edits.
+                if !crate::wnd::editkeys::undo_marker_conversion(editor) {
+                    SendMessageW(editor, EM_UNDO, 0, 0);
+                }
             }
             menu::IDM_EDIT_REDO => {
                 SendMessageW(editor, EM_REDO, 0, 0);

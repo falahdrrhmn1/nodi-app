@@ -46,6 +46,20 @@ pub fn format_math_link(latex: &str) -> String {
     out
 }
 
+/// Target of a separator picture: the picture is the link text and the target
+/// marks it as a horizontal rule (see `Insert > Separator`).
+pub const RULE_PREFIX: &str = "nodi-hr:";
+
+/// `nodi-hr:` for the separator's `HYPERLINK` field.
+pub fn format_rule_link() -> String {
+    RULE_PREFIX.to_owned()
+}
+
+/// True for the separator target.
+pub fn is_rule_link(target: &str) -> bool {
+    target.trim() == RULE_PREFIX
+}
+
 /// LaTeX from a `nodi-math:` link target.
 pub fn parse_math_link(target: &str) -> Option<String> {
     let encoded = target.trim().strip_prefix(MATH_PREFIX)?;
@@ -81,6 +95,14 @@ mod tests {
             Some("E = mc^2")
         );
         assert!(parse_math_link("https://example.com").is_none());
+    }
+
+    #[test]
+    fn rule_links_are_recognised() {
+        assert!(is_rule_link(RULE_PREFIX));
+        assert!(is_rule_link("  nodi-hr:  "));
+        assert!(!is_rule_link("nodi-math:E%20%3D%20mc%5E2"));
+        assert_eq!(format_rule_link(), RULE_PREFIX);
     }
 
     #[test]

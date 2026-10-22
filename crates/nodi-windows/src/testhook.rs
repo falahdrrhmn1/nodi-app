@@ -8,6 +8,7 @@
 
 use std::mem::size_of;
 
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR};
 
@@ -107,6 +108,28 @@ fn run(app: &mut App, line: &str) -> String {
             }
             "ok".to_owned()
         }
+        ("keys", Some(window)) => {
+            // Types text one character at a time through WM_CHAR, so the
+            // editor subclass sees spaces and tabs exactly like a keyboard.
+            // `\n` becomes Enter, `\t` a Tab; `\\` escapes the next character.
+            let mut chars = rest.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\\' => {
+                        let Some(literal) = chars.next() else { break };
+                        send_char(window, literal as u32);
+                    }
+                    '\n' => send_key(window, 0x0D),
+                    '\t' => send_key(window, 0x09),
+                    ch => send_char(window, ch as u32),
+                }
+            }
+            "ok".to_owned()
+        }
+        ("backspace", Some(window)) => {
+            send_key(window, 0x08);
+            "ok".to_owned()
+        }
         ("select", Some(window)) => match parse_range(rest) {
             Some((from, to)) => {
                 editor::set_selection(window, from, to);
@@ -120,10 +143,9 @@ fn run(app: &mut App, line: &str) -> String {
         }
         ("fmt", Some(window)) => match parse_range(rest) {
             Some((from, to)) => {
-                editor::set_selection(window, from, to);
-                let format = editor::selection_format(window);
+                let format = format::format_at(window, from, to);
                 format!(
-                    "bold={} italic={} underline={} strike={} face={} size={}",
+                    "bold={} italic={} underline={} strike={} face={} size={} hidden={}",
                     u8::from(format.dw_effects & editor::CFE_BOLD != 0),
                     u8::from(format.dw_effects & editor::CFE_ITALIC != 0),
                     u8::from(format.dw_effects & editor::CFE_UNDERLINE != 0),
@@ -136,11 +158,30 @@ fn run(app: &mut App, line: &str) -> String {
                             .take_while(|unit| *unit != 0)
                             .collect::<Vec<u16>>()
                     ),
-                    format.y_height
+                    format.y_height,
+                    u8::from(format.dw_effects & editor::CFE_HIDDEN != 0)
                 )
             }
             None => "bad range".to_owned(),
         },
+        ("hidden", Some(window)) => match parse_range(rest) {
+            Some((from, to)) => format::hidden_at(window, from, to).to_string(),
+            None => "bad range".to_owned(),
+        },
+        ("para", Some(window)) => {
+            let format = editor::para_format(window);
+            let (from, _) = editor::selection(window);
+            let start = editor::paragraph_start(window, from);
+            let end = editor::paragraph_end(window, from);
+            format!(
+                "start={} offset={} numbering={} level={} text={:?}",
+                format.dx_start_indent,
+                format.dx_offset,
+                format.w_numbering,
+                format::list_level(window),
+                editor::text_range(window, start, end)
+            )
+        }
         ("pictures", Some(window)) => editor::picture_count(window).to_string(),
         ("units", Some(window)) => editor::text_units(window, 0, editor::text_length(window))
             .iter()
@@ -355,10 +396,7 @@ fn run(app: &mut App, line: &str) -> String {
             "ok".to_owned()
         }
         ("tab", Some(window)) => {
-            // SAFETY: a character message to our own Rich Edit.
-            unsafe {
-                SendMessageW(window, WM_CHAR, 0x09, 1);
-            }
+            send_key(window, 0x09);
             "ok".to_owned()
         }
         ("shift-tab", Some(window)) => {
@@ -366,6 +404,24 @@ fn run(app: &mut App, line: &str) -> String {
             "ok".to_owned()
         }
         _ => format!("unknown command: {command}"),
+    }
+}
+
+/// WM_KEYDOWN + WM_CHAR + WM_KEYUP, like `TranslateMessage` produces.
+fn send_key(window: HWND, code: u32) {
+    // SAFETY: keyboard messages to our own Rich Edit.
+    unsafe {
+        SendMessageW(window, 0x0100, code as usize, 1);
+        SendMessageW(window, WM_CHAR, code as usize, 1);
+        SendMessageW(window, 0x0101, code as usize, 0xC000_0001u32 as isize);
+    }
+}
+
+/// A printable character: only WM_CHAR matters (and our space-marker hook).
+fn send_char(window: HWND, code: u32) {
+    // SAFETY: a character message to our own Rich Edit.
+    unsafe {
+        SendMessageW(window, WM_CHAR, code as usize, 1);
     }
 }
 

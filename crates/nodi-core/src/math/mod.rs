@@ -32,12 +32,14 @@ pub fn encode_png(width: u32, height: u32, gray_alpha: &[u8], latex: &str) -> Ve
     chunk(&mut png, b"IHDR", &header);
 
     let mut text = Vec::new();
-    text.extend_from_slice(LATEX_KEYWORD.as_bytes());
-    text.extend_from_slice(&[0, 0, 0]); // separator, uncompressed, method
-    text.push(0); // empty language tag
-    text.push(0); // empty translated keyword
-    text.extend_from_slice(latex.as_bytes());
-    chunk(&mut png, b"iTXt", &text);
+    if !latex.is_empty() {
+        text.extend_from_slice(LATEX_KEYWORD.as_bytes());
+        text.extend_from_slice(&[0, 0, 0]); // separator, uncompressed, method
+        text.push(0); // empty language tag
+        text.push(0); // empty translated keyword
+        text.extend_from_slice(latex.as_bytes());
+        chunk(&mut png, b"iTXt", &text);
+    }
 
     chunk(&mut png, b"IDAT", &compressed);
     chunk(&mut png, b"IEND", &[]);

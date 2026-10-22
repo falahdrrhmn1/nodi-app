@@ -126,6 +126,7 @@ pub const IDM_INSERT_DATETIME: u16 = 203;
 pub const IDM_INSERT_LINK: u16 = 204;
 pub const IDM_INSERT_CODE_BLOCK: u16 = 205;
 pub const IDM_INSERT_FORMULA: u16 = 206;
+pub const IDM_INSERT_SEPARATOR: u16 = 207;
 
 /// Every documented shortcut: (keys, action). Shown by Help > Keyboard
 /// Shortcuts and mirrored in docs/SHORTCUTS.md.
@@ -167,6 +168,11 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Shift+I", "Insert image"),
     ("Ctrl+Shift+T", "Insert table"),
     ("Alt+=", "Insert formula"),
+    ("Ctrl+Shift+-", "Insert separator"),
+    ("- / * / 1. + Space", "Start a bulleted / numbered list"),
+    ("# + Space", "Heading 1–4 (## … #### for deeper levels)"),
+    ("--- + Enter", "Horizontal separator"),
+    ("Enter on an empty list item", "End the list"),
     ("F5", "Insert date and time"),
     ("Ctrl+F", "Find in note"),
     ("F3 / Shift+F3", "Find next / previous"),
@@ -265,6 +271,7 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_INSERT_LINK, "&Link...\tCtrl+K"),
             Item::Cmd(IDM_INSERT_CODE_BLOCK, "&Code Block\tCtrl+Shift+C"),
             Item::Cmd(IDM_INSERT_FORMULA, "&Formula...\tAlt+="),
+            Item::Cmd(IDM_INSERT_SEPARATOR, "&Separator\tCtrl+Shift+-"),
             Item::Sep,
             Item::Cmd(IDM_INSERT_DATETIME, "&Date and Time\tF5"),
         ]);
@@ -446,6 +453,7 @@ pub fn create_accel() -> HACCEL {
         accel(ctrl_shift, key(b'I'), IDM_INSERT_IMAGE),
         accel(ctrl_shift, key(b'T'), IDM_INSERT_TABLE),
         accel(FALT, VK_OEM_PLUS, IDM_INSERT_FORMULA),
+        accel(ctrl_shift, VK_OEM_MINUS, IDM_INSERT_SEPARATOR),
         accel(0, VK_F5, IDM_INSERT_DATETIME),
         accel(ctrl, key(b'F'), IDM_SEARCH_FIND),
         accel(0, VK_F3, IDM_SEARCH_FIND_NEXT),
@@ -575,6 +583,7 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_INSERT_LINK => link::insert_or_edit(app),
         IDM_INSERT_CODE_BLOCK => with_editor(app, format::insert_code_block),
         IDM_INSERT_FORMULA => app::insert_formula(app),
+        IDM_INSERT_SEPARATOR => with_editor(app, format::insert_separator),
         IDM_INSERT_DATETIME => with_editor(app, |editor| {
             editor::replace_selection(editor, &app::local_date_time(), true);
         }),

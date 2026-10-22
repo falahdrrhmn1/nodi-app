@@ -701,6 +701,7 @@ pub unsafe extern "system" fn wndproc(
                 } else if header.code == editor::EN_SELCHANGE_NOTIFY
                     && app.tab_index(header.hwndFrom).is_some()
                 {
+                    crate::wnd::format::update_heading_marker(header.hwndFrom);
                     status::update_caret(app);
                     toolbar::sync_format(app);
                 } else if header.code == link::EN_LINK && app.tab_index(header.hwndFrom).is_some() {

@@ -510,10 +510,12 @@ impl App {
         // Rich Edit's default tab stop is 0.5"; Nodi uses half of that for the
         // whole document (new paragraphs inherit it).
         crate::wnd::format::apply_document_tabs(editor);
-        editor::set_modified(editor, false);
         if let Some((from, to)) = selection {
             editor::set_selection(editor, from, to);
         }
+        // Headings made by older versions may not have their `# ` marker yet.
+        crate::wnd::format::normalize_heading_markers(editor);
+        editor::set_modified(editor, false);
         if let Some(line) = scroll {
             editor::scroll_to_line(editor, line);
         }
@@ -576,6 +578,7 @@ impl App {
 
         tabs::set_cur(self, index);
         status::update_caret(self);
+        crate::wnd::format::update_heading_marker(self.tabs[index].editor);
         crate::wnd::toolbar::sync_format(self);
         status::set_message(self, "Ready");
         self.refresh_tab_ui(index);
@@ -610,6 +613,7 @@ impl App {
         }
         let editor = self.tabs[index].editor;
         if !editor.is_null() {
+            crate::wnd::format::forget_editor(editor);
             // SAFETY: the editor is a child window of this process.
             unsafe {
                 DestroyWindow(editor);
@@ -1449,6 +1453,8 @@ pub fn on_editor_change(app: &mut App, editor: HWND) {
     }
     app.mark_dirty(editor);
     status::update_caret(app);
+    crate::wnd::format::maintain_heading(editor);
+    crate::wnd::format::update_heading_marker(editor);
 }
 
 /// `TCN_SELCHANGE` from the tab control.

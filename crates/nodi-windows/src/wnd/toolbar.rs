@@ -7,9 +7,10 @@ use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, EnumFontFamiliesExW, GetDC, ReleaseDC, DEFAULT_CHARSET, LOGFONTW, TEXTMETRICW,
+    ClientToScreen, EnumFontFamiliesExW, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject,
+    DEFAULT_CHARSET, LOGFONTW, TEXTMETRICW,
 };
 use windows_sys::Win32::UI::Controls::{
     BTNS_AUTOSIZE, BTNS_BUTTON, BTNS_CHECK, BTNS_DROPDOWN, BTNS_SEP, BTNS_SHOWTEXT, CCS_NODIVIDER,
@@ -41,8 +42,11 @@ pub const TTN_GETDISPINFOW: u32 = 0u32.wrapping_sub(530);
 
 /// The separator that reserves room for the three comboboxes.
 const COMBO_SEP_ID: u16 = 1999;
-/// Width reserved for the combos, in 96-DPI pixels.
-const COMBO_AREA: i32 = 272;
+/// Width reserved for the combos, in 96-DPI pixels (style + font + size).
+const COMBO_FONT_WIDTH: i32 = 118;
+const COMBO_SIZE_WIDTH: i32 = 50;
+const COMBO_GAP: i32 = 6;
+const COMBO_EDGE: i32 = 2;
 
 /// Internal palette command ids (never reach `menu::on_command`).
 const PALETTE_BASE: u16 = 3200;
@@ -294,7 +298,7 @@ fn create_format(app: &App) -> HWND {
         "f(x)",
     ];
     create_bar(app, &LABELS, |buttons| {
-        buttons.separator(COMBO_SEP_ID, app.scale(COMBO_AREA));
+        buttons.separator(COMBO_SEP_ID, app.scale(combo_area(app)));
         buttons.text(0, IDM_FORMAT_BOLD, 0, false);
         buttons.text(1, IDM_FORMAT_ITALIC, 0, false);
         buttons.text(2, IDM_FORMAT_UNDERLINE, 0, false);
@@ -556,6 +560,10 @@ pub fn relayout(app: &mut App) {
     // The window height is the height of the dropped-down list; only the top
     // part of a closed combobox is visible.
     let height = app.scale(260);
+    let style_width = app.scale(style_combo_width(app));
+    let font_width = app.scale(COMBO_FONT_WIDTH);
+    let size_width = app.scale(COMBO_SIZE_WIDTH);
+    let gap = app.scale(COMBO_GAP);
     let place = |combo: HWND, offset: i32, width: i32| {
         if combo.is_null() {
             return;
@@ -565,17 +573,60 @@ pub fn relayout(app: &mut App) {
             SetWindowPos(
                 combo,
                 ptr::null_mut(),
-                rect.left + app.scale(offset),
+                rect.left + offset,
                 top,
-                app.scale(width),
+                width,
                 height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
     };
-    place(app.style_combo, 2, 88);
-    place(app.font_combo, 94, 118);
-    place(app.size_combo, 216, 50);
+    let style_left = app.scale(COMBO_EDGE);
+    place(app.style_combo, style_left, style_width);
+    let font_left = style_left + style_width + gap;
+    place(app.font_combo, font_left, font_width);
+    let size_left = font_left + font_width + gap;
+    place(app.size_combo, size_left, size_width);
+}
+
+/// Width needed by the widest style name (`Heading 1`…`Heading 4`) plus the
+/// drop-down arrow and padding, in 96-DPI pixels.
+fn style_combo_width(app: &App) -> i32 {
+    let labels = ["Normal", "Heading 1", "Heading 2", "Heading 3", "Heading 4"];
+    let mut widest = 0i32;
+    // SAFETY: the DC is released below and the font belongs to the app.
+    unsafe {
+        let dc = GetDC(app.formatbar);
+        if !dc.is_null() {
+            let previous = SelectObject(dc, app.ui_font);
+            for label in labels {
+                let wide: Vec<u16> = label.encode_utf16().collect();
+                let mut size = SIZE { cx: 0, cy: 0 };
+                if GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut size) != 0 {
+                    widest = widest.max(size.cx);
+                }
+            }
+            SelectObject(dc, previous);
+            ReleaseDC(app.formatbar, dc);
+        }
+    }
+    if widest == 0 {
+        widest = 60;
+    }
+    // The measured width is already in device pixels; convert to 96-DPI.
+    let dpi = app.dpi.max(1) as i32;
+    win::mul_div(widest.clamp(60, 200) + 34, 96, dpi)
+}
+
+/// Total width of the three combos and their gaps, in 96-DPI pixels.
+fn combo_area(app: &App) -> i32 {
+    COMBO_EDGE
+        + style_combo_width(app)
+        + COMBO_GAP
+        + COMBO_FONT_WIDTH
+        + COMBO_GAP
+        + COMBO_SIZE_WIDTH
+        + COMBO_EDGE
 }
 
 /// Recomputes the toolbar heights after a font/DPI change.

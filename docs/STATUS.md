@@ -25,12 +25,16 @@ same handlers as the menus.
 | extra — code block | indentation kept, exports as fenced code | **PASS** (e2e I) |
 | extra — formulas | render, persist, LaTeX editable, `$…$` export, bad LaTeX rejected | **PASS** (e2e J) |
 | extra — links | internal + web links survive restart | **PASS** (e2e K) |
-| extra — format bar | Heading 4 and Normal via the style list, `####` export | **PASS** (e2e P) |
+| extra — format bar | Heading 4 and Normal via the style list, `####` export; the style list is measured for its longest entry | **PASS** (e2e P) |
 | extra — tab width | tab stops 360 twips, code blocks 480 twips (measured with `EM_POSFROMCHAR`) | **PASS** (e2e Q) |
 | extra — Trash | confirmation with sub-note count, permanent `Trash (N)` item, Empty Trash → `recovery/` | **PASS** (e2e S) |
 | extra — real keyboard | foreground window, typed text, Ctrl+A/B, Ctrl+N, F2 rename | **PASS** (e2e R) |
+| extra — lists | `- ` → bullet, Enter → item, Tab/Shift+Tab nesting, Backspace keeps indent, markdown | **PASS** (e2e T, U) |
+| extra — paragraph indent | Tab indents the paragraph, Enter keeps it, wrapped lines align, restart | **PASS** (e2e V) |
+| extra — headings | `## ` → H2, grey marker visible while editing and hidden after leaving, level changes, restart, markdown | **PASS** (e2e W) |
+| extra — separator | `---` + Enter, Insert > Separator (Ctrl+Shift+-), restart, markdown `---` | **PASS** (e2e X) |
 
-Unit and integration tests: `cargo test` — 86 tests pass (nodi-core: tree,
+Unit and integration tests: `cargo test` — 91 tests pass (nodi-core: tree,
 storage, autosave, backup, search, links, image, RTF, Markdown, LaTeX parser,
 math layout, PNG; nodi-windows: table structure, link parsing/safety).
 `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean.
@@ -74,14 +78,25 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   1–4, bulleted/numbered lists, alignment, font, size, colour, highlight,
   inline code, clear formatting), undo/redo, Unicode, zoom, word wrap,
   duplicate line, go to line, date/time.
+- Markdown-style typing (Obsidian-like): `- `/`* `/`1. `/`1) ` make list items,
+  `# `…`#### ` make headings (the marker stays in the text but is grey while
+  the caret is in that heading and hidden otherwise), `---` + Enter (or
+  Ctrl+Shift+-) makes a horizontal separator; Undo right after a list marker
+  restores the typed text.
+- Lists nest with Tab/Shift+Tab (• ◦ ▪) and wrap with a hanging indent;
+  Enter on an empty item ends the list; Backspace at the start of an item drops
+  the bullet but keeps the indent.
+- Paragraph indentation: Tab/Shift+Tab indent the paragraph itself (360 twips),
+  so wrapped lines stay aligned; Enter keeps the indent and legacy notes with
+  leading tab characters keep working.
 - Word-like format bar: style list (Normal, Heading 1–4), installed-font list,
   size list 8–72 pt, text-colour and highlight palettes (10 colours + More… +
   None), four alignments, word-wrap toggle, lists and the insert commands;
   every button has a tooltip with its shortcut. The lists follow the caret.
 - Tab stops every 360 twips (half of Rich Edit's 0.5") in new and loaded notes;
   code blocks use 480 twips. Double-clicking a picture opens Image > Size….
-- Notepad++-style indentation: Enter keeps indentation, Tab/Shift+Tab on
-  selections, Backspace removes a tab indent.
+- Code blocks keep Notepad++-style Enter/Tab: Enter copies the indentation,
+  Tab inserts a tab, Shift+Tab removes one indent level.
 - Code blocks: grey bordered box, Consolas, code-editor Enter/Tab.
 - Pictures: insert from file, paste screenshots/copied images, Rich Edit's
   own resize handles, exact size dialog, 25/50/75/100 %, fit to width,
@@ -107,9 +122,10 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
 - Portable build (`scripts/build.ps1` → `dist\Nodi`), data next to the exe.
 
 ### Not done yet / limitations
-- **Markdown source editing** (typing Markdown that becomes rich text) is not
-  implemented. The Markdown view is read-only; the note itself stays the
-  source of truth.
+- **Markdown source editing** covers list markers, headings, separators and
+  indentation only. Inline syntax typed as text (`**bold**`, `` `code` ``,
+  `> quotes`, fenced code, link syntax) is not converted; the Markdown view
+  stays read-only and the note itself is the source of truth.
 - Picture rotate/crop and editing in an external program are not implemented.
 - Dragging picture files from Explorer into a note is not implemented
   (Insert > Image and paste work).

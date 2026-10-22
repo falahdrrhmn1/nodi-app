@@ -23,10 +23,10 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 
 | Keys | Action |
 |---|---|
-| Enter | New line **with the same indentation** as the current line |
+| Enter | New line with the same indentation and paragraph indent |
 | Shift+Enter | Line break without indentation |
-| Tab / Shift+Tab | Indent / outdent — the whole selected lines when several are selected |
-| Backspace | Removes one indent level when the indent is a tab |
+| Tab / Shift+Tab | Indent / outdent the paragraph (the selected lines when several are selected); in the middle of a line Tab still inserts a tab character |
+| Backspace | At the start of a paragraph: remove a bullet (keeping the indentation), turn a heading back into text, or outdent one step |
 | Ctrl+Z / Ctrl+Y | Undo / Redo |
 | Ctrl+X / Ctrl+C / Ctrl+V | Cut / Copy / Paste (also pastes screenshots and copied pictures) |
 | Ctrl+Shift+V | Paste as plain text |
@@ -34,6 +34,25 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 | Ctrl+D | Duplicate line (or the selection) |
 | Ctrl+G | Go to line |
 | F5 | Insert date and time |
+
+## Markdown-style typing
+
+Lists, headings and separators can be typed the Markdown way and turn into
+formatting as soon as the marker is finished (the raw marker is removed for
+lists/separators; headings keep it and show it in grey while the caret is in
+that heading).
+
+| Type | Result |
+|---|---|
+| `- ` or `* ` at the start of a paragraph | Bulleted list item |
+| `1. ` or `1) ` at the start of a paragraph | Numbered list item |
+| `# ` … `#### ` at the start of a paragraph | Heading 1–4 |
+| `---` alone on a line, then Enter | Horizontal separator |
+| Enter in a list item | Next item (same level) |
+| Enter on an empty list item | Ends the list, normal paragraph at the same indent |
+| Tab / Shift+Tab in a list item | One bullet level deeper / shallower (• ◦ ▪) |
+| Backspace at the start of a list item | Removes the bullet, keeps the indent |
+| Ctrl+Z right after `- ` / `1. ` | Restores the typed marker as plain text |
 
 ## Formatting
 
@@ -65,6 +84,7 @@ the insert commands.
 | Ctrl+Shift+I | Insert image from a file |
 | Ctrl+Shift+T | Insert table |
 | Alt+= | Insert formula (LaTeX) |
+| Ctrl+Shift+- | Insert separator (horizontal rule) |
 | Double-click a formula | Edit the formula |
 | Double-click a picture | Open Image > Size... |
 

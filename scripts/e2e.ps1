@@ -327,10 +327,17 @@ Test-Case 'F' 'Enter keeps indentation, Tab/Shift+Tab indent lines' {
     Invoke-Nodi $nodi 'select 0 30' | Out-Null
     Invoke-Nodi $nodi 'tab' | Out-Null
     $text = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
-    Assert ($text -like "`t`tif x:|`t`ty = 1|`tdone*") "block indent failed: '$text'"
+    Assert ($text -like "`tif x:|`ty = 1|done*") "block tab changed text: '$text'"
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -like 'start=360*') "block indent missing: $para"
+    Invoke-Nodi $nodi 'select 0 30' | Out-Null
     Invoke-Nodi $nodi 'shift-tab' | Out-Null
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
     $text = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
-    Assert ($text -like "`tif x:|`ty = 1|done*") "block outdent failed: '$text'"
+    Assert ($para -like 'start=0*') "block outdent left an indent: $para"
+    Assert ($text -like "`tif x:|`ty = 1|done*") "block outdent changed text: '$text'"
     Stop-Nodi $nodi
     ''
 }
@@ -464,7 +471,7 @@ Test-Case 'L' 'headings, lists and Enter-after-heading' {
     $nodi = Start-Nodi $data
     Invoke-Nodi $nodi 'type Machine Learning' | Out-Null
     Invoke-Nodi $nodi 'cmd 210' | Out-Null                # Heading 1
-    Invoke-Nodi $nodi 'select 16 16' | Out-Null
+    Invoke-Nodi $nodi 'select 18 18' | Out-Null
     Invoke-Nodi $nodi 'enter' | Out-Null
     Invoke-Nodi $nodi 'type Badan teks.' | Out-Null
     Invoke-Nodi $nodi 'enter' | Out-Null
@@ -640,6 +647,160 @@ Test-Case 'R' 'real keyboard: foreground window, Ctrl+A/B, Ctrl+N, F2 rename' {
     Stop-Nodi $nodi
     $renamed = @((Read-Tree $data).nodes | Where-Object title -eq 'Renamed')
     Assert ($renamed.Count -eq 1) "F2 rename did not reach tree.json: $((Read-Tree $data).nodes | ForEach-Object title)"
+    ''
+}
+
+# -------------------------------------------------------------------- batch 2
+
+Test-Case 'T' 'Markdown lists: typing, nesting, Backspace keeps indent' {
+    $data = New-DataDir 'T'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys - satu' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -match 'numbering=1' -and $para -match 'level=1' -and $para -match 'text="satu"') "bullet not formed: $para"
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys dua' | Out-Null
+    Invoke-Nodi $nodi 'tab' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -match 'start=360' -and $para -match 'level=2' -and $para -match 'numbering=0') "Tab did not nest: $para"
+    Invoke-Nodi $nodi 'shift-tab' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -match 'start=0' -and $para -match 'level=1' -and $para -match 'numbering=1') "Shift+Tab did not unnest: $para"
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    Invoke-Nodi $nodi 'backspace' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    $text = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
+    Assert ($para -match 'numbering=0' -and $para -match 'start=360' -and $para -match 'text="satu"') "Backspace changed the wrong things: $para"
+    Assert ($text -eq 'satu|dua') "text changed: '$text'"
+    Invoke-Nodi $nodi 'select 6 6' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -match 'numbering=1' -and $para -match 'text="dua"') "second item lost: $para"
+    ''
+}
+
+Test-Case 'U' 'empty item ends the list, Ctrl+Z restores a typed marker' {
+    $data = New-DataDir 'U'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys - ' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -match 'numbering=1' -and $para -match 'text=""') "empty bullet not created: $para"
+    Invoke-Nodi $nodi 'cmd 110' | Out-Null                 # Undo the conversion
+    $text = Invoke-Nodi $nodi 'text'
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($text -eq '- ') "Undo did not restore the typed text: '$text'"
+    Assert ($para -match 'numbering=0' -and $para -match 'start=0') "Undo left list formatting: $para"
+
+    Invoke-Nodi $nodi 'select 0 2' | Out-Null
+    Invoke-Nodi $nodi 'type ' | Out-Null
+    Invoke-Nodi $nodi 'keys - alpha' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys beta' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null                   # empty item -> end list
+    Invoke-Nodi $nodi 'keys tail' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -match 'numbering=0' -and $para -match 'start=360' -and $para -match 'text="tail"') "empty item did not end the list: $para"
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    $first = Invoke-Nodi $nodi 'para'
+    Invoke-Nodi $nodi 'select 6 6' | Out-Null
+    $second = Invoke-Nodi $nodi 'para'
+    $markdown = (Invoke-Nodi $nodi 'markdown') -replace "`0", ''
+    Stop-Nodi $nodi
+    Assert ($first -match 'numbering=1' -and $first -match 'text="alpha"') "first item lost: $first"
+    Assert ($second -match 'numbering=1' -and $second -match 'text="beta"') "second item lost: $second"
+    Assert ($markdown.Contains('- alpha') -and $markdown.Contains('- beta')) "list markdown missing:`n$markdown"
+    ''
+}
+
+Test-Case 'V' 'paragraph indentation survives wrapping and restart' {
+    $data = New-DataDir 'V'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys baris panjang' | Out-Null
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    Invoke-Nodi $nodi 'tab' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -match 'start=360' -and $para -match 'offset=0') "Tab did not indent the paragraph: $para"
+    Invoke-Nodi $nodi 'select 13 13' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys baris kedua' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -match 'start=360') "Enter lost the indent: $para"
+    $markdown = (Invoke-Nodi $nodi 'markdown') -replace "`0", ''
+    $indent = [string][char]0x00A0 + [char]0x00A0
+    Assert ($markdown.Contains("$indent" + 'baris panjang') -and $markdown.Contains("$indent" + 'baris kedua')) "markdown indent missing:`n$markdown"
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Stop-Nodi $nodi
+    Assert ($para -match 'start=360') "indent lost after restart: $para"
+    ''
+}
+
+Test-Case 'W' 'Markdown headings: hidden marker, level changes, restart' {
+    $data = New-DataDir 'W'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys ## Judul' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    Assert ($para -match 'text="## Judul"') "marker not kept: $para"
+    Assert ((Invoke-Nodi $nodi 'fmt 0 3') -match 'bold=1.*size=320') "H2 formatting missing: $(Invoke-Nodi $nodi 'fmt 0 3')"
+    Assert ((Invoke-Nodi $nodi 'hidden 0 3') -eq 'false') 'marker is not visible while editing'
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'hidden 0 3') -eq 'true') 'marker is not hidden after leaving the heading'
+    Invoke-Nodi $nodi 'keys isi' | Out-Null
+    # One more `#` upgrades the heading; deleting it goes back.
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    Invoke-Nodi $nodi 'keys #' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'fmt 0 4') -match 'size=280') "adding # did not make H3: $(Invoke-Nodi $nodi 'fmt 0 4')"
+    Invoke-Nodi $nodi 'select 0 1' | Out-Null
+    Invoke-Nodi $nodi 'type ' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'fmt 0 3') -match 'size=320') "deleting # did not restore H2: $(Invoke-Nodi $nodi 'fmt 0 3')"
+    Invoke-Nodi $nodi 'select 12 12' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'hidden 0 3') -eq 'true') 'marker stayed visible outside the heading'
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+
+    $nodi = Start-Nodi $data
+    Assert ((Invoke-Nodi $nodi 'hidden 0 3') -eq 'true') 'marker was visible after restart'
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    $para = Invoke-Nodi $nodi 'para'
+    $markdown = (Invoke-Nodi $nodi 'markdown') -replace "`0", ''
+    $inside = Invoke-Nodi $nodi 'hidden 0 3'
+    Stop-Nodi $nodi
+    Assert ($para -match 'text="## Judul"') "heading text lost after restart: $para"
+    Assert ($markdown.Trim() -like "## Judul`n`nisi*") "heading markdown wrong:`n$markdown"
+    Assert ($inside -eq 'false') 'marker did not become visible when re-entering the heading'
+    ''
+}
+
+Test-Case 'X' 'separator: --- + Enter, Insert menu, restart and markdown' {
+    $data = New-DataDir 'X'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys atas' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys ---' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    $pictures = Invoke-Nodi $nodi 'pictures'
+    Assert ($pictures -eq '1') "separator picture missing: $pictures"
+    Invoke-Nodi $nodi 'keys bawah' | Out-Null
+    $markdown = (Invoke-Nodi $nodi 'markdown') -replace "`0", ''
+    Assert ($markdown -match '(?s)atas.*---.*bawah') "separator markdown wrong:`n$markdown"
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    Stop-Nodi $nodi
+
+    $nodi = Start-Nodi $data
+    $pictures = Invoke-Nodi $nodi 'pictures'
+    $markdown = (Invoke-Nodi $nodi 'markdown') -replace "`0", ''
+    Assert ($pictures -eq '1') "separator lost after restart: $pictures"
+    Assert ($markdown -match '(?s)atas.*---.*bawah') "separator markdown lost after restart:`n$markdown"
+    Invoke-Nodi $nodi 'cmd 207' | Out-Null                # Insert > Separator
+    Assert ((Invoke-Nodi $nodi 'pictures') -eq '2') "Insert > Separator did nothing: $(Invoke-Nodi $nodi 'pictures')"
+    Stop-Nodi $nodi
     ''
 }
 
