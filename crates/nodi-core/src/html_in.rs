@@ -79,8 +79,14 @@ struct Parser {
     link: Option<String>,
     pre: Option<String>,
     pre_language: String,
-    skip: Option<String>,
+    /// Element being skipped and how many of its kind are open inside it.
+    skip: Option<(String, usize)>,
     table: Option<TableData>,
+    /// Inside `<math>` / a MathJax script: the TeX collected so far
+    /// (`display`, text). Only TeX sources are read; the visual MathML is not.
+    math: Option<(bool, String)>,
+    /// Inside a TeX `<annotation>` / `<script type="math/tex">`.
+    math_source: bool,
 }
 
 impl Parser {
@@ -99,6 +105,8 @@ impl Parser {
             pre_language: String::new(),
             skip: None,
             table: None,
+            math: None,
+            math_source: false,
         }
     }
 
@@ -139,15 +147,33 @@ impl Parser {
         let name = raw[..name_end].to_ascii_lowercase();
         let attrs = &raw[name_end..];
 
-        if let Some(skip) = self.skip.clone() {
-            if closing && name == skip {
-                self.skip = None;
+        if let Some((skip, depth)) = self.skip.as_mut() {
+            if name == *skip {
+                if closing {
+                    *depth -= 1;
+                    if *depth == 0 {
+                        self.skip = None;
+                    }
+                } else if !raw.ends_with('/') {
+                    *depth += 1;
+                }
+            }
+            return;
+        }
+        if self.math_tag(&name, attrs, closing) {
+            return;
+        }
+        if !closing && attr(attrs, "aria-hidden").is_some_and(|value| value == "true") {
+            // Decorative duplicates, e.g. KaTeX's visual rendering next to the
+            // MathML that carries the TeX. Void elements have nothing inside.
+            if !is_void(&name) {
+                self.skip_element(name);
             }
             return;
         }
         if matches!(name.as_str(), "script" | "style") {
             if !closing {
-                self.skip = Some(name);
+                self.skip_element(name);
             }
             return;
         }
@@ -179,7 +205,7 @@ impl Parser {
         match name.as_str() {
             "head" => {
                 if !closing {
-                    self.skip = Some(name);
+                    self.skip_element(name);
                 }
             }
             "p" | "div" | "section" | "article" | "header" | "footer" | "main" => {
@@ -233,7 +259,12 @@ impl Parser {
                     }
                 } else if let Some(target) = attr(attrs, "href") {
                     let target = target.trim();
-                    if !target.is_empty() && !target.starts_with('#') {
+                    // Only addresses that may become links (no `javascript:`…);
+                    // the others stay plain text.
+                    if !target.is_empty()
+                        && !target.starts_with('#')
+                        && crate::links::pasted_link_allowed(target)
+                    {
                         self.emit("[");
                         self.link = Some(target.to_owned());
                     }
@@ -328,9 +359,86 @@ impl Parser {
         }
     }
 
+    fn skip_element(&mut self, name: String) {
+        self.skip = Some((name, 1));
+    }
+
+    /// Formulas: Wikipedia's `<math alttext>`, an element with `data-latex`,
+    /// KaTeX/ChatGPT MathML with a TeX `<annotation>`, and MathJax's
+    /// `<script type="math/tex">`. They become `$…$` (`$$…$$` for display
+    /// math), which `markdown_in` turns into formulas. Returns true when the
+    /// tag was consumed.
+    fn math_tag(&mut self, name: &str, attrs: &str, closing: bool) -> bool {
+        if let Some((display, tex)) = self.math.as_mut() {
+            let ends = closing && (name == "math" || (name == "script" && self.math_source));
+            if name == "annotation" {
+                self.math_source = !closing
+                    && attr(attrs, "encoding").is_some_and(|encoding| encoding.contains("tex"));
+            }
+            if ends {
+                let (display, tex) = (*display, std::mem::take(tex));
+                self.math = None;
+                self.math_source = false;
+                self.emit_math(&tex, display);
+            }
+            return true;
+        }
+        if closing {
+            return false;
+        }
+        if let Some(tex) = attr(attrs, "data-latex") {
+            self.emit_math(&tex, false);
+            self.skip_element(name.to_owned());
+            return true;
+        }
+        if name == "math" {
+            let display = attr(attrs, "display").is_some_and(|value| value == "block");
+            if let Some(alt) = attr(attrs, "alttext") {
+                let alt = alt.trim();
+                let tex = alt
+                    .strip_prefix("{\\displaystyle")
+                    .and_then(|inner| inner.strip_suffix('}'))
+                    .unwrap_or(alt);
+                self.emit_math(tex, display);
+                self.skip_element(name.to_owned());
+                return true;
+            }
+            self.math = Some((display, String::new()));
+            return true;
+        }
+        if name == "script" {
+            if let Some(kind) = attr(attrs, "type").filter(|kind| kind.starts_with("math/tex")) {
+                self.math = Some((kind.contains("mode=display"), String::new()));
+                self.math_source = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn emit_math(&mut self, tex: &str, display: bool) {
+        let tex = tex.trim();
+        if tex.is_empty() {
+            return;
+        }
+        if display {
+            self.block();
+            self.out.push_str(&format!("$${tex}$$"));
+            self.block();
+        } else {
+            self.emit(&format!("${tex}$"));
+        }
+    }
+
     /// Text node: decodes entities and collapses whitespace outside `<pre>`.
     fn text(&mut self, text: &str) {
         if self.skip.is_some() {
+            return;
+        }
+        if let Some((_, tex)) = self.math.as_mut() {
+            if self.math_source {
+                tex.push_str(&decode_entities(text));
+            }
             return;
         }
         let decoded = decode_entities(text);
@@ -469,6 +577,14 @@ impl Parser {
         }
         text.trim().to_owned()
     }
+}
+
+/// Elements without content or a closing tag.
+fn is_void(name: &str) -> bool {
+    matches!(
+        name,
+        "img" | "br" | "hr" | "input" | "meta" | "link" | "wbr" | "source" | "area" | "col"
+    )
 }
 
 fn attr(attrs: &str, name: &str) -> Option<String> {
@@ -640,10 +756,10 @@ mod tests {
         let markdown = html_to_markdown(html);
         assert!(markdown.starts_with("**Kecerdasan buatan**"), "{markdown}");
         assert!(markdown.contains("*artificial intelligence*"), "{markdown}");
-        assert!(
-            markdown.contains("[kecerdasan](/wiki/Kecerdasan)"),
-            "{markdown}"
-        );
+        // A relative address cannot be opened from a note: the text stays,
+        // the link does not.
+        assert!(markdown.contains("atau kecerdasan entitas"), "{markdown}");
+        assert!(!markdown.contains("/wiki/"), "{markdown}");
         assert!(!markdown.contains('<'), "tags left over: {markdown}");
     }
 
@@ -667,6 +783,29 @@ mod tests {
         );
         assert!(markdown.contains("AT&T — 100%"), "{markdown}");
         assert!(markdown.contains("[Logo](https://x/y.png)"), "{markdown}");
+    }
+
+    #[test]
+    fn katex_from_chatgpt_keeps_only_the_tex() {
+        let html = r#"<p>Energi <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>E</mi><mo>=</mo><mi>m</mi><msup><mi>c</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">E = mc^2</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="mord">E</span><span class="mrel">=</span><span class="mord">m</span><span class="mord"><span class="mord">c</span><span class="msupsub">2</span></span></span></span></span> saja.</p>"#;
+        let markdown = html_to_markdown(html);
+        assert_eq!(markdown, "Energi $E = mc^2$ saja.");
+    }
+
+    #[test]
+    fn katex_display_math_is_a_block() {
+        let html = r#"<span class="katex-display"><span class="katex"><span class="katex-mathml"><math display="block"><semantics><mrow></mrow><annotation encoding="application/x-tex">\frac{a}{b}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span>a</span><span>b</span></span></span></span>"#;
+        assert_eq!(html_to_markdown(html), r"$$\frac{a}{b}$$");
+    }
+
+    #[test]
+    fn wikipedia_alttext_and_mathjax_scripts() {
+        let wiki = r#"<p>Luas <span class="mwe-math-element"><math alttext="{\displaystyle \pi r^{2}}"><semantics><mi>π</mi></semantics></math><img src="x.svg" class="mwe-math-fallback-image-inline" aria-hidden="true" alt="\pi r^2"></span>.</p>"#;
+        assert_eq!(html_to_markdown(wiki), r"Luas $\pi r^{2}$.");
+        let mathjax = r#"<p>Nilai <script type="math/tex">x_1 &lt; y</script> dan <script type="math/tex; mode=display">\sum_i x_i</script></p>"#;
+        let markdown = html_to_markdown(mathjax);
+        assert!(markdown.contains("$x_1 < y$"), "{markdown}");
+        assert!(markdown.contains(r"$$\sum_i x_i$$"), "{markdown}");
     }
 
     #[test]

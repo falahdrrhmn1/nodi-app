@@ -275,3 +275,88 @@ fn move_among_siblings_skips_trashed_and_stops_at_the_ends() {
     assert!(!tree.move_among_siblings(&a, 1), "already last");
     let _ = b;
 }
+
+#[test]
+fn auto_title_takes_the_first_line_without_markers() {
+    use nodi_core::tree::auto_title;
+    assert_eq!(auto_title("## Rapat mingguan\risi"), "Rapat mingguan");
+    assert_eq!(auto_title("\r\r  •\tpoin satu\r"), "poin satu");
+    assert_eq!(auto_title("- a   b\tc"), "a b c");
+    assert_eq!(auto_title("\u{FFFC}\r"), "New Note");
+    assert_eq!(auto_title(""), "New Note");
+    assert_eq!(auto_title(&"x".repeat(100)).chars().count(), 60);
+}
+
+#[test]
+fn only_automatic_titles_follow_the_text_and_renaming_stops_it() {
+    let mut tree = Tree::new();
+    let note = tree.new_node(NodeKind::Note, "New Note", None);
+    assert_eq!(tree.follow_text(&note, "Judul"), None, "manual by default");
+    tree.set_auto_title(&note, true);
+    assert_eq!(
+        tree.follow_text(&note, "Judul\risi").as_deref(),
+        Some("Judul")
+    );
+    assert_eq!(tree.follow_text(&note, "Judul\rlain"), None, "unchanged");
+    assert!(tree.rename(&note, "X"));
+    assert_eq!(tree.follow_text(&note, "Baru"), None);
+    assert_eq!(tree.get(&note).unwrap().title, "X");
+    // Round trip through JSON keeps the flag; old files default to manual.
+    tree.set_auto_title(&note, true);
+    let back = Tree::from_json(&tree.to_json().unwrap()).unwrap();
+    assert!(back.get(&note).unwrap().auto_title);
+}
+
+#[test]
+fn undo_trash_brings_back_only_what_it_trashed_at_the_same_place() {
+    let mut tree = Tree::new();
+    let a = tree.new_node(NodeKind::Note, "A", None);
+    let folder = tree.new_node(NodeKind::Folder, "Folder", None);
+    let child = tree.new_node(NodeKind::Note, "Child", Some(folder.clone()));
+    let old = tree.new_node(NodeKind::Note, "Old", Some(folder.clone()));
+    tree.trash(&old);
+    let change = tree.trash_undoable(&folder).unwrap();
+    assert!(change.question(&tree).contains("\"Folder\" and 1 sub-note"));
+    tree.undo(&change).unwrap();
+    let roots: Vec<&str> = tree
+        .children(None)
+        .iter()
+        .map(|n| n.title.as_str())
+        .collect();
+    assert_eq!(roots, vec!["A", "Folder"]);
+    assert!(!tree.get(&child).unwrap().trashed);
+    assert!(tree.get(&old).unwrap().trashed, "was trashed before");
+    let _ = a;
+}
+
+#[test]
+fn undo_move_and_rename() {
+    let mut tree = Tree::new();
+    let a = tree.new_node(NodeKind::Note, "A", None);
+    let b = tree.new_node(NodeKind::Note, "B", None);
+    let box_ = tree.new_node(NodeKind::Folder, "Box", None);
+    let change = tree.move_undo(&a).unwrap();
+    tree.move_node(&a, Some(box_.clone()), usize::MAX).unwrap();
+    assert_eq!(
+        change.question(&tree),
+        "Undo: move \"A\" back to the top level?"
+    );
+    tree.undo(&change).unwrap();
+    let roots: Vec<&str> = tree
+        .children(None)
+        .iter()
+        .map(|n| n.title.as_str())
+        .collect();
+    assert_eq!(roots, vec!["A", "B", "Box"]);
+
+    tree.set_auto_title(&b, true);
+    let rename = tree.rename_undo(&b, "Baru").unwrap();
+    tree.rename(&b, "Baru");
+    assert_eq!(
+        rename.question(&tree),
+        "Undo: rename \"Baru\" back to \"B\"?"
+    );
+    tree.undo(&rename).unwrap();
+    assert_eq!(tree.get(&b).unwrap().title, "B");
+    assert!(tree.get(&b).unwrap().auto_title);
+}

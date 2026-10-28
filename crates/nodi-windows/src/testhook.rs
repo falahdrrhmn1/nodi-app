@@ -60,6 +60,111 @@ fn run(app: &mut App, line: &str) -> String {
     let editor = app.active_editor();
     match (command, editor) {
         ("state", _) => app.active_state().unwrap_or("").to_owned(),
+        // Batch 5: screen points for real mouse input, and direct triggers.
+        ("tabbutton", _) => {
+            let index = rest.trim().parse::<usize>().ok();
+            match crate::wnd::tabs::button_screen_point(app, index) {
+                Some(point) => format!("{} {}", point.x, point.y),
+                None => "none".to_owned(),
+            }
+        }
+        ("tabhit", _) => {
+            let mut parts = rest
+                .split_whitespace()
+                .filter_map(|part| part.parse::<i32>().ok());
+            let point = windows_sys::Win32::Foundation::POINT {
+                x: parts.next().unwrap_or(0),
+                y: parts.next().unwrap_or(0),
+            };
+            crate::wnd::tabs::describe_hit(app, point)
+        }
+        ("treerect", _) => {
+            let title = rest.trim();
+            let id = app
+                .tree
+                .iter_ordered()
+                .into_iter()
+                .find(|node| !node.trashed && node.title == title)
+                .map(|node| node.id.clone());
+            match id.and_then(|id| crate::wnd::tree::item_screen_rect(app, &id)) {
+                Some(rect) => format!("{} {} {} {}", rect.left, rect.top, rect.right, rect.bottom),
+                None => "none".to_owned(),
+            }
+        }
+        ("titles", _) => app
+            .tree
+            .iter_ordered()
+            .into_iter()
+            .filter(|node| !node.trashed)
+            .map(|node| node.title.clone())
+            .collect::<Vec<_>>()
+            .join("|"),
+        ("undo-count", _) => app.tree_undo.len().to_string(),
+        ("parent", _) => app
+            .tree
+            .iter_ordered()
+            .into_iter()
+            .find(|node| node.title == rest.trim())
+            .map(|node| {
+                node.parent
+                    .as_ref()
+                    .and_then(|parent| app.tree.get(parent))
+                    .map_or_else(|| "<root>".to_owned(), |parent| parent.title.clone())
+            })
+            .unwrap_or_else(|| "not found".to_owned()),
+        ("firstline", Some(window)) => editor::first_visible_line(window).to_string(),
+        ("import", _) => {
+            let paths: Vec<std::path::PathBuf> = rest
+                .split('|')
+                .filter(|part| !part.trim().is_empty())
+                .map(|part| std::path::PathBuf::from(part.trim()))
+                .collect();
+            crate::wnd::import::start(app, paths);
+            "started".to_owned()
+        }
+        ("export-folder", _) => {
+            let Some((title, dest)) = rest.split_once('|') else {
+                return "usage: export-folder <title>|<dest>".to_owned();
+            };
+            let Some(data) = app.data.clone() else {
+                return "no data".to_owned();
+            };
+            let id = app
+                .tree
+                .iter_ordered()
+                .into_iter()
+                .find(|node| !node.trashed && node.title == title.trim())
+                .map(|node| node.id.clone());
+            let Some(id) = id else {
+                return "not found".to_owned();
+            };
+            app.flush_all();
+            if let Some(writer) = &app.writer {
+                writer.flush_blocking(std::time::Duration::from_secs(5));
+            }
+            match nodi_core::mirror::export(
+                &data,
+                &app.tree,
+                &id,
+                std::path::Path::new(dest.trim()),
+            ) {
+                Ok(count) => count.to_string(),
+                Err(err) => format!("error: {err}"),
+            }
+        }
+        ("mirror-folder", _) => {
+            let folder = match rest.trim() {
+                "default" => None,
+                other => Some(other.to_owned()),
+            };
+            match app.set_mirror_folder(folder) {
+                Ok(()) => app
+                    .ai_folder()
+                    .map(|folder| folder.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                Err(message) => format!("error: {message}"),
+            }
+        }
         ("accel", _) => format!("{:?}", app.accel),
         ("lastcmd", _) => LAST_COMMAND.with(|last| format!("{:?}", last.get())),
         ("tabs", _) => {
@@ -77,11 +182,13 @@ fn run(app: &mut App, line: &str) -> String {
             }
             Err(_) => "bad id".to_owned(),
         },
-        ("counts", _) => app
-            .status_text
-            .get(status::PART_COUNTS)
-            .cloned()
-            .unwrap_or_default(),
+        ("counts", _) => {
+            status::update_counts(app);
+            app.status_text
+                .get(status::PART_COUNTS)
+                .cloned()
+                .unwrap_or_default()
+        }
         ("recent", _) => app
             .recent
             .iter()
@@ -724,13 +831,9 @@ fn move_rel(app: &mut App, rest: &str) -> String {
     let Some(target) = find(&app.tree, target_title) else {
         return "target not found".to_owned();
     };
-    match app.tree.move_relative(&source, &target, position) {
-        Ok(()) => {
-            app.tree_save();
-            app.selected = Some(source);
-            app.rebuild_tree();
-            "ok".to_owned()
-        }
+    // The same path as a drag & drop (so it is undoable too).
+    match app.move_node_relative(source, target, position) {
+        Ok(()) => "ok".to_owned(),
         Err(err) => format!("error: {err}"),
     }
 }

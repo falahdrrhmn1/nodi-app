@@ -15,13 +15,14 @@ use windows_sys::Win32::UI::Controls::{
     ImageList_BeginDrag, ImageList_Create, ImageList_DragEnter, ImageList_DragLeave,
     ImageList_DragMove, ImageList_EndDrag, ImageList_ReplaceIcon, ILC_COLOR32, ILC_MASK, NMHDR,
     NMTREEVIEWW, NMTVDISPINFOW, NMTVKEYDOWN, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET,
-    TVGN_DROPHILITE, TVHITTESTINFO, TVHT_ONITEM, TVIF_CHILDREN, TVIF_IMAGE, TVIF_SELECTEDIMAGE,
-    TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT,
-    TVM_DELETEITEM, TVM_EDITLABELW, TVM_EXPAND, TVM_GETEDITCONTROL, TVM_GETITEMRECT, TVM_GETITEMW,
-    TVM_GETNEXTITEM, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETIMAGELIST,
-    TVM_SETINSERTMARK, TVM_SETITEMW, TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW,
-    TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS,
-    TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEWW,
+    TVGN_DROPHILITE, TVHITTESTINFO, TVHT_ONITEM, TVHT_ONITEMBUTTON, TVHT_ONITEMINDENT,
+    TVHT_ONITEMRIGHT, TVIF_CHILDREN, TVIF_IMAGE, TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW,
+    TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_EDITLABELW,
+    TVM_EXPAND, TVM_GETEDITCONTROL, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST,
+    TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETIMAGELIST, TVM_SETINSERTMARK, TVM_SETITEMW,
+    TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW, TVN_ITEMEXPANDEDW, TVN_KEYDOWN,
+    TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT,
+    TVS_SHOWSELALWAYS, WC_TREEVIEWW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_APPS, VK_DELETE, VK_ESCAPE, VK_RETURN,
@@ -756,8 +757,10 @@ fn is_note(app: &App, id: &NoteId) -> bool {
         .is_some_and(|node| node.kind == NodeKind::Note && !node.trashed)
 }
 
-/// Raw item handle at `client` (0 when the point is not on an item).
-fn hit_item(app: &App, client: POINT) -> isize {
+/// Item whose row contains `client`, anywhere in the row: label, icon,
+/// indent, expand button or the empty space right of the label (0 below the
+/// last row). Dragging must work across the whole row, not only on the text.
+fn hit_row(app: &App, client: POINT) -> isize {
     let mut info = TVHITTESTINFO {
         pt: client,
         flags: 0,
@@ -772,11 +775,29 @@ fn hit_item(app: &App, client: POINT) -> isize {
             &mut info as *mut TVHITTESTINFO as isize,
         )
     } as isize;
-    if item != 0 && info.flags & TVHT_ONITEM != 0 {
+    let row = TVHT_ONITEM | TVHT_ONITEMRIGHT | TVHT_ONITEMINDENT | TVHT_ONITEMBUTTON;
+    if item != 0 && info.flags & row != 0 {
         item
     } else {
         0
     }
+}
+
+/// Client rectangle of `item`'s whole row.
+fn row_rect(app: &App, item: isize) -> Option<RECT> {
+    let mut rect = RECT::default();
+    // SAFETY: TVM_GETITEMRECT reads the item handle from the start of the
+    // RECT and overwrites it with the result; wParam FALSE = the whole row.
+    let ok = unsafe {
+        *(&mut rect as *mut RECT as *mut isize) = item;
+        SendMessageW(
+            app.tree_view,
+            TVM_GETITEMRECT,
+            0,
+            &mut rect as *mut RECT as isize,
+        )
+    };
+    (ok != 0).then_some(rect)
 }
 
 // --------------------------------------------------------------- notifications
@@ -1019,35 +1040,18 @@ fn on_drag_move(app: &mut App, lparam: LPARAM) {
 
 /// True while `point` is over the tree's "Trash" pseudo-item.
 fn over_trash(app: &App, point: POINT) -> bool {
-    app.trash_item != 0 && hit_item(app, point) == app.trash_item
+    app.trash_item != 0 && hit_row(app, point) == app.trash_item
 }
 
 /// Item under `client` plus the drop zone for its row: the top quarter means
 /// "before", the bottom quarter "after", the middle "inside".
 fn drop_zone(app: &App, client: POINT) -> Option<(NoteId, Position)> {
-    let item = hit_item(app, client);
+    let item = hit_row(app, client);
     if item == 0 || item == app.trash_item {
         return None;
     }
     let id = item_note(app, item)?;
-    let mut rect = RECT {
-        left: 1,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    // SAFETY: `rect` is valid for the call; `item` is a live item.
-    let ok = unsafe {
-        SendMessageW(
-            app.tree_view,
-            TVM_GETITEMRECT,
-            item as usize,
-            &mut rect as *mut RECT as isize,
-        )
-    };
-    if ok == 0 {
-        return None;
-    }
+    let rect = row_rect(app, item)?;
     let band = ((rect.bottom - rect.top) / 4).max(1);
     let position = if client.y < rect.top + band {
         Position::Before
@@ -1179,7 +1183,8 @@ fn on_drop(app: &mut App, lparam: LPARAM) {
     if let Some(source) = source {
         match hover {
             Some((target, position)) if target != source => {
-                app.move_node_relative(source, target, position);
+                // A refused move is reported in the status bar.
+                let _ = app.move_node_relative(source, target, position);
             }
             Some(_) => {}
             // Dropped on empty space: move to the top level.
@@ -1214,7 +1219,8 @@ pub fn show_context_menu(app: &mut App, screen: Option<POINT>) {
             unsafe {
                 ScreenToClient(app.tree_view, &mut client);
             }
-            let item = hit_item(app, client);
+            // The whole row counts, not only the label.
+            let item = hit_row(app, client);
             if app.trash_item != 0 && item == app.trash_item {
                 on_trash = true;
                 app.selected = None;
@@ -1364,25 +1370,7 @@ unsafe fn append(menu: HMENU, id: u16, label: &str) {
 
 fn item_screen_pos(app: &App, id: Option<&NoteId>) -> Option<POINT> {
     let item = id.and_then(|id| item_of(app, id))?;
-    // `left` must be TRUE to receive the full row rectangle.
-    let mut rect = RECT {
-        left: 1,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    // SAFETY: `rect` is valid for the call; `item` is a live item.
-    let ok = unsafe {
-        SendMessageW(
-            app.tree_view,
-            TVM_GETITEMRECT,
-            item as usize,
-            &mut rect as *mut RECT as isize,
-        )
-    };
-    if ok == 0 {
-        return None;
-    }
+    let rect = row_rect(app, item)?;
     let mut point = POINT {
         x: rect.left + 12,
         y: rect.bottom,
@@ -1392,6 +1380,30 @@ fn item_screen_pos(app: &App, id: Option<&NoteId>) -> Option<POINT> {
         ClientToScreen(app.tree_view, &mut point);
     }
     Some(point)
+}
+
+/// Screen rectangle of a node's full row (test hook for real mouse drags).
+pub fn item_screen_rect(app: &App, id: &NoteId) -> Option<RECT> {
+    let rect = row_rect(app, item_of(app, id)?)?;
+    let mut top_left = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let mut bottom_right = POINT {
+        x: rect.right,
+        y: rect.bottom,
+    };
+    // SAFETY: the tree window is alive.
+    unsafe {
+        ClientToScreen(app.tree_view, &mut top_left);
+        ClientToScreen(app.tree_view, &mut bottom_right);
+    }
+    Some(RECT {
+        left: top_left.x,
+        top: top_left.y,
+        right: bottom_right.x,
+        bottom: bottom_right.y,
+    })
 }
 
 /// Focuses the tree (used when the user closes the last editor).

@@ -12,7 +12,7 @@ use windows_sys::Win32::UI::Controls::EM_SETMARGINS;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NOHIDESEL, ES_WANTRETURN,
-    WM_COPY, WM_CUT, WM_PASTE, WS_CHILD, WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
+    WM_COPY, WM_CUT, WM_PASTE, WM_SETREDRAW, WS_CHILD, WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::app::App;
@@ -895,6 +895,14 @@ pub fn first_visible_line(editor: HWND) -> u32 {
     line.max(0) as u32
 }
 
+/// Scrolls the view by `lines` (negative = up) without moving the caret.
+pub fn scroll_lines(editor: HWND, lines: i32) {
+    // SAFETY: standard edit message on our control.
+    unsafe {
+        SendMessageW(editor, EM_LINESCROLL, 0, lines as isize);
+    }
+}
+
 /// Scrolls so that `line` becomes the first visible line.
 pub fn scroll_to_line(editor: HWND, line: u32) {
     let current = first_visible_line(editor) as i32;
@@ -905,6 +913,58 @@ pub fn scroll_to_line(editor: HWND, line: u32) {
     // SAFETY: standard edit message on our control.
     unsafe {
         SendMessageW(editor, EM_LINESCROLL, 0, delta as isize);
+    }
+}
+
+thread_local! {
+    /// Nesting depth of [`Frozen`] guards on this (the UI) thread.
+    static FROZEN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Stops an editor from painting while code moves the selection around to
+/// read or format text (the control has `ES_NOHIDESEL`, so every temporary
+/// selection would otherwise flash as a highlight). On drop the first visible
+/// line is restored and the control repaints once. Guards nest.
+pub struct Frozen {
+    editor: HWND,
+    line: u32,
+}
+
+impl Frozen {
+    pub fn new(editor: HWND) -> Self {
+        let depth = FROZEN_DEPTH.with(|depth| {
+            let value = depth.get();
+            depth.set(value + 1);
+            value
+        });
+        if depth == 0 {
+            // SAFETY: `editor` is a live control owned by this thread.
+            unsafe {
+                SendMessageW(editor, WM_SETREDRAW, 0, 0);
+            }
+        }
+        Self {
+            editor,
+            line: first_visible_line(editor),
+        }
+    }
+}
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        scroll_to_line(self.editor, self.line);
+        let depth = FROZEN_DEPTH.with(|depth| {
+            let value = depth.get().saturating_sub(1);
+            depth.set(value);
+            value
+        });
+        if depth == 0 {
+            // SAFETY: as in `new`; repaint without erasing to avoid flicker.
+            unsafe {
+                SendMessageW(self.editor, WM_SETREDRAW, 1, 0);
+                windows_sys::Win32::Graphics::Gdi::InvalidateRect(self.editor, ptr::null(), 0);
+            }
+        }
     }
 }
 

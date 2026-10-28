@@ -23,7 +23,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +43,9 @@ pub struct DataDir {
     /// Test/diagnostic switch: when true [`DataDir::atomic_write`] fails before
     /// touching the disk. Production code never sets it.
     pub fail_writes: Arc<AtomicBool>,
+    /// Folder of the Markdown mirror chosen in Tools > AI Mirror Folder
+    /// (`None` = `data/markdown`). Shared with the writer thread's clone.
+    markdown_override: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl DataDir {
@@ -70,6 +73,7 @@ impl DataDir {
         Self {
             root: root.into(),
             fail_writes: Arc::new(AtomicBool::new(false)),
+            markdown_override: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -93,9 +97,24 @@ impl DataDir {
         self.root.join("settings.json")
     }
 
-    /// `markdown/` — the AI-agent-readable mirror (derived, never read back).
+    /// `markdown/` — the AI-agent-readable mirror (derived, never read back),
+    /// or the folder chosen with [`DataDir::set_markdown_dir`].
     pub fn markdown_dir(&self) -> PathBuf {
-        self.root.join("markdown")
+        let chosen = self
+            .markdown_override
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        chosen.unwrap_or_else(|| self.root.join("markdown"))
+    }
+
+    /// Moves the Markdown mirror to `dir` (`None` = back to `data/markdown`).
+    /// Every clone of this `DataDir` (the writer's too) follows. The old
+    /// folder is left as it is.
+    pub fn set_markdown_dir(&self, dir: Option<PathBuf>) {
+        if let Ok(mut guard) = self.markdown_override.write() {
+            *guard = dir;
+        }
     }
 
     /// `icons/` - copies of note icons the user picked from a file.
@@ -206,8 +225,7 @@ impl DataDir {
             if keep_prev && path.exists() {
                 fs::copy(path, sibling(path, ".prev"))?;
             }
-            fs::rename(&tmp, path)?;
-            Ok(())
+            rename_retrying(&tmp, path)
         })();
 
         if outcome.is_err() {
@@ -448,6 +466,29 @@ fn data_dir_for_exe_dir(exe_dir: &Path) -> PathBuf {
     exe_dir.join("data")
 }
 
+/// `rename` that waits out a short lock on the target: on Windows replacing a
+/// file fails while another program (a virus scanner, a sync client, an
+/// indexer, a reader) has it open. Retries for up to about a second.
+fn rename_retrying(from: &Path, to: &Path) -> io::Result<()> {
+    const ATTEMPTS: u32 = 20;
+    let mut attempt = 0;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                // ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32).
+                let locked = err.kind() == io::ErrorKind::PermissionDenied
+                    || matches!(err.raw_os_error(), Some(5 | 32));
+                attempt += 1;
+                if !locked || attempt >= ATTEMPTS {
+                    return Err(err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 /// Adds a suffix to a file name (`notes/a.rtf` + `.prev` → `notes/a.rtf.prev`).
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name: OsString = path.file_name().map(OsString::from).unwrap_or_default();
@@ -598,6 +639,13 @@ pub struct Settings {
     /// View > Spell Check (default off).
     #[serde(default)]
     pub spell_check: bool,
+    /// View > "Ctrl+Up/Down Scrolls the View" (Notepad++ style, default on).
+    #[serde(default = "default_true")]
+    pub ctrl_arrow_scroll: bool,
+    /// Tools > AI Mirror Folder: where the Markdown mirror goes (empty =
+    /// `data/markdown`).
+    #[serde(default)]
+    pub markdown_dir: String,
 }
 
 impl Default for Settings {
@@ -607,6 +655,8 @@ impl Default for Settings {
             custom: CustomTheme::default(),
             markdown_mirror: true,
             spell_check: false,
+            ctrl_arrow_scroll: true,
+            markdown_dir: String::new(),
         }
     }
 }

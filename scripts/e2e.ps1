@@ -271,7 +271,8 @@ function Set-ClipboardHtml([string]$fragment) {
     Add-Type -AssemblyName System.Windows.Forms
     $body = "<html><body><!--StartFragment-->$fragment<!--EndFragment--></body></html>"
     $template = "Version:0.9`r`nStartHTML:{0:D10}`r`nEndHTML:{1:D10}`r`nStartFragment:{2:D10}`r`nEndFragment:{3:D10}`r`n"
-    $headerLength = $template.Length
+    # Measured with the numbers filled in (10 digits each), not the placeholders.
+    $headerLength = [string]::Format($template, 0, 0, 0, 0).Length
     $start = $headerLength + $body.IndexOf('<!--StartFragment-->') + 20
     $end = $headerLength + $body.IndexOf('<!--EndFragment-->')
     $header = [string]::Format($template, $headerLength, $headerLength + $body.Length, $start, $end)
@@ -1270,9 +1271,8 @@ Test-Case 'AI' 'status bar counts words and characters' {
     Invoke-Nodi $nodi 'select 0 8' | Out-Null
     $selected = Invoke-Nodi $nodi 'counts'
     Stop-Nodi $nodi
-    Assert ($counts -match '\b3 words') "note counts: $counts"
-    Assert ($counts -match '\b13 ch') "note chars: $counts"
-    Assert ($selected -match '\b2 words') "selection counts: $selected"
+    Assert ($counts -eq 'Lines 1 · Words 3 · Chars 13') "note counts: $counts"
+    Assert ($selected -match 'Sel: 1 lines, 2 words, 8 chars') "selection counts: $selected"
     "($counts / $selected)"
 }
 
@@ -1341,6 +1341,339 @@ Test-Case 'AL' 'recent notes and Ctrl+Alt+O with real keys' {
     Assert ($last -match '142') "Ctrl+Alt+O did not reach View > Outline: $last"
     Assert ($session -match 'recent') 'recent notes are not stored in the session'
     "(recent $recent)"
+}
+
+# --------------------------------------------------------------- batch 5 (AM-AW)
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class NodiMouse {
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll")] static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    /// Coordinates from the hooks are in Nodi's own DPI mode (a debug build
+    /// is DPI-unaware, a release build per-monitor aware); the cursor must
+    /// be placed in the same mode or it lands elsewhere on a scaled display.
+    public static IntPtr Target = IntPtr.Zero;
+    static IntPtr Match() {
+        return Target == IntPtr.Zero ? IntPtr.Zero
+            : SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(Target));
+    }
+    static void Restore(IntPtr previous) {
+        if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous);
+    }
+    /// Ctrl+<key> through the input queue, without waiting for the target
+    /// (a modal dialog may open in response).
+    public static void CtrlKey(byte vk) {
+        keybd_event(0x11, 0, 0, UIntPtr.Zero);
+        keybd_event(vk, 0, 0, UIntPtr.Zero);
+        keybd_event(vk, 0, 2, UIntPtr.Zero);
+        keybd_event(0x11, 0, 2, UIntPtr.Zero);
+    }
+    [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
+    const uint LEFTDOWN = 0x0002, LEFTUP = 0x0004;
+    public static void Click(int x, int y) {
+        IntPtr previous = Match();
+        SetCursorPos(x, y);
+        Restore(previous);
+        System.Threading.Thread.Sleep(80);
+        mouse_event(LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(40);
+        mouse_event(LEFTUP, 0, 0, 0, UIntPtr.Zero);
+    }
+    /// A real drag: press, move in small steps (the tree needs several
+    /// WM_MOUSEMOVEs to start and track a drag), release.
+    public static void Drag(int x1, int y1, int x2, int y2) {
+        IntPtr previous = Match();
+        SetCursorPos(x1, y1);
+        System.Threading.Thread.Sleep(80);
+        mouse_event(LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+        for (int step = 1; step <= 20; step++) {
+            SetCursorPos(x1 + (x2 - x1) * step / 20, y1 + (y2 - y1) * step / 20);
+            System.Threading.Thread.Sleep(25);
+        }
+        System.Threading.Thread.Sleep(150);
+        mouse_event(LEFTUP, 0, 0, 0, UIntPtr.Zero);
+        Restore(previous);
+    }
+}
+'@
+
+function Point-Of([string]$reply) {
+    $parts = $reply -split ' '
+    if ($parts.Count -lt 2) { throw "no point: '$reply'" }
+    return @([int]$parts[0], [int]$parts[1])
+}
+
+function Real-Keys($nodi) {
+    [NodiMouse]::Target = $nodi.Hwnd
+    if (-not [NodiHook]::Foreground($nodi.Hwnd)) { return $false }
+    Add-Type -AssemblyName System.Windows.Forms
+    Start-Sleep -Milliseconds 250
+    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    Start-Sleep -Milliseconds 100
+    return $true
+}
+
+Test-Case 'AM' 'pasted HTML cannot inject RTF through a link target' {
+    $data = New-DataDir 'AM'
+    $nodi = Start-Nodi $data
+    Set-ClipboardHtml '<p>A <a href="https://x.test/}}{\object\objemb{\objdata 01}}{">klik</a> B <a href="javascript:alert(1)">jahat</a></p>'
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null
+    $rtf = Invoke-Nodi $nodi 'rtf'
+    $text = Invoke-Nodi $nodi 'text'
+    Stop-Nodi $nodi
+    Assert (-not $rtf.Contains('\object')) "RTF was injected:`n$rtf"
+    Assert (([regex]::Matches($rtf, 'HYPERLINK')).Count -eq 1) "expected exactly one link:`n$rtf"
+    Assert ($text.Contains('klik') -and $text.Contains('jahat')) "text lost: $text"
+    ''
+}
+
+Test-Case 'AN' 'typing in a heading: no selection flashes, one undo step per edit' {
+    $data = New-DataDir 'AN'
+    $nodi = Start-Nodi $data
+    if (-not (Real-Keys $nodi)) { Stop-Nodi $nodi; return 'NOT TESTED: no foreground' }
+    [System.Windows.Forms.SendKeys]::SendWait('# Judul{ENTER}isi{UP}{END}')
+    Start-Sleep -Milliseconds 200
+    $selections = @()
+    foreach ($key in @('a', 'b', 'c')) {
+        [System.Windows.Forms.SendKeys]::SendWait($key)
+        Start-Sleep -Milliseconds 60
+        $selections += Invoke-Nodi $nodi 'sel'
+    }
+    $before = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
+    [System.Windows.Forms.SendKeys]::SendWait('^z')
+    Start-Sleep -Milliseconds 200
+    $after = (Invoke-Nodi $nodi 'text') -replace "`r", '|'
+    Stop-Nodi $nodi
+    foreach ($sel in $selections) {
+        $parts = $sel -split '[ ,-]' | Where-Object { $_ -ne '' }
+        Assert ($parts[0] -eq $parts[1]) "a selection was left behind while typing: $sel"
+    }
+    Assert ($before.Contains('Judulabc')) "typed text missing: $before"
+    Assert ($after -ne $before -and -not $after.Contains('Judulabc')) "Ctrl+Z did not undo the typing (only formatting?): $after"
+    "(sel $($selections -join ' / '))"
+}
+
+Test-Case 'AO' 'tabs: real clicks on x and +, Ctrl+T' {
+    $data = New-DataDir 'AO'
+    $nodi = Start-Nodi $data
+    if (-not (Real-Keys $nodi)) { Stop-Nodi $nodi; return 'NOT TESTED: no foreground' }
+    [System.Windows.Forms.SendKeys]::SendWait('^t')
+    Start-Sleep -Milliseconds 400
+    $afterCtrlT = Invoke-Nodi $nodi 'tabcount'
+    $plus = Point-Of (Invoke-Nodi $nodi 'tabbutton')
+    [NodiMouse]::Click($plus[0], $plus[1])
+    Start-Sleep -Milliseconds 500
+    $afterPlus = Invoke-Nodi $nodi 'tabcount'
+    $close = Point-Of (Invoke-Nodi $nodi 'tabbutton 1')
+    [NodiMouse]::Click($close[0], $close[1])
+    Start-Sleep -Milliseconds 500
+    $afterClose = Invoke-Nodi $nodi 'tabcount'
+    $notes = @((Read-Tree $data).nodes).Count
+    Stop-Nodi $nodi
+    Assert ($afterCtrlT -eq '2') "Ctrl+T: $afterCtrlT tabs"
+    Assert ($afterPlus -eq '3') "+ button: $afterPlus tabs"
+    Assert ($afterClose -eq '2') "x button: $afterClose tabs"
+    Assert ($notes -eq 3) "closing a tab must not delete its note ($notes notes)"
+    ''
+}
+
+Test-Case 'AP' 'a new note is titled by its first line until renamed' {
+    $data = New-DataDir 'AP'
+    $nodi = Start-Nodi $data
+    if (-not (Real-Keys $nodi)) { Stop-Nodi $nodi; return 'NOT TESTED: no foreground' }
+    [System.Windows.Forms.SendKeys]::SendWait('^t')
+    Start-Sleep -Milliseconds 400
+    [System.Windows.Forms.SendKeys]::SendWait('Rapat mingguan{ENTER}isi')
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    $tabs = Invoke-Nodi $nodi 'tabs'
+    $titles = Invoke-Nodi $nodi 'titles'
+    Invoke-Nodi $nodi 'rename-selected Tetap' | Out-Null
+    [System.Windows.Forms.SendKeys]::SendWait('^{HOME}Baru ')
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved after rename'
+    Start-Sleep -Milliseconds 300
+    $titles2 = Invoke-Nodi $nodi 'titles'
+    Stop-Nodi $nodi
+    Assert ($tabs -match 'Rapat mingguan') "tab title: $tabs"
+    Assert ($titles -match 'Rapat mingguan') "tree title: $titles"
+    Assert ($titles2 -match 'Tetap' -and $titles2 -notmatch 'Baru') "a manual title changed: $titles2"
+    ''
+}
+
+Test-Case 'AQ' 'Ctrl+Z in the Notes Explorer restores a trashed note (with confirmation)' {
+    $data = New-DataDir 'AQ'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'rename-selected Satu' | Out-Null
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Dua' | Out-Null
+    Invoke-Nodi $nodi 'cmd 172' | Out-Null            # child note
+    Invoke-Nodi $nodi 'rename-selected Anak' | Out-Null
+    Invoke-Nodi $nodi 'select-title Dua' | Out-Null
+    [NodiHook]::SendAsync($nodi.Hwnd, 'cmd 178') | Out-Null
+    Assert (Close-Dialog $nodi 6) 'no trash confirmation'
+    $nodes = Wait-Tree $data { param($n) @($n | Where-Object { $_.title -eq 'Dua' -and $_.trashed }).Count -eq 1 }
+    if (-not (Real-Keys $nodi)) { Stop-Nodi $nodi; return 'NOT TESTED: no foreground' }
+    # Click a note so the Notes Explorer has the focus, like a user would.
+    $satu = (Invoke-Nodi $nodi 'treerect Satu') -split ' ' | ForEach-Object { [int]$_ }
+    [NodiMouse]::Click($satu[0] + 60, [int](($satu[1] + $satu[3]) / 2))
+    Start-Sleep -Milliseconds 300
+    [NodiMouse]::CtrlKey(0x5A)                       # Ctrl+Z, not waiting for the dialog
+    $asked = Close-Dialog $nodi 6
+    $nodes = Wait-Tree $data { param($n) @($n | Where-Object { $_.title -eq 'Dua' -and -not $_.trashed }).Count -eq 1 }
+    Stop-Nodi $nodi
+    Assert $asked 'Ctrl+Z did not ask before undoing'
+    $dua = @($nodes | Where-Object title -eq 'Dua')[0]
+    $anak = @($nodes | Where-Object title -eq 'Anak')[0]
+    Assert (-not $dua.trashed) 'Dua is still in the Trash'
+    Assert (-not $anak.trashed -and $anak.parent -eq $dua.id) 'the sub-note did not come back with it'
+    Assert ((Root-Titles $nodes) -eq 'Satu,Dua') "order after undo: $(Root-Titles $nodes)"
+    ''
+}
+
+Test-Case 'AR' 'Ctrl+Up/Down scroll the view (toggle)' {
+    $data = New-DataDir 'AR'
+    $nodi = Start-Nodi $data
+    $lines = (1..80 | ForEach-Object { "baris $_" }) -join '\n'
+    Invoke-Nodi $nodi "type $lines" | Out-Null
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    if (-not (Real-Keys $nodi)) { Stop-Nodi $nodi; return 'NOT TESTED: no foreground' }
+    $caret = Invoke-Nodi $nodi 'caret'
+    [System.Windows.Forms.SendKeys]::SendWait('^{DOWN}^{DOWN}^{DOWN}')
+    Start-Sleep -Milliseconds 200
+    $first = Invoke-Nodi $nodi 'firstline'
+    $caret2 = Invoke-Nodi $nodi 'caret'
+    Invoke-Nodi $nodi 'cmd 143' | Out-Null            # toggle off
+    [System.Windows.Forms.SendKeys]::SendWait('^{DOWN}')
+    Start-Sleep -Milliseconds 200
+    $caret3 = Invoke-Nodi $nodi 'caret'
+    Stop-Nodi $nodi
+    $settings = Get-Content -Raw (Join-Path $data 'settings.json') | ConvertFrom-Json
+    Assert ($first -eq '3') "first visible line after 3x Ctrl+Down: $first"
+    Assert ($caret2 -eq $caret) "the caret moved: $caret -> $caret2"
+    Assert ($caret3 -ne $caret2) "with the option off Ctrl+Down should move the caret ($caret3)"
+    Assert ($settings.ctrl_arrow_scroll -eq $false) 'the option is not saved'
+    ''
+}
+
+Test-Case 'AS' 'pasted formulas become rendered formulas' {
+    $data = New-DataDir 'AS'
+    $nodi = Start-Nodi $data
+    $markdown = "Energi `$E = mc^2`$ dan:`n`n\[`n\frac{a}{b}`n\]`n`nRusak `$\nosuchcommand{x}`$ dan harga `$5."
+    Set-Clipboard -Value $markdown
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 4000) -ge 0) 'never Saved'
+    $pictures = Invoke-Nodi $nodi 'pictures'
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $out = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($pictures -eq '2') "expected 2 formula pictures, got $pictures"
+    Assert ($out.Contains('$E = mc^2$')) "formula 1 lost:`n$out"
+    Assert ($out.Contains('\frac{a}{b}')) "formula 2 lost:`n$out"
+    Assert ($out.Contains('nosuchcommand')) "unsupported LaTeX must stay as text:`n$out"
+    Assert ($out.Contains('$5')) "the price became a formula:`n$out"
+    ''
+}
+
+Test-Case 'AT' 'import a folder (md, txt, sub-folder) and export it back' {
+    $data = New-DataDir 'AT'
+    $source = Join-Path $data '..\AT-source' | ForEach-Object { [IO.Path]::GetFullPath($_) }
+    New-Item -ItemType Directory -Force (Join-Path $source 'Bab 1') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $source 'catatan.md'), "# Judul`n`n- satu`n- dua`n")
+    [IO.File]::WriteAllBytes((Join-Path $source 'lama.txt'), [byte[]](0x63,0x61,0x66,0xE9))   # "café" in ANSI
+    [IO.File]::WriteAllText((Join-Path $source 'Bab 1\isi.md'), "Isi **tebal**")
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi "import $source" | Out-Null
+    $nodes = Wait-Tree $data { param($n) @($n | Where-Object title -eq 'isi').Count -eq 1 }
+    $root = @($nodes | Where-Object { $_.title -like 'Imported *' })[0]
+    $folder = @($nodes | Where-Object title -eq 'AT-source')[0]
+    $bab = @($nodes | Where-Object title -eq 'Bab 1')[0]
+    $isi = @($nodes | Where-Object title -eq 'isi')[0]
+    Assert ($null -ne $root -and $folder.parent -eq $root.id) 'import folder structure wrong'
+    Assert ($isi.parent -eq $bab.id -and $bab.parent -eq $folder.id) 'sub-folder structure lost'
+    $dest = Join-Path $data '..\AT-export' | ForEach-Object { [IO.Path]::GetFullPath($_) }
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge -1) ''
+    Start-Sleep -Milliseconds 500
+    $count = Invoke-Nodi $nodi "export-folder AT-source|$dest"
+    Stop-Nodi $nodi
+    Assert ($count -eq '3') "export wrote $count notes"
+    $md = Get-Content -Raw (Join-Path $dest 'AT-source\catatan.md')
+    $txt = Get-Content -Raw -Encoding UTF8 (Join-Path $dest 'AT-source\lama.md')
+    $sub = Get-Content -Raw (Join-Path $dest 'AT-source\Bab 1\isi.md')
+    Assert ($md.Contains('# Judul') -and $md.Contains('- satu')) "markdown round trip:`n$md"
+    Assert ($txt.Contains('café')) "ANSI text not decoded:`n$txt"
+    Assert ($sub.Contains('**tebal**')) "sub-folder note:`n$sub"
+    Assert ((Get-Item (Join-Path $source 'lama.txt')).Length -eq 4) 'the original file was changed'
+    ''
+}
+
+Test-Case 'AU' 'AI mirror folder can be moved and never takes over a used folder' {
+    $data = New-DataDir 'AU'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'rename-selected Rapat' | Out-Null
+    Invoke-Nodi $nodi 'type agenda' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    $empty = [IO.Path]::GetFullPath((Join-Path $data '..\AU-ai'))
+    $used = [IO.Path]::GetFullPath((Join-Path $data '..\AU-used'))
+    New-Item -ItemType Directory -Force $used | Out-Null
+    [IO.File]::WriteAllText((Join-Path $used 'punyaku.md'), 'jangan dipindah')
+    $first = Invoke-Nodi $nodi "mirror-folder $empty"
+    $second = Invoke-Nodi $nodi "mirror-folder $used"
+    Start-Sleep -Milliseconds 1500
+    $back = Invoke-Nodi $nodi 'mirror-folder default'
+    Stop-Nodi $nodi
+    Assert ($first -eq $empty) "empty folder used as is: $first"
+    Assert ($second -eq (Join-Path $used 'Nodi AI')) "a used folder must get a 'Nodi AI' sub-folder: $second"
+    Assert ((Get-Content -Raw (Join-Path $used 'punyaku.md')) -eq 'jangan dipindah') 'a user file was touched'
+    Assert (Test-Path (Join-Path $used 'Nodi AI\Rapat.md')) 'the mirror was not rebuilt in the new folder'
+    Assert ($back -eq (Join-Path $data 'markdown')) "default folder: $back"
+    ''
+}
+
+Test-Case 'AV' 'tree drag & drop with the real mouse: above the first item, inside a folder' {
+    $data = New-DataDir 'AV'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'rename-selected Alpha' | Out-Null
+    foreach ($title in @('Beta', 'Gamma')) {
+        Invoke-Nodi $nodi 'cmd 170' | Out-Null
+        Invoke-Nodi $nodi "rename-selected $title" | Out-Null
+    }
+    Invoke-Nodi $nodi 'cmd 174' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Box' | Out-Null
+    Invoke-Nodi $nodi 'cancel-rename' | Out-Null
+    if (-not (Real-Keys $nodi)) { Stop-Nodi $nodi; return 'NOT TESTED: no foreground' }
+    # Gamma onto the top quarter of Alpha (far right of the row, not on the label).
+    $gamma = (Invoke-Nodi $nodi 'treerect Gamma') -split ' ' | ForEach-Object { [int]$_ }
+    $alpha = (Invoke-Nodi $nodi 'treerect Alpha') -split ' ' | ForEach-Object { [int]$_ }
+    [NodiMouse]::Drag($gamma[0] + 40, ($gamma[1] + $gamma[3]) / 2, $alpha[2] - 10, $alpha[1] + 2)
+    $nodes = Wait-Tree $data { param($n) (Root-Titles $n) -eq 'Gamma,Alpha,Beta,Box' }
+    $order1 = Root-Titles $nodes
+    # Beta into the middle of Box.
+    $beta = (Invoke-Nodi $nodi 'treerect Beta') -split ' ' | ForEach-Object { [int]$_ }
+    $box = (Invoke-Nodi $nodi 'treerect Box') -split ' ' | ForEach-Object { [int]$_ }
+    [NodiMouse]::Drag($beta[0] + 40, ($beta[1] + $beta[3]) / 2, $box[0] + 60, ($box[1] + $box[3]) / 2)
+    $nodes = Wait-Tree $data { param($n) @($n | Where-Object title -eq 'Beta')[0].parent -eq @($n | Where-Object title -eq 'Box')[0].id }
+    $boxId = @($nodes | Where-Object title -eq 'Box')[0].id
+    $inside = @($nodes | Where-Object title -eq 'Beta')[0].parent -eq $boxId
+    Stop-Nodi $nodi
+    Assert ($order1 -eq 'Gamma,Alpha,Beta,Box') "drop above the first item: $order1"
+    Assert $inside 'drop inside a folder did not move Beta into Box'
+    ''
+}
+
+Test-Case 'AW' 'status bar shows lines, words, chars and the selection' {
+    $data = New-DataDir 'AW'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'type satu dua\ntiga' | Out-Null
+    $note = Invoke-Nodi $nodi 'counts'
+    Invoke-Nodi $nodi 'select 0 8' | Out-Null
+    $sel = Invoke-Nodi $nodi 'counts'
+    Stop-Nodi $nodi
+    Assert ($note -eq 'Lines 2 · Words 3 · Chars 12') "note: $note"
+    Assert ($sel -match 'Sel: 1 lines, 2 words, 8 chars') "selection: $sel"
+    ''
 }
 
 # --------------------------------------------------------------------- report

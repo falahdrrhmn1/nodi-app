@@ -38,6 +38,8 @@ use crate::wnd::{clipboard, dialogs, editor, image, link, menu, status, table, t
 /// Custom message posted by the writer thread with a boxed [`SaveResult`].
 pub const WM_APP_SAVE_RESULT: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 
+/// Notes Explorer changes kept for Ctrl+Z.
+pub const TREE_UNDO_LIMIT: usize = 20;
 /// Debounce delay for the per-tab autosave timer.
 const DEBOUNCE_MS: u32 = 500;
 /// Retry delay while a save keeps failing.
@@ -157,6 +159,9 @@ pub struct App {
     pub recent: Vec<NoteId>,
     /// Tab whose context menu is open (right-click on the tab strip).
     pub tab_context: Option<usize>,
+    /// Notes Explorer changes Ctrl+Z (tree focused) can take back, newest
+    /// last; at most [`TREE_UNDO_LIMIT`], this session only.
+    pub tree_undo: Vec<nodi_core::TreeUndo>,
     /// Set once `WM_CREATE` finished: from then on the window procedure owns
     /// the boxed `App` and frees it in `WM_NCDESTROY`.
     pub created: bool,
@@ -223,6 +228,7 @@ impl App {
             status_text: vec![String::new(); 5],
             recent: Vec::new(),
             tab_context: None,
+            tree_undo: Vec::new(),
             created: false,
         }
     }
@@ -332,6 +338,10 @@ impl App {
         // Settings decide the palette before any note is streamed into an
         // editor, so the very first paint is already themed.
         self.settings = data.load_settings();
+        let chosen = self.settings.markdown_dir.trim();
+        if !chosen.is_empty() {
+            data.set_markdown_dir(Some(std::path::PathBuf::from(chosen)));
+        }
         self.palette = theme::Palette::from_settings(&self.settings);
         self.palette.install_display_colours();
 
@@ -394,6 +404,7 @@ impl App {
 
         if self.tree.is_empty() {
             let id = self.create_note_node(NodeKind::Note, "Untitled", None);
+            self.tree.set_auto_title(&id, true);
             self.tree_save();
             self.selected = Some(id.clone());
             self.expand(Some(id.clone()));
@@ -546,6 +557,117 @@ impl App {
         }
     }
 
+    /// Tools > AI Mirror Folder...: pick where the Markdown mirror goes.
+    pub fn choose_mirror_folder(&mut self) {
+        let Some(folder) = dialogs::open_folder(self.hwnd) else {
+            return;
+        };
+        if let Err(message) = self.set_mirror_folder(Some(folder)) {
+            dialogs::error(self.hwnd, &message);
+        }
+    }
+
+    /// Moves the mirror (`None` = `data\markdown`) and rebuilds it there. The
+    /// old folder is left as it is. Only local drives are accepted.
+    pub fn set_mirror_folder(&mut self, folder: Option<String>) -> Result<(), String> {
+        let Some(data) = self.data.clone() else {
+            return Err("No data directory".to_owned());
+        };
+        let mut folder = folder.map(|folder| folder.trim().trim_end_matches('\\').to_owned());
+        if let Some(chosen) = folder.as_mut() {
+            let bytes = chosen.as_bytes();
+            let drive =
+                bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":\\";
+            if !drive || crate::wnd::link::drive_is_remote(chosen) {
+                return Err(format!(
+                    "The AI mirror folder must be a folder on a local drive \
+                     (like E:\\catatan-ai):\n{chosen}"
+                ));
+            }
+            // The mirror moves Markdown files it does not own into `.trash`,
+            // so it never takes over a folder that already holds other files:
+            // it uses a "Nodi AI" folder inside it instead.
+            let path = std::path::Path::new(chosen.as_str());
+            let used = std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some());
+            if used && !path.join("index.json").is_file() {
+                *chosen = path.join("Nodi AI").to_string_lossy().into_owned();
+            }
+            std::fs::create_dir_all(chosen.as_str()).map_err(|err| format!("{chosen}: {err}"))?;
+        }
+        data.set_markdown_dir(folder.as_ref().map(std::path::PathBuf::from));
+        self.settings.markdown_dir = folder.unwrap_or_default();
+        self.save_settings();
+        if self.settings.markdown_mirror {
+            self.rebuild_mirror();
+        }
+        let shown = data.markdown_dir().to_string_lossy().into_owned();
+        status::set_message(self, &format!("AI mirror folder: {shown}"));
+        Ok(())
+    }
+
+    /// The folder AI agents should read.
+    pub fn ai_folder(&self) -> Option<std::path::PathBuf> {
+        self.data.as_ref().map(DataDir::markdown_dir)
+    }
+
+    /// Tools > Copy AI Folder Path.
+    pub fn copy_ai_folder_path(&mut self) {
+        let Some(folder) = self.ai_folder() else {
+            return;
+        };
+        let text = folder.to_string_lossy().into_owned();
+        if crate::wnd::clipboard::set_text(self.hwnd, &text) {
+            status::set_message(self, &format!("Copied: {text}"));
+        }
+    }
+
+    /// Tools > Open AI Folder.
+    pub fn open_ai_folder(&mut self) {
+        let Some(folder) = self.ai_folder() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&folder);
+        let path = win::wide(&folder.to_string_lossy());
+        let verb = win::wide("explore");
+        // SAFETY: all pointers are NUL terminated and outlive the call.
+        unsafe {
+            ShellExecuteW(
+                self.hwnd,
+                verb.as_ptr(),
+                path.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                SW_SHOWNORMAL,
+            );
+        }
+    }
+
+    /// Help > Using Nodi with AI Agents.
+    pub fn explain_ai_mirror(&mut self) {
+        let folder = self
+            .ai_folder()
+            .map(|folder| folder.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let state = if self.settings.markdown_mirror {
+            "on"
+        } else {
+            "OFF (Tools > Keep Markdown Mirror for AI Agents)"
+        };
+        dialogs::info(
+            self.hwnd,
+            &format!(
+                "Nodi keeps every note as a Markdown file for AI agents (mirror {state}):\n\n\
+                 {folder}\n\n\
+                 Point the agent at this folder and let it start with INDEX.md \
+                 (index.json is the machine-readable list). The files are \
+                 regenerated after each save; changes made there are not read \
+                 back into Nodi.\n\n\
+                 Tools > AI Mirror Folder... moves it (e.g. to E:\\catatan-ai); \
+                 Tools > Copy AI Folder Path copies the path."
+            ),
+        );
+    }
+
     // ------------------------------------------------------------------- tabs
 
     /// Opens (or re-uses) the tab for a note.
@@ -661,7 +783,7 @@ impl App {
         status::set_save_state(self, "");
         status::set_message(self, "Restored from backup");
         status::clear_caret(self);
-        status::set_counts(self, 0, 0, false);
+        status::update_counts(self);
         crate::wnd::layout(self);
     }
 
@@ -837,7 +959,7 @@ impl App {
             status::set_save_state(self, "");
             status::set_message(self, "No note open");
             status::clear_caret(self);
-            status::set_counts(self, 0, 0, false);
+            status::update_counts(self);
             sync_window_title(self);
             tree::focus_tree(self);
         } else {
@@ -976,6 +1098,13 @@ impl App {
         let txt = editor::plain_text(editor);
         let seq = self.tabs[index].seq + 1;
         let note = self.tabs[index].note.clone();
+        // A note that was never renamed by hand is titled by its first line;
+        // checking at save time keeps it off the keystroke path.
+        if let Some(title) = self.tree.follow_text(&note, &txt) {
+            self.tree_save();
+            tree::set_item_text(self, &note, &title);
+            self.tabs[index].title = title;
+        }
         self.tabs[index].seq = seq;
         self.tabs[index].dirty = false;
 
@@ -1072,6 +1201,14 @@ impl App {
     pub fn on_timer(&mut self, id: usize) {
         if id == SESSION_TIMER {
             self.write_session();
+            return;
+        }
+        if id == status::COUNTS_TIMER {
+            // SAFETY: one-shot use of our own timer.
+            unsafe {
+                KillTimer(self.hwnd, status::COUNTS_TIMER);
+            }
+            status::update_counts(self);
             return;
         }
         if id == RETRY_TIMER {
@@ -1279,6 +1416,10 @@ impl App {
             NodeKind::Folder => "New Folder",
         };
         let id = self.create_note_node(kind, title, parent.clone());
+        if kind == NodeKind::Note {
+            // Titled by its first line until the user renames it.
+            self.tree.set_auto_title(&id, true);
+        }
         self.tree_save();
         self.selected = Some(id.clone());
         // Insert just the new item; rebuilding the whole tree made every new
@@ -1334,10 +1475,11 @@ impl App {
                 self.close_tab(index);
             }
         }
-        if self.tree.trash(&id) {
+        if let Some(change) = self.tree.trash_undoable(&id) {
+            self.remember_tree_change(change);
             self.tree_save();
             self.rebuild_tree();
-            status::set_message(self, "Moved to Trash");
+            status::set_message(self, "Moved to Trash (Ctrl+Z in the tree undoes it)");
             self.save_session_now();
         }
     }
@@ -1418,8 +1560,15 @@ impl App {
         if title.is_empty() {
             return;
         }
+        let change = self.tree.rename_undo(&id, &title);
         if !self.tree.rename(&id, title.clone()) {
             return;
+        }
+        if let Some(change) = change.filter(|change| match change {
+            nodi_core::TreeUndo::Rename { title: old, .. } => *old != title,
+            _ => true,
+        }) {
+            self.remember_tree_change(change);
         }
         self.tree_save();
         tree::set_item_text(self, &id, &title);
@@ -1443,12 +1592,21 @@ impl App {
     }
 
     /// Moves a node before / after `target`, or inside it (last child).
-    pub fn move_node_relative(&mut self, source: NoteId, target: NoteId, position: Position) {
+    pub fn move_node_relative(
+        &mut self,
+        source: NoteId,
+        target: NoteId,
+        position: Position,
+    ) -> Result<(), String> {
         if source == target {
-            return;
+            return Ok(());
         }
+        let change = self.tree.move_undo(&source);
         match self.tree.move_relative(&source, &target, position) {
             Ok(()) => {
+                if let Some(change) = change {
+                    self.remember_tree_change(change);
+                }
                 self.tree_save();
                 if position == Position::Inside {
                     self.expand(Some(target));
@@ -1460,9 +1618,11 @@ impl App {
                     Position::Inside => "Moved",
                 };
                 status::set_message(self, message);
+                Ok(())
             }
             Err(err) => {
                 status::set_message(self, &format!("Move rejected: {err}"));
+                Err(err.to_string())
             }
         }
     }
@@ -1495,7 +1655,8 @@ impl App {
             None => self.move_selected_to_root(),
             Some(parent) => {
                 self.context_note = Some(id.clone());
-                self.move_node_relative(id, parent, Position::Inside);
+                // A refused move is reported in the status bar.
+                let _ = self.move_node_relative(id, parent, Position::Inside);
             }
         }
     }
@@ -1603,6 +1764,26 @@ impl App {
                 "Spell check on"
             } else {
                 "Spell check off"
+            },
+        );
+    }
+
+    /// View > Ctrl+Up/Down Scrolls the View.
+    pub fn toggle_ctrl_arrow_scroll(&mut self) {
+        self.settings.ctrl_arrow_scroll = !self.settings.ctrl_arrow_scroll;
+        crate::wnd::editkeys::set_ctrl_arrow_scroll(self.settings.ctrl_arrow_scroll);
+        self.save_settings();
+        menu::set_checked(
+            self,
+            menu::IDM_VIEW_CTRL_SCROLL,
+            self.settings.ctrl_arrow_scroll,
+        );
+        status::set_message(
+            self,
+            if self.settings.ctrl_arrow_scroll {
+                "Ctrl+Up/Down scroll the view"
+            } else {
+                "Ctrl+Up/Down move by paragraph"
             },
         );
     }
@@ -2024,7 +2205,7 @@ pub fn on_editor_change(app: &mut App, editor: HWND) {
     }
     app.mark_dirty(editor);
     status::update_caret(app);
-    status::update_counts(app);
+    status::schedule_counts(app);
     crate::wnd::format::maintain_heading(editor);
     crate::wnd::format::update_heading_marker(editor);
 }
@@ -2121,12 +2302,75 @@ pub fn open_selected(app: &mut App) {
 }
 
 impl App {
+    /// Records a Notes Explorer change for Ctrl+Z (tree focused).
+    pub fn remember_tree_change(&mut self, change: nodi_core::TreeUndo) {
+        self.tree_undo.push(change);
+        if self.tree_undo.len() > TREE_UNDO_LIMIT {
+            self.tree_undo.remove(0);
+        }
+    }
+
+    /// True while the Notes Explorer has the keyboard focus.
+    pub fn tree_has_focus(&self) -> bool {
+        // SAFETY: plain focus query.
+        let focus = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+        !self.tree_view.is_null() && focus == self.tree_view
+    }
+
+    /// Ctrl+Z in the Notes Explorer: asks, then takes back the newest change
+    /// (restore from the Trash, move back, rename back).
+    pub fn undo_tree_change(&mut self) {
+        let Some(change) = self.tree_undo.last().cloned() else {
+            status::set_message(self, "Nothing to undo in the Notes Explorer");
+            return;
+        };
+        let question = change.question(&self.tree);
+        if !dialogs::ask_yes_no(self.hwnd, &question) {
+            return;
+        }
+        self.tree_undo.pop();
+        match self.tree.undo(&change) {
+            Ok(()) => {
+                self.tree_save();
+                self.selected = match &change {
+                    nodi_core::TreeUndo::Rename { id, .. }
+                    | nodi_core::TreeUndo::Move { id, .. } => Some(id.clone()),
+                    nodi_core::TreeUndo::Trash { ids, .. } => ids.first().cloned(),
+                };
+                self.rebuild_tree();
+                self.refresh_titles();
+                status::set_message(self, "Undone");
+            }
+            Err(err) => status::set_message(self, &format!("Undo failed: {err}")),
+        }
+    }
+
+    /// Tab captions after titles changed outside a rename (undo).
+    fn refresh_titles(&mut self) {
+        for index in 0..self.tabs.len() {
+            let title = self
+                .tree
+                .get(&self.tabs[index].note)
+                .map(|node| node.title.clone());
+            if let Some(title) = title {
+                if self.tabs[index].title != title {
+                    self.tabs[index].title = title;
+                    self.refresh_tab_ui(index);
+                }
+            }
+        }
+    }
+
     /// Notes > Move Up / Move Down (Alt+Up / Alt+Down).
     pub fn move_selected(&mut self, delta: i32) {
         let Some(id) = self.context_note.clone().or_else(|| self.selected.clone()) else {
             return;
         };
+        let change = self.tree.move_undo(&id);
         if self.tree.move_among_siblings(&id, delta) {
+            if let Some(change) = change {
+                self.remember_tree_change(change);
+            }
             self.tree_save();
             self.selected = Some(id);
             self.rebuild_tree();
@@ -2138,7 +2382,11 @@ impl App {
         let Some(id) = self.context_note.clone().or_else(|| self.selected.clone()) else {
             return;
         };
+        let change = self.tree.move_undo(&id);
         if self.tree.move_node(&id, None, usize::MAX).is_ok() {
+            if let Some(change) = change {
+                self.remember_tree_change(change);
+            }
             self.tree_save();
             self.selected = Some(id);
             self.rebuild_tree();
@@ -2320,7 +2568,7 @@ fn lossy_note(lossy: &[String]) -> String {
 }
 
 /// Characters Windows does not allow in file names.
-fn safe_file_name(title: &str) -> String {
+pub fn safe_file_name(title: &str) -> String {
     let cleaned: String = title
         .chars()
         .map(|ch| {
@@ -2366,11 +2614,17 @@ pub fn export_markdown(app: &mut App) {
     else {
         return;
     };
-    let path = std::path::PathBuf::from(path);
+    export_markdown_to(app, std::path::Path::new(&path));
+}
+
+/// Writes the active note as Markdown to `path` (pictures in a
+/// `<name>_files` folder next to it) and reports what Markdown cannot keep.
+pub fn export_markdown_to(app: &mut App, path: &std::path::Path) {
+    let path = path.to_path_buf();
     let stem = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or(name);
+        .unwrap_or_else(|| "note".to_owned());
     let folder = path.parent().unwrap_or(std::path::Path::new("."));
     let mut asset_dir = format!("{stem}_files");
     let mut attempt = 2;

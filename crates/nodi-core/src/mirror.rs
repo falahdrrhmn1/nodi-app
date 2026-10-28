@@ -54,13 +54,40 @@ pub fn rebuild(data: &DataDir, tree: &Tree) -> io::Result<Report> {
     let mut report = Report::default();
     for (id, planned) in &ordered {
         let rtf = data.load_note(id);
-        write_note_file(data, tree, id, planned, rtf.as_deref())?;
+        write_note_file(&data.markdown_dir(), tree, id, planned, rtf.as_deref())?;
         report.notes += 1;
     }
     report.index = write_index(data, tree, &ordered)?;
     report.json = write_index_json(data, tree, &ordered)?;
     report.moved_to_trash = move_stale_to_trash(data, &ordered)?;
     Ok(report)
+}
+
+/// Exports the note or folder `root` and everything below it to `dest` as
+/// Markdown files (front matter, pictures in `<title>_files`), in the same
+/// layout as the mirror. Nothing else in `dest` is touched; existing files
+/// with the same names are overwritten. Returns the number of notes written.
+pub fn export(data: &DataDir, tree: &Tree, root: &NoteId, dest: &Path) -> io::Result<usize> {
+    let mut sub = tree.clone();
+    sub.move_node(root, None, 0)
+        .map_err(|err| io::Error::new(io::ErrorKind::NotFound, format!("{err:?}")))?;
+    let others: Vec<NoteId> = sub
+        .children(None)
+        .iter()
+        .filter(|node| node.id != *root)
+        .map(|node| node.id.clone())
+        .collect();
+    for id in others {
+        sub.trash(&id);
+    }
+    std::fs::create_dir_all(dest)?;
+    let mut written = 0;
+    for (id, planned) in plan_ordered(&sub) {
+        let rtf = data.load_note(&id);
+        write_note_file(dest, &sub, &id, &planned, rtf.as_deref())?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 /// Where each visible note's mirror file was written by the last sync.
@@ -87,7 +114,7 @@ pub fn sync(
                 || (trust_existing && newer_than(&file, &data.note_path(id))));
         if !up_to_date {
             let rtf = data.load_note(id);
-            write_note_file(data, tree, id, planned, rtf.as_deref())?;
+            write_note_file(&data.markdown_dir(), tree, id, planned, rtf.as_deref())?;
         }
     }
     write_index(data, tree, &ordered)?;
@@ -135,7 +162,7 @@ pub fn write_many(data: &DataDir, tree: &Tree, notes: &[(&NoteId, &[u8])]) -> io
     let ordered = plan_ordered(tree);
     for (id, rtf) in notes {
         if let Some((_, planned)) = ordered.iter().find(|(note, _)| note == *id) {
-            write_note_file(data, tree, id, planned, Some(rtf))?;
+            write_note_file(&data.markdown_dir(), tree, id, planned, Some(rtf))?;
         }
     }
     write_index(data, tree, &ordered)?;
@@ -379,7 +406,7 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<bool> {
 }
 
 fn write_note_file(
-    data: &DataDir,
+    root: &Path,
     tree: &Tree,
     id: &NoteId,
     planned: &Planned,
@@ -400,7 +427,7 @@ fn write_note_file(
         },
     };
 
-    let mut path = data.markdown_dir();
+    let mut path = root.to_path_buf();
     for dir in &planned.dirs {
         path.push(dir);
     }

@@ -873,6 +873,57 @@ pub fn save_file(
     Some(String::from_utf16_lossy(&buffer[..length]))
 }
 
+/// "Save As" with several file types, as `(label, extension)`. The chosen
+/// type's extension is added when the name has none.
+pub fn save_file_typed(owner: HWND, default_name: &str, types: &[(&str, &str)]) -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetSaveFileNameW, OFN_EXPLORER, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+        OPENFILENAMEW,
+    };
+    let mut filter = String::new();
+    for (label, extension) in types {
+        filter.push_str(&format!("{label}\0*.{extension}\0"));
+    }
+    filter.push('\0');
+    let filter: Vec<u16> = filter.encode_utf16().collect();
+    let mut buffer = vec![0u16; 4096];
+    for (slot, unit) in buffer
+        .iter_mut()
+        .zip(default_name.encode_utf16().take(4000))
+    {
+        *slot = unit;
+    }
+    let default_extension = win::wide(types.first().map_or("", |(_, ext)| ext));
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.nFilterIndex = 1;
+    dialog.lpstrFile = buffer.as_mut_ptr();
+    dialog.nMaxFile = buffer.len() as u32;
+    dialog.lpstrDefExt = default_extension.as_ptr();
+    dialog.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    // SAFETY: the pointers refer to buffers that outlive the call.
+    if unsafe { GetSaveFileNameW(&mut dialog) } == 0 {
+        return None;
+    }
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    let mut path = String::from_utf16_lossy(&buffer[..length]);
+    let chosen = types
+        .get((dialog.nFilterIndex as usize).saturating_sub(1))
+        .map(|(_, ext)| *ext);
+    if let Some(extension) = chosen {
+        let has_known = types
+            .iter()
+            .any(|(_, ext)| path.to_ascii_lowercase().ends_with(&format!(".{ext}")));
+        if !has_known {
+            path.push('.');
+            path.push_str(extension);
+        }
+    }
+    Some(path)
+}
+
 /// Standard "Open" dialog for any file; returns its full path.
 pub fn open_any_file(owner: HWND) -> Option<String> {
     use windows_sys::Win32::UI::Controls::Dialogs::{
@@ -893,6 +944,45 @@ pub fn open_any_file(owner: HWND) -> Option<String> {
     }
     let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
     Some(String::from_utf16_lossy(&buffer[..length]))
+}
+
+/// File > Import Files...: multi-select Open dialog for notes to import.
+pub fn open_note_files(owner: HWND) -> Vec<std::path::PathBuf> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+        OPENFILENAMEW,
+    };
+    let filter: Vec<u16> =
+        "Notes (*.md, *.markdown, *.txt, *.rtf)\0*.md;*.markdown;*.txt;*.rtf\0All files (*.*)\0*.*\0\0"
+            .encode_utf16()
+            .collect();
+    let mut buffer = vec![0u16; 65536];
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrFile = buffer.as_mut_ptr();
+    dialog.nMaxFile = buffer.len() as u32;
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_ALLOWMULTISELECT;
+    // SAFETY: the pointers refer to buffers that outlive the call.
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+        return Vec::new();
+    }
+    // One file: its full path. Several: the folder, then the names, each
+    // NUL terminated, ending with an empty string.
+    let parts: Vec<String> = buffer
+        .split(|unit| *unit == 0)
+        .take_while(|part| !part.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect();
+    match parts.as_slice() {
+        [] => Vec::new(),
+        [single] => vec![std::path::PathBuf::from(single)],
+        [folder, names @ ..] => names
+            .iter()
+            .map(|name| std::path::Path::new(folder).join(name))
+            .collect(),
+    }
 }
 
 /// Folder picker for the Link dialog; returns the full folder path.

@@ -107,3 +107,28 @@ fn trashed_notes_leave_the_mirror() {
     assert!(!data.markdown_dir().join("Buang.md").exists());
     assert!(!read(&data, "index.json").contains(&note.to_string()));
 }
+
+#[test]
+fn export_writes_only_the_subtree_and_leaves_other_files() {
+    let (tmp, data) = fresh("mirror-export");
+    let mut tree = Tree::new();
+    let folder = tree.new_node(NodeKind::Folder, "Kuliah", None);
+    let note = tree.new_node(NodeKind::Note, "Bab 1", Some(folder.clone()));
+    let other = tree.new_node(NodeKind::Note, "Lain", None);
+    data.save_note(&note, RTF, "Isi catatan").expect("save");
+    data.save_note(&other, RTF, "Isi catatan").expect("save");
+    let dest = tmp.path().join("export");
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("punyaku.md"), "jangan disentuh").unwrap();
+
+    let written = mirror::export(&data, &tree, &folder, &dest).expect("export");
+    assert_eq!(written, 1);
+    let body = fs::read_to_string(dest.join("Kuliah").join("Bab 1.md")).unwrap();
+    assert!(body.contains("Isi catatan"), "{body}");
+    assert!(!dest.join("Lain.md").exists());
+    assert_eq!(
+        fs::read_to_string(dest.join("punyaku.md")).unwrap(),
+        "jangan disentuh"
+    );
+    assert!(!dest.join("INDEX.md").exists());
+}

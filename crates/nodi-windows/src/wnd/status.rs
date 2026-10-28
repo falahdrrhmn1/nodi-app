@@ -113,47 +113,79 @@ pub fn update_caret(app: &mut App) {
     set(app, PART_CARET, &text);
 }
 
-/// Word and character count for the status bar (`selection` or whole note).
-pub fn set_counts(app: &mut App, words: usize, chars: usize, selection: bool) {
-    let suffix = if selection { " (sel)" } else { "" };
-    set(
-        app,
-        PART_COUNTS,
-        &format!("{words} words · {chars} chars{suffix}"),
-    );
+/// Timer id of the debounced count update.
+pub const COUNTS_TIMER: usize = usize::MAX - 3;
+/// Counting walks the whole note, so it waits until typing pauses briefly.
+const COUNTS_DELAY_MS: u32 = 120;
+
+/// Counts for the status bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub lines: usize,
+    pub words: usize,
+    pub chars: usize,
 }
 
-/// Recomputes part 4 from the active editor: whole note, or the selection.
+/// Restarts the count timer (EN_CHANGE / EN_SELCHANGE).
+pub fn schedule_counts(app: &App) {
+    // SAFETY: (re)starting a timer on our own window.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetTimer(
+            app.hwnd,
+            COUNTS_TIMER,
+            COUNTS_DELAY_MS,
+            None,
+        );
+    }
+}
+
+/// Status text: `Lines N · Words N · Chars N`, plus the selection's counts.
+pub fn counts_text(note: Counts, selection: Option<Counts>) -> String {
+    let mut text = format!(
+        "Lines {} · Words {} · Chars {}",
+        note.lines, note.words, note.chars
+    );
+    if let Some(sel) = selection {
+        text.push_str(&format!(
+            " | Sel: {} lines, {} words, {} chars",
+            sel.lines, sel.words, sel.chars
+        ));
+    }
+    text
+}
+
+/// Recomputes the counts part from the active editor: the whole note, and
+/// the selection when there is one.
 pub fn update_counts(app: &mut App) {
     let Some(window) = app.active_editor() else {
-        set_counts(app, 0, 0, false);
+        set(app, PART_COUNTS, "");
         return;
     };
     let (from, to) = editor::selection(window);
-    let selection = from != to;
-    let text = if selection {
-        editor::text_range(window, from, to)
-    } else {
-        editor::plain_text(window)
-    };
-    let (words, chars) = count_text(&text);
-    set_counts(app, words, chars, selection);
+    let note = count_text(&editor::plain_text(window));
+    let selection = (from != to).then(|| count_text(&editor::text_range(window, from, to)));
+    set(app, PART_COUNTS, &counts_text(note, selection));
 }
 
-/// Words and characters in `text`, ignoring line breaks and the hidden
-/// Markdown markers (`# `, `## ` …) that headings keep in the buffer.
-fn count_text(text: &str) -> (usize, usize) {
-    let mut words = 0;
-    let mut chars = 0;
-    for line in text.split('\r') {
+/// Lines (paragraphs), words and characters in `text`, ignoring line breaks
+/// and the hidden Markdown markers (`# `, `## ` …) that headings keep in the
+/// buffer. An empty text has 0 lines; a trailing break adds no line.
+pub fn count_text(text: &str) -> Counts {
+    let mut counts = Counts::default();
+    let trimmed = text.strip_suffix('\r').unwrap_or(text);
+    if trimmed.is_empty() {
+        return counts;
+    }
+    for line in trimmed.split(['\r', '\u{000B}']) {
+        counts.lines += 1;
         let visible = visible_line(line);
-        words += visible.split_whitespace().count();
-        chars += visible
+        counts.words += visible.split_whitespace().count();
+        counts.chars += visible
             .chars()
-            .filter(|ch| !matches!(ch, '\r' | '\n'))
+            .filter(|ch| !matches!(ch, '\r' | '\n' | '\u{FFFC}'))
             .count();
     }
-    (words, chars)
+    counts
 }
 
 /// A line without a leading heading marker (`### `).
@@ -224,7 +256,7 @@ pub fn layout_parts(app: &App, width: i32) {
     // Parts: message | save state | Ln/Col | counts | mode. The counts part
     // holds the word/character counts plus the selection counts.
     let mode = app.scale(90);
-    let counts = app.scale(300);
+    let counts = app.scale(380);
     let caret = app.scale(110);
     let save = app.scale(100);
     let min_width = app.scale(40);
@@ -250,5 +282,51 @@ pub fn layout_parts(app: &App, width: i32) {
     // SAFETY: `edges` is a 5-element i32 array as `SB_SETPARTS` expects.
     unsafe {
         SendMessageW(app.status, SB_SETPARTS, PART_COUNT, edges.as_ptr() as isize);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_lines_words_and_chars() {
+        let counts = count_text("## Judul\rsatu dua\r\rtiga\r");
+        assert_eq!(
+            counts,
+            Counts {
+                lines: 4,
+                words: 4,
+                chars: 17
+            }
+        );
+        assert_eq!(count_text(""), Counts::default());
+        assert_eq!(
+            count_text("a\u{FFFC}b"),
+            Counts {
+                lines: 1,
+                words: 1,
+                chars: 2
+            }
+        );
+    }
+
+    #[test]
+    fn status_text_lists_the_selection_too() {
+        let note = Counts {
+            lines: 3,
+            words: 5,
+            chars: 20,
+        };
+        let sel = Counts {
+            lines: 1,
+            words: 2,
+            chars: 8,
+        };
+        assert_eq!(counts_text(note, None), "Lines 3 · Words 5 · Chars 20");
+        assert_eq!(
+            counts_text(note, Some(sel)),
+            "Lines 3 · Words 5 · Chars 20 | Sel: 1 lines, 2 words, 8 chars"
+        );
     }
 }

@@ -10,6 +10,7 @@ pub mod form;
 pub mod format;
 pub mod formula;
 pub mod image;
+pub mod import;
 pub mod link;
 pub mod menu;
 pub mod outline;
@@ -558,6 +559,9 @@ pub unsafe extern "system" fn wndproc(
             Some(app) => {
                 if create_ui(app) {
                     app.created = true;
+                    // Files dragged from Explorer: import (or pictures into
+                    // the note).
+                    windows_sys::Win32::UI::Shell::DragAcceptFiles(hwnd, 1);
                     0
                 } else {
                     -1
@@ -647,6 +651,25 @@ pub unsafe extern "system" fn wndproc(
             0
         }
 
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_DROPFILES => {
+            if let Some(app) = app_mut(hwnd) {
+                import::on_drop(app, wparam as windows_sys::Win32::UI::Shell::HDROP);
+            }
+            0
+        }
+
+        import::WM_APP_IMPORT_DONE => {
+            let raw = lparam as *mut import::Converted;
+            if !raw.is_null() {
+                // SAFETY: the import worker boxed this result for us.
+                let converted = *Box::from_raw(raw);
+                if let Some(app) = app_mut(hwnd) {
+                    import::finish(app, converted);
+                }
+            }
+            0
+        }
+
         app::WM_APP_SAVE_RESULT => {
             let raw = lparam as *mut SaveResult;
             if !raw.is_null() {
@@ -729,7 +752,7 @@ pub unsafe extern "system" fn wndproc(
                 {
                     crate::wnd::format::update_heading_marker(header.hwndFrom);
                     status::update_caret(app);
-                    status::update_counts(app);
+                    status::schedule_counts(app);
                     toolbar::sync_format(app);
                 } else if header.code == link::EN_LINK && app.tab_index(header.hwndFrom).is_some() {
                     // SAFETY: Rich Edit sends an ENLINK for EN_LINK.

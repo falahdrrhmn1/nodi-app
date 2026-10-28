@@ -441,7 +441,7 @@ fn local_action(path: &str, is_dir: bool) -> LocalAction {
 
 /// True unless the path's drive is a local disk, removable drive, CD or RAM
 /// disk (mapped network drives and unknown roots count as remote).
-fn drive_is_remote(path: &str) -> bool {
+pub(crate) fn drive_is_remote(path: &str) -> bool {
     const DRIVE_REMOVABLE: u32 = 2;
     const DRIVE_FIXED: u32 = 3;
     const DRIVE_CDROM: u32 = 5;

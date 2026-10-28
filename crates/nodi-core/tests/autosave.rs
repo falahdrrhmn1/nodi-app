@@ -185,3 +185,35 @@ fn empty_flush_is_acknowledged() {
     let writer = Writer::spawn(data, notify);
     assert!(writer.flush_blocking(Duration::from_secs(5)));
 }
+
+#[test]
+fn a_failed_tree_write_is_retried_without_a_new_submission() {
+    let (_tmp, data) = fresh("autosave-tree-retry");
+    let (results, notify) = sink();
+    let writer = Writer::spawn(data.clone(), notify);
+    let mut tree = Tree::new();
+    tree.new_node(NodeKind::Note, "Tetap", None);
+
+    data.set_fail_writes(true);
+    assert!(writer.submit(Job::TreeSave(tree.to_json().unwrap())));
+    assert!(writer.flush_blocking(Duration::from_secs(10)));
+    assert!(results
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|result| result.target == Target::Tree && result.result.is_err()));
+    assert!(!data.tree_path().exists());
+
+    // The fault clears (e.g. a scanner closed the file): the writer retries
+    // the same tree by itself.
+    data.set_fail_writes(false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !data.tree_path().exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let saved = data.load_tree().expect("tree");
+    assert_eq!(
+        saved.iter().next().map(|node| node.title.as_str()),
+        Some("Tetap")
+    );
+}

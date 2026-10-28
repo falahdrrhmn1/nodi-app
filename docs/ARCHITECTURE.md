@@ -86,7 +86,12 @@ At startup a mirror file newer than its note is trusted as it is.
 4. The result is posted back; the tab shows `Saved` only when that exact save
    succeeded. Failure → `Save Failed`, one message box per failure streak,
    text stays in the editor, retry every 5 s.
-5. Closing flushes everything and waits for the writer; unsaved notes prompt
+5. Replacing a file retries for about a second while another program
+   holds it open (scanners, sync clients, readers); a `tree.json` /
+   `session.json` write that still fails stays queued and is retried every
+   second instead of waiting for the next change. Found by the save torture
+   test: a reader polling `tree.json` made a move vanish from disk.
+6. Closing flushes everything and waits for the writer; unsaved notes prompt
    "Close anyway?". The session file and new-note files also go through the
    writer, so the UI thread never waits for the disk.
 

@@ -5,18 +5,24 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    DrawTextW, InvalidateRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
-    DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, HGDIOBJ, TRANSPARENT,
+    DrawTextW, GetDC, InvalidateRect, ReleaseDC, ScreenToClient, SelectObject, SetBkMode,
+    SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HGDIOBJ,
+    TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, TCHITTESTINFO, TCIF_TEXT, TCITEMW, TCM_ADJUSTRECT, TCM_DELETEITEM,
-    TCM_GETCURSEL, TCM_GETITEMW, TCM_HITTEST, TCM_INSERTITEMW, TCM_SETCURSEL, TCM_SETITEMW,
-    TCS_FOCUSNEVER, TCS_HOTTRACK, TCS_OWNERDRAWFIXED, TCS_TOOLTIPS, WC_TABCONTROLW,
+    TCM_GETCURSEL, TCM_GETITEMRECT, TCM_GETITEMW, TCM_HITTEST, TCM_INSERTITEMW, TCM_SETCURSEL,
+    TCM_SETITEMW, TCM_SETPADDING, TCS_FOCUSNEVER, TCS_HOTTRACK, TCS_OWNERDRAWFIXED, TCS_TOOLTIPS,
+    WC_TABCONTROLW,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, PostMessageW, SendMessageW, TrackPopupMenu, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_COMMAND, WM_ERASEBKGND, WM_MBUTTONDOWN, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, PostMessageW, SendMessageW, TrackPopupMenu, HTCLIENT, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::app::App;
@@ -26,6 +32,9 @@ use crate::wnd::theme;
 
 /// Subclass id for the tab strip's background painting.
 const SUBCLASS_ID: usize = 0x5441_4253; // 'TABS'
+
+/// `WM_MOUSELEAVE` (sent after `TrackMouseEvent(TME_LEAVE)`).
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 pub fn create(app: &App) -> HWND {
     let style = WS_CHILD
@@ -187,16 +196,24 @@ pub fn draw_item(app: &App, item: &DRAWITEMSTRUCT) -> bool {
         SetBkMode(item.hDC, TRANSPARENT as i32);
         SetTextColor(item.hDC, app.palette.window_text);
         let previous: HGDIOBJ = SelectObject(item.hDC, app.ui_font);
+        let close = close_rect(app, &item.rcItem);
         let mut rect = item.rcItem;
-        rect.left += app.scale(6);
-        rect.right -= app.scale(6);
+        rect.left += app.scale(8);
+        rect.right = close.left - app.scale(2);
         DrawTextW(
             item.hDC,
             text.as_ptr(),
             -1,
             &mut rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
+
+        // The × close box; highlighted while the pointer is over it.
+        let hot = HOT.with(|hot| hot.get()) == Some(Hot::Close(index));
+        if hot {
+            theme::fill(item.hDC, &close, app.palette.accent);
+        }
+        draw_glyph(item.hDC, "\u{00D7}", close);
         SelectObject(item.hDC, previous);
 
         // A thin rule under unselected tabs keeps them readable on dark.
@@ -207,6 +224,177 @@ pub fn draw_item(app: &App, item: &DRAWITEMSTRUCT) -> bool {
         }
     }
     true
+}
+
+/// What the pointer is over in the tab strip (for the hover highlight).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hot {
+    Close(usize),
+    Plus,
+}
+
+thread_local! {
+    static HOT: std::cell::Cell<Option<Hot>> = const { std::cell::Cell::new(None) };
+}
+
+/// Side of the × box in a tab and of the `+` button.
+fn button_size(app: &App) -> i32 {
+    app.scale(16)
+}
+
+/// The × box at the right end of a tab's rect.
+fn close_rect(app: &App, item: &RECT) -> RECT {
+    let size = button_size(app);
+    let right = item.right - app.scale(6);
+    let top = item.top + (item.bottom - item.top - size) / 2;
+    RECT {
+        left: right - size,
+        top,
+        right,
+        bottom: top + size,
+    }
+}
+
+/// Client rect of tab `index`.
+fn item_rect(tabctrl: HWND, index: usize) -> Option<RECT> {
+    let mut rect = RECT::default();
+    // SAFETY: `rect` is a valid out-parameter for our tab control.
+    let ok = unsafe {
+        SendMessageW(
+            tabctrl,
+            TCM_GETITEMRECT,
+            index,
+            &mut rect as *mut RECT as isize,
+        )
+    };
+    (ok != 0).then_some(rect)
+}
+
+/// The `+` (new tab) button right after the last tab.
+fn plus_rect(app: &App, tabctrl: HWND) -> RECT {
+    let size = button_size(app);
+    let (left, top, bottom) = match app
+        .tabs
+        .len()
+        .checked_sub(1)
+        .and_then(|last| item_rect(tabctrl, last))
+    {
+        Some(last) => (last.right + app.scale(4), last.top, last.bottom),
+        None => (app.scale(4), 0, app.scale(24)),
+    };
+    let top = top + (bottom - top - size) / 2;
+    RECT {
+        left,
+        top,
+        right: left + size + app.scale(4),
+        bottom: top + size,
+    }
+}
+
+fn contains(rect: &RECT, point: POINT) -> bool {
+    point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
+}
+
+/// What lies under a client point of the tab strip.
+fn hit(app: &App, tabctrl: HWND, point: POINT) -> Option<Hot> {
+    if contains(&plus_rect(app, tabctrl), point) {
+        return Some(Hot::Plus);
+    }
+    (0..app.tabs.len()).find_map(|index| {
+        let rect = item_rect(tabctrl, index)?;
+        contains(&close_rect(app, &rect), point).then_some(Hot::Close(index))
+    })
+}
+
+/// What a screen point hits in the tab strip (test hook diagnostics).
+pub fn describe_hit(app: &App, screen: POINT) -> String {
+    let mut point = screen;
+    // SAFETY: coordinate conversion for our own control.
+    unsafe {
+        ScreenToClient(app.tabctrl, &mut point);
+    }
+    let plus = plus_rect(app, app.tabctrl);
+    let found = match hit(app, app.tabctrl, point) {
+        Some(Hot::Plus) => "plus".to_owned(),
+        Some(Hot::Close(index)) => format!("close {index}"),
+        None => "none".to_owned(),
+    };
+    format!(
+        "client {},{} hit {found} plus {},{}-{},{}",
+        point.x, point.y, plus.left, plus.top, plus.right, plus.bottom
+    )
+}
+
+/// Centered single-character glyph (× or +) in the DC's current font/colour.
+unsafe fn draw_glyph(hdc: windows_sys::Win32::Graphics::Gdi::HDC, glyph: &str, rect: RECT) {
+    let text = win::wide(glyph);
+    let mut rect = rect;
+    DrawTextW(
+        hdc,
+        text.as_ptr(),
+        -1,
+        &mut rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
+/// Paints the `+` button after the tabs (the control itself knows nothing of
+/// it, so it is drawn after the control's own painting).
+unsafe fn paint_plus(app: &App, tabctrl: HWND) {
+    let hdc = GetDC(tabctrl);
+    if hdc.is_null() {
+        return;
+    }
+    let rect = plus_rect(app, tabctrl);
+    let hot = HOT.with(|hot| hot.get()) == Some(Hot::Plus);
+    theme::fill(
+        hdc,
+        &rect,
+        if hot {
+            app.palette.accent
+        } else {
+            app.palette.tab_bg
+        },
+    );
+    SetBkMode(hdc, TRANSPARENT as i32);
+    SetTextColor(hdc, app.palette.window_text);
+    let previous = SelectObject(hdc, app.ui_font);
+    draw_glyph(hdc, "+", rect);
+    SelectObject(hdc, previous);
+    ReleaseDC(tabctrl, hdc);
+}
+
+/// Extra horizontal room in every tab for the × box.
+fn set_padding(app: &App) {
+    let horizontal = app.scale(14) as isize;
+    let vertical = app.scale(3) as isize;
+    // SAFETY: plain size message to our tab control.
+    unsafe {
+        SendMessageW(
+            app.tabctrl,
+            TCM_SETPADDING,
+            0,
+            (vertical << 16) | (horizontal & 0xFFFF),
+        );
+    }
+}
+
+/// Screen centre of tab `index`'s × box, or of the `+` button (`None`), for
+/// the test hook's real mouse clicks.
+pub fn button_screen_point(app: &App, index: Option<usize>) -> Option<POINT> {
+    let rect = match index {
+        Some(index) => close_rect(app, &item_rect(app.tabctrl, index)?),
+        None => plus_rect(app, app.tabctrl),
+    };
+    let mut point = POINT {
+        x: (rect.left + rect.right) / 2,
+        y: (rect.top + rect.bottom) / 2,
+    };
+    // SAFETY: coordinate conversion for our own control.
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::ClientToScreen(app.tabctrl, &mut point);
+    }
+    Some(point)
 }
 
 pub fn invalidate(app: &App) {
@@ -326,6 +514,7 @@ pub fn install_subclass(app: &App) {
     if app.tabctrl.is_null() {
         return;
     }
+    set_padding(app);
     // SAFETY: our tab control; the frame handle travels as reference data.
     unsafe {
         SetWindowSubclass(
@@ -352,6 +541,80 @@ unsafe extern "system" fn tab_subclass(
             if windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect) != 0 {
                 theme::fill(hdc, &rect, app.palette.tab_bg);
                 return 1;
+            }
+        }
+    }
+    if msg == WM_PAINT {
+        let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+        if let Some(app) = crate::wnd::app_mut(refdata as HWND) {
+            paint_plus(app, hwnd);
+        }
+        return result;
+    }
+    if msg == WM_NCHITTEST {
+        // The tab control answers HTTRANSPARENT outside its tabs, which would
+        // send clicks on the `+` (and hover over it) to the frame instead.
+        if let Some(app) = crate::wnd::app_mut(refdata as HWND) {
+            let mut point = POINT {
+                x: win::x_from_lparam(lparam),
+                y: win::y_from_lparam(lparam),
+            };
+            ScreenToClient(hwnd, &mut point);
+            if contains(&plus_rect(app, hwnd), point) {
+                return HTCLIENT as LRESULT;
+            }
+        }
+    }
+    if msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE {
+        if let Some(app) = crate::wnd::app_mut(refdata as HWND) {
+            let now = if msg == WM_MOUSELEAVE {
+                None
+            } else {
+                let point = POINT {
+                    x: win::x_from_lparam(lparam),
+                    y: win::y_from_lparam(lparam),
+                };
+                hit(app, hwnd, point)
+            };
+            if HOT.with(|hot| hot.replace(now)) != now {
+                InvalidateRect(hwnd, ptr::null(), 0);
+            }
+            if msg == WM_MOUSEMOVE {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                TrackMouseEvent(&mut track);
+            }
+        }
+    }
+    // A quick second click arrives as a double-click: it must still press
+    // the button (two fast clicks on + make two tabs).
+    if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK {
+        if let Some(app) = crate::wnd::app_mut(refdata as HWND) {
+            let point = POINT {
+                x: win::x_from_lparam(lparam),
+                y: win::y_from_lparam(lparam),
+            };
+            // Posted, so the tab control finishes the mouse message first.
+            match hit(app, hwnd, point) {
+                Some(Hot::Plus) => {
+                    PostMessageW(
+                        refdata as HWND,
+                        WM_COMMAND,
+                        menu::IDM_FILE_NEW_TAB as usize,
+                        0,
+                    );
+                    return 0;
+                }
+                Some(Hot::Close(index)) => {
+                    app.tab_context = Some(index);
+                    PostMessageW(refdata as HWND, WM_COMMAND, menu::IDM_TAB_CLOSE as usize, 0);
+                    return 0;
+                }
+                None => {}
             }
         }
     }

@@ -513,7 +513,7 @@ fn decode_hex(hex: &[u8]) -> Vec<u8> {
 }
 
 /// Windows-1252 byte → char (Rich Edit writes `\ansicpg1252`).
-fn cp1252(byte: u8) -> char {
+pub(crate) fn cp1252(byte: u8) -> char {
     const HIGH: [char; 32] = [
         '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž',
         '\u{8F}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}',

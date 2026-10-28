@@ -74,6 +74,40 @@ pub fn is_rule_link(target: &str) -> bool {
     target.trim() == RULE_PREFIX
 }
 
+/// A link target that is safe inside `{\*\fldinst{HYPERLINK "<target>"}}`:
+/// `{`, `}`, `\`, `"`, control characters and every non-ASCII character are
+/// percent-encoded (UTF-8), so the target can never close the field group or
+/// smuggle RTF into the note. Everything else (URL syntax, spaces, existing
+/// `%XX` escapes) is kept as written.
+pub fn field_target(target: &str) -> String {
+    let mut out = String::with_capacity(target.len());
+    for ch in target.trim().chars() {
+        if (' '..='~').contains(&ch) && !matches!(ch, '{' | '}' | '\\' | '"') {
+            out.push(ch);
+        } else {
+            let mut buffer = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buffer).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// Link targets that pasted Markdown/HTML may turn into links: web and mail
+/// addresses, `file:` URLs, local drive paths and Nodi's own `nodi` links.
+/// Anything else (`javascript:`, `vbscript:`, `ms-…:`, `search-ms:`, `data:`,
+/// relative addresses, …) stays plain text.
+pub fn pasted_link_allowed(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
+    [
+        "http://", "https://", "mailto:", "file:", "nodi://", "nodi-",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+        || is_drive_path(target.trim())
+}
+
 /// Finds a full local path at the end of `text` and returns the byte offset
 /// where the replaceable range starts plus the path itself. Quotes around the
 /// path are included in the range, so converting removes them.

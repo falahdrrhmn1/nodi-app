@@ -47,6 +47,94 @@ pub struct Node {
     /// Unix seconds.
     #[serde(default)]
     pub modified: u64,
+    /// The title still follows the note's first line (a new note that was
+    /// never renamed by hand). See [`auto_title`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_title: bool,
+}
+
+/// One Notes Explorer change that Ctrl+Z in the tree can take back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeUndo {
+    /// Moved to the trash: these nodes come back.
+    Trash { ids: Vec<NoteId>, title: String },
+    /// Moved (drag & drop, Move Up/Down/To…): the previous place.
+    Move {
+        id: NoteId,
+        title: String,
+        parent: Option<NoteId>,
+        index: usize,
+    },
+    /// Renamed: the previous title (and whether it followed the text).
+    Rename {
+        id: NoteId,
+        title: String,
+        auto_title: bool,
+        new_title: String,
+    },
+}
+
+impl TreeUndo {
+    /// The confirmation question shown before undoing.
+    pub fn question(&self, tree: &Tree) -> String {
+        match self {
+            TreeUndo::Trash { title, ids } => {
+                let more = ids.len().saturating_sub(1);
+                if more == 0 {
+                    format!("Undo: restore \"{title}\" from the Trash?")
+                } else {
+                    format!("Undo: restore \"{title}\" and {more} sub-note(s) from the Trash?")
+                }
+            }
+            TreeUndo::Move { title, parent, .. } => {
+                let place = parent
+                    .as_ref()
+                    .and_then(|id| tree.get(id))
+                    .map(|node| format!("\"{}\"", node.title))
+                    .unwrap_or_else(|| "the top level".to_owned());
+                format!("Undo: move \"{title}\" back to {place}?")
+            }
+            TreeUndo::Rename {
+                title, new_title, ..
+            } => format!("Undo: rename \"{new_title}\" back to \"{title}\"?"),
+        }
+    }
+}
+
+/// Longest automatic title, in characters.
+pub const AUTO_TITLE_MAX: usize = 60;
+
+/// Title for a note whose title follows its text: the first non-empty
+/// paragraph without its heading `#`s or list bullet, whitespace collapsed,
+/// at most [`AUTO_TITLE_MAX`] characters; `New Note` when there is no text.
+pub fn auto_title(text: &str) -> String {
+    for line in text.split(['\r', '\n', '\u{000B}']) {
+        let cleaned: String = line
+            .chars()
+            .filter(|ch| !matches!(*ch, '\u{FFFC}' | '\u{FFF9}' | '\u{FFFB}' | '\u{0007}'))
+            .collect();
+        let mut rest = cleaned.trim();
+        rest = rest.trim_start_matches('#').trim_start();
+        for bullet in ['•', '◦', '▪', '-', '*'] {
+            if let Some(after) = rest.strip_prefix(bullet) {
+                if after.starts_with([' ', '\t']) {
+                    rest = after.trim_start();
+                }
+            }
+        }
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        if words.is_empty() {
+            continue;
+        }
+        let joined = words.join(" ");
+        return joined
+            .chars()
+            .take(AUTO_TITLE_MAX)
+            .collect::<String>()
+            .trim_end()
+            .to_owned();
+    }
+    "New Note".to_owned()
 }
 
 /// Errors from tree operations that can fail.
@@ -164,16 +252,42 @@ impl Tree {
             trashed: false,
             created: now,
             modified: now,
+            auto_title: false,
         };
         self.nodes.insert(id.clone(), node);
         id
     }
 
-    /// Renames a node. Returns false when the node does not exist.
+    /// Lets the note's title follow its first line (or stop doing so).
+    pub fn set_auto_title(&mut self, id: &NoteId, auto: bool) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.auto_title = auto;
+        }
+    }
+
+    /// For a note with an automatic title: retitles it from `text` and returns
+    /// the new title when it changed. Manual titles are never touched.
+    pub fn follow_text(&mut self, id: &NoteId, text: &str) -> Option<String> {
+        let node = self.nodes.get_mut(id)?;
+        if !node.auto_title {
+            return None;
+        }
+        let title = auto_title(text);
+        if node.title == title {
+            return None;
+        }
+        node.title = title.clone();
+        node.modified = now_secs();
+        Some(title)
+    }
+
+    /// Renames a node by hand: its title stops following the first line.
+    /// Returns false when the node does not exist.
     pub fn rename(&mut self, id: &NoteId, title: impl Into<String>) -> bool {
         let title = title.into();
         match self.nodes.get_mut(id) {
             Some(node) => {
+                node.auto_title = false;
                 if node.title != title {
                     node.title = title;
                     node.modified = now_secs();
@@ -453,6 +567,7 @@ impl Tree {
             trashed: false,
             created: now,
             modified: now,
+            auto_title: false,
         };
         self.nodes.insert(new_id.clone(), copy);
         Some(new_id)
@@ -511,6 +626,84 @@ impl Tree {
             .collect();
         titles.push(node.title.clone());
         titles
+    }
+
+    /// Parent and position among the visible siblings of `id`.
+    pub fn place(&self, id: &NoteId) -> Option<(Option<NoteId>, usize)> {
+        let node = self.nodes.get(id)?;
+        let index = self
+            .children(node.parent.as_ref())
+            .iter()
+            .position(|sibling| sibling.id == *id)
+            .unwrap_or(usize::MAX);
+        Some((node.parent.clone(), index))
+    }
+
+    /// Moves `id` (and its subtree) to the trash and returns how to undo it:
+    /// only the nodes this call trashed come back, not ones that were already
+    /// in the trash.
+    pub fn trash_undoable(&mut self, id: &NoteId) -> Option<TreeUndo> {
+        let title = self.nodes.get(id)?.title.clone();
+        let mut ids = vec![id.clone()];
+        ids.extend(self.descendants(id));
+        ids.retain(|node| self.nodes.get(node).is_some_and(|n| !n.trashed));
+        self.trash(id);
+        Some(TreeUndo::Trash { ids, title })
+    }
+
+    /// The undo record for moving `id`, taken before the move.
+    pub fn move_undo(&self, id: &NoteId) -> Option<TreeUndo> {
+        let (parent, index) = self.place(id)?;
+        Some(TreeUndo::Move {
+            id: id.clone(),
+            title: self.nodes.get(id)?.title.clone(),
+            parent,
+            index,
+        })
+    }
+
+    /// The undo record for renaming `id`, taken before the rename.
+    pub fn rename_undo(&self, id: &NoteId, new_title: &str) -> Option<TreeUndo> {
+        let node = self.nodes.get(id)?;
+        Some(TreeUndo::Rename {
+            id: id.clone(),
+            title: node.title.clone(),
+            auto_title: node.auto_title,
+            new_title: new_title.to_owned(),
+        })
+    }
+
+    /// Takes a change back. A move goes back to the old parent and position;
+    /// when that parent is gone (purged) the node goes to the top level.
+    pub fn undo(&mut self, change: &TreeUndo) -> Result<(), TreeError> {
+        match change {
+            TreeUndo::Trash { ids, .. } => {
+                for id in ids {
+                    if let Some(node) = self.nodes.get_mut(id) {
+                        node.trashed = false;
+                    }
+                }
+                Ok(())
+            }
+            TreeUndo::Move {
+                id, parent, index, ..
+            } => {
+                let parent = parent.clone().filter(|p| self.nodes.contains_key(p));
+                self.move_node(id, parent, *index)
+            }
+            TreeUndo::Rename {
+                id,
+                title,
+                auto_title,
+                ..
+            } => {
+                if !self.rename(id, title.clone()) {
+                    return Err(TreeError::NotFound(id.clone()));
+                }
+                self.set_auto_title(id, *auto_title);
+                Ok(())
+            }
+        }
     }
 
     /// True when `node` is a descendant of `ancestor` (or equal).

@@ -47,6 +47,18 @@ same handlers as the menus.
 | extra — tab menu | Close Others keeps one tab, notes untouched | **PASS** (e2e AJ) |
 | extra — restore backup | Backup Now, rename, restore → old title back, current state snapshotted first | **PASS** (e2e AK) |
 | extra — recent notes, outline shortcut | recent list stored in the session; Ctrl+Alt+O with real keys | **PASS** (e2e AL) |
+| security — pasted links | a hostile `href` (`}}{\object…`) cannot inject RTF; `javascript:` etc. stay text | **PASS** (e2e AM + unit tests) |
+| extra — typing in a heading | real keys: no selection left behind, Ctrl+Z undoes the typing (not a formatting step) | **PASS** (e2e AN) |
+| extra — tab × and + | real mouse clicks on × and +, real Ctrl+T | **PASS** (e2e AO) |
+| extra — automatic titles | real keys: first line becomes the title; a manual rename sticks | **PASS** (e2e AP) |
+| extra — Notes Explorer undo | Trash a note with a sub-note, real click in the tree + Ctrl+Z, confirmation, same place | **PASS** (e2e AQ) |
+| extra — Ctrl+Up/Down | real keys scroll without moving the caret; toggle off → caret moves; saved | **PASS** (e2e AR) |
+| extra — pasted formulas | `$…$` and `\[…\]` rendered, unsupported LaTeX kept as text, `$5` stays text, restart | **PASS** (e2e AS + unit tests) |
+| extra — import / export | folder with `.md`, ANSI `.txt`, sub-folder → notes; Export Folder round trip; original untouched | **PASS** (e2e AT + unit tests) |
+| extra — AI mirror folder | moved to an empty folder; a used folder gets `Nodi AI`; user files untouched; back to default | **PASS** (e2e AU) |
+| extra — tree drag & drop (real mouse) | drop on the right side of a row above the first item; drop inside a folder | **PASS** (e2e AV) |
+| extra — status counts | `Lines · Words · Chars` and the selection's counts | **PASS** (e2e AW) |
+| **save torture** | `scripts/persist-torture.ps1 -Cycles 20 -Runs 3`: every cycle restarts Nodi and compares every note's text and Markdown and the tree with what was there before closing; closing rotates over WM_CLOSE right after typing (buffer still `Modified`), Ctrl+S + close, Windows shutdown messages, and `Stop-Process -Force` after `Saved` | **PASS**: 2 × 60 cycles, 0 mismatches (plus ≈130 earlier starts by the harness author) |
 
 Unit and integration tests: `cargo test` — all pass (nodi-core: tree,
 storage, autosave, backup, Markdown mirror, search, links, image, RTF and theme
@@ -54,8 +66,11 @@ colours, Markdown import/export, HTML import, LaTeX parser, math layout, PNG; no
 link parsing/safety). `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` are clean.
 
-**NOT TESTED automatically:** physical mouse input (the tests never move the
-real pointer). Still to be tried by hand: dragging a picture's resize handles,
+Real mouse input (cursor moved and clicked by the tests, in the window's own
+DPI mode) covers the tab × / + buttons, a click in the tree and tree drag &
+drop (e2e AO, AQ, AV).
+
+**NOT TESTED automatically:** Still to be tried by hand: dragging a picture's resize handles,
 the visual drag feedback (insertion line / row highlight / hover-expand /
 auto-scroll are driven by `WM_MOUSEMOVE`, while e2e AF tests the same model
 move through a hook), right-click menus, the common dialogs
@@ -140,6 +155,24 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   becomes a path link; Rich Edit only persists such fields as `file:` URLs, so
   targets are stored that way and shown/exported as the real path. Link safety
   policy below.
+- Tabs: × on every tab, + after the last one, Ctrl+T, right-click menu,
+  middle-click. A new note is titled by its first line (headings and bullets
+  stripped) until it is renamed by hand.
+- Notes Explorer undo: Ctrl+Z with the tree focused takes back the last move to
+  the Trash (with its sub-notes, at the same place), move or rename, after a
+  confirmation (20 steps, this session).
+- Ctrl+Up/Down scroll the view without moving the caret (View menu toggle).
+- Status bar: `Lines · Words · Chars` of the note and of the selection
+  (updated 120 ms after typing pauses).
+- Import: File > Import Files / Import Folder and files dropped from Explorer
+  (`.md`, `.markdown`, `.txt` in UTF-8/UTF-16/ANSI, `.rtf`; folders keep their
+  structure; local pictures of Markdown files are embedded; originals are only
+  read). Export: File > Export Note As (`.md` / `.rtf` / `.txt`) and Export
+  Folder (Markdown). Pictures dropped on the note are inserted.
+- Formulas pasted from ChatGPT/web pages: `$…$`, `$$…$$`, `\(…\)`, `\[…\]`,
+  KaTeX/MathJax TeX sources and Wikipedia `alttext` become rendered formulas;
+  LaTeX the renderer does not know stays as inline code and is named in the
+  status bar.
 - Formulas: LaTeX dialog (Alt+=), rendered with a TeX-like layout in Cambria
   Math: fractions, roots, scripts, ∑/∏/∫ with limits, `\left…\right`,
   matrices, cases, accents, Greek, ℝ/ℕ/ℤ, operators. Editable again by
@@ -177,8 +210,6 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   note itself is the source of truth.
 - Picture rotate and editing in an external program are not implemented
   (crop and exact size are).
-- Dragging picture files from Explorer into a note is not implemented
-  (Insert > Image and paste work).
 - Formula evaluation (calculating results) is not implemented — rendering only.
 - Older small dialogs (icon picker, Trash, note picker) do not scale with DPI.
 - All tabs of the previous session are loaded at startup (150 tabs ≈ 2.2 s).
@@ -186,6 +217,9 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   to be reused).
 
 ## Security notes
+- Pasted HTML/Markdown can only create web, mail, `file:`/drive-path and Nodi
+  links; every link target is percent-encoded before it goes into the RTF, so
+  a crafted address cannot add RTF (objects, fields) to a note.
 - Links never run programs: `http(s)`/`mailto` open in the browser/mail
   client. File links must be fully qualified drive paths (`X:\...`);
   relative paths, `\\?\`, `\\.\`, `\??\` device/NT paths, alternate data

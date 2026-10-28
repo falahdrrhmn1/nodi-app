@@ -376,6 +376,54 @@ pub fn insert_rendered(editor: HWND, rendered: &Rendered, latex: &str) -> Result
     Ok(())
 }
 
+/// Replaces every formula placeholder a Markdown/HTML paste left behind
+/// (`markdown_in::FORMULA_START` … `FORMULA_END`) with a rendered formula.
+/// LaTeX that cannot be rendered stays as inline-code text. Returns how many
+/// were rendered and the LaTeX of those kept as text.
+pub fn render_pasted(editor: HWND) -> (usize, Vec<String>) {
+    let start_mark = nodi_core::markdown_in::FORMULA_START as u16;
+    let end_mark = nodi_core::markdown_in::FORMULA_END as u16;
+    let mut rendered_count = 0;
+    let mut kept = Vec::new();
+    let mut caret = editor::selection(editor).1;
+    loop {
+        let raw = editor::raw_text(editor);
+        let Some(start) = raw.iter().position(|unit| *unit == start_mark) else {
+            break;
+        };
+        let before = editor::text_length(editor);
+        let Some(length) = raw[start..].iter().position(|unit| *unit == end_mark) else {
+            // An unterminated marker: drop it so the loop ends.
+            editor::set_selection(editor, start as i32, start as i32 + 1);
+            editor::replace_selection(editor, "", true);
+            caret += editor::text_length(editor) - before;
+            continue;
+        };
+        let end = start + length;
+        let latex = String::from_utf16_lossy(&raw[start + 1..end]);
+        let (from, to) = (start as i32, end as i32 + 1);
+        editor::set_selection(editor, from, to);
+        let done = render(&latex)
+            .and_then(|picture| insert_rendered(editor, &picture, &latex))
+            .is_ok();
+        if done {
+            rendered_count += 1;
+        } else {
+            // Rendering failed before anything changed: put the LaTeX back
+            // as code text in place of the placeholder.
+            editor::set_selection(editor, from, to);
+            editor::replace_selection(editor, &latex, true);
+            let length = latex.encode_utf16().count() as i32;
+            editor::set_selection(editor, from, from + length);
+            crate::wnd::format::toggle_inline_code(editor);
+            kept.push(latex);
+        }
+        caret += editor::text_length(editor) - before;
+    }
+    editor::set_selection(editor, caret, caret);
+    (rendered_count, kept)
+}
+
 /// Insert > Formula... (Alt+=): new formula, or edit the selected one.
 pub fn insert_or_edit(app: &mut App) {
     let Some(editor) = app.active_editor() else {

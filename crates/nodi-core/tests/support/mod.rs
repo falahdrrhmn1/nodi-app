@@ -29,7 +29,14 @@ impl TempDir {
         Self { path }
     }
 
+    /// The temp dir itself (not every test crate uses it).
+    #[allow(dead_code)]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// A `data/` directory inside this temp dir.
+    #[allow(dead_code)]
     pub fn data_dir(&self) -> DataDir {
         DataDir::at(self.path.join("data"))
     }

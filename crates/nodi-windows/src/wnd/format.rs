@@ -268,7 +268,18 @@ fn set_marker_format(editor: HWND, start: i32, len: i32, level: usize, visible: 
     }
     face(&mut format, BODY_FONT);
     editor::set_selection(editor, start, start + len);
-    editor::set_selection_format(editor, &format);
+    // Called on every keystroke in a heading: only format when something
+    // differs, so the undo stack does not fill up with formatting steps.
+    let current = editor::selection_format(editor);
+    let same = current.dw_mask & format.dw_mask == format.dw_mask
+        && current.dw_effects & (CFE_HIDDEN | CFE_BOLD)
+            == format.dw_effects & (CFE_HIDDEN | CFE_BOLD)
+        && current.cr_text_color == format.cr_text_color
+        && current.y_height == format.y_height
+        && face_name(&current) == BODY_FONT;
+    if !same {
+        editor::set_selection_format(editor, &format);
+    }
 }
 
 /// Shows or hides the marker of the paragraph at `start`.
@@ -281,6 +292,7 @@ fn set_marker_visibility(editor: HWND, start: i32, visible: bool) {
         return;
     }
     let (from, to) = editor::selection(editor);
+    let _frozen = editor::Frozen::new(editor);
     let format = CharFormat2W {
         dw_mask: CFM_HIDDEN | CFM_COLOR,
         dw_effects: if visible { 0 } else { CFE_HIDDEN },
@@ -288,7 +300,13 @@ fn set_marker_visibility(editor: HWND, start: i32, visible: bool) {
         ..CharFormat2W::default()
     };
     editor::set_selection(editor, start, start + len);
-    editor::set_selection_format(editor, &format);
+    let current = editor::selection_format(editor);
+    let same = current.dw_mask & format.dw_mask == format.dw_mask
+        && current.dw_effects & CFE_HIDDEN == format.dw_effects
+        && current.cr_text_color == HEADING_MARKER_GREY;
+    if !same {
+        editor::set_selection_format(editor, &format);
+    }
     editor::set_selection(editor, from, to);
 }
 
@@ -378,6 +396,7 @@ pub fn heading(editor: HWND, level: usize) {
     }
     let level = level.min(4);
     let (from, to) = editor::selection(editor);
+    let _frozen = editor::Frozen::new(editor);
     let raw = editor::raw_text(editor);
     let starts = selected_paragraphs(&raw, from, to);
     let mut new_from = from;
@@ -419,6 +438,13 @@ pub fn maintain_heading(editor: HWND) {
     let end = paragraph_end_in(&raw, start);
     let text = text_in(&raw, start, end);
     let prefix = heading_prefix(&text);
+    // Typing in a body paragraph (no `#` marker, body-size text at the caret)
+    // needs nothing: return before touching the selection at all.
+    if prefix.is_none() && heading_level_at(editor) == 0 {
+        return;
+    }
+    // The probing below moves the selection; nothing of it may be painted.
+    let _frozen = editor::Frozen::new(editor);
     let old_len = heading_marker_len(&text) as i32;
     let probe = start + old_len;
     editor::set_selection(editor, probe, probe);
@@ -469,6 +495,7 @@ pub fn normalize_heading_markers(editor: HWND) {
         return;
     };
     let (from, to) = editor::selection(editor);
+    let _frozen = editor::Frozen::new(editor);
     let raw = editor::raw_text(editor);
     let mut starts = vec![0];
     for (index, unit) in raw.iter().enumerate() {

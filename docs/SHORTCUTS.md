@@ -8,6 +8,7 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 | Keys | Action |
 |---|---|
 | Ctrl+N | New note (next to the selected one) |
+| Ctrl+T | New tab: a new note (same as the + after the tabs) |
 | Ctrl+Shift+N | New child note |
 | Ctrl+S | Save now (autosave runs anyway, ~0.5 s after you stop typing) |
 | Ctrl+W / Ctrl+F4 | Close tab |
@@ -16,6 +17,7 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 | Ctrl+O | Go to note by title |
 | F2 | Rename note |
 | Del (in the tree) | Move note to Trash |
+| Ctrl+Z (in the tree) | Undo the last Trash / move / rename (asks first) |
 | Alt+Up / Alt+Down | Move note up / down among its siblings |
 | Drag & drop in the tree | Move before / after (insertion line) or inside (highlighted row, last child); near the top/bottom edge auto-scrolls, hovering a collapsed node expands it, **Esc** cancels |
 | Enter (in the tree) | Open the selected note |
@@ -36,6 +38,7 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 | Ctrl+A | Select all |
 | Ctrl+D | Duplicate line (or the selection) |
 | Ctrl+G | Go to line |
+| Ctrl+Up / Ctrl+Down | Scroll the view one line, caret stays (View > Ctrl+Up/Down Scrolls the View; off = jump by paragraph) |
 | F5 | Insert date and time |
 
 ## Markdown-style typing
@@ -107,8 +110,11 @@ the insert commands.
 
 ## Mouse
 
+- Each tab has a × (close); the + after the last tab opens a new note.
 - Right-click a tab: Close, Close Others, Close All, Copy Internal Link,
   Reveal in Tree. Middle-click a tab closes it.
+- Drag files from Explorer onto the window: `.md` / `.txt` / `.rtf` files and
+  folders are imported; pictures dropped on the note are inserted.
 - View > Theme: Light, Dark or Custom... colours.
 
 - Right-click a note in the tree: New Child/Sibling Note, Rename, Change Icon,
@@ -118,9 +124,10 @@ the insert commands.
 - **Trash (N)** sits at the bottom of the tree: click it (or press Enter) to
   open the Trash; right-click it for Open Trash and Empty Trash... (files are
   still kept in `data/recovery/`).
-- Drag a note or folder in the tree: the top/bottom quarter of a row shows an
-  insertion line (before/after), the middle half highlights the row (drop
-  inside as the last child). Dropping on empty space moves it to the top
+- Drag a note or folder in the tree (anywhere on the row, not only on the
+  title): the top/bottom quarter of a row shows an insertion line
+  (before/after), the middle half highlights the row (drop inside as the last
+  child). Dropping on empty space moves it to the top
   level. Dragging near an edge scrolls; hovering a collapsed node expands it
   after ~0.7 s; Esc cancels.
 - A full local path (`C:\...`, `D:\...`, or a quoted path with spaces) becomes

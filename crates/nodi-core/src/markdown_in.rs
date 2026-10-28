@@ -10,6 +10,15 @@
 
 use crate::links;
 
+/// Formulas pasted as `$…$`, `$$…$$`, `\(…\)` or `\[…\]` are written as
+/// `FORMULA_START` + LaTeX + `FORMULA_END` (private-use characters). The
+/// editor replaces each such span with a rendered formula after the paste
+/// (rendering needs Windows), or with the LaTeX as inline code when it
+/// cannot be rendered — the text is never lost.
+pub const FORMULA_START: char = '\u{E000}';
+/// See [`FORMULA_START`].
+pub const FORMULA_END: char = '\u{E001}';
+
 /// Body font, mirroring `wnd::format::BODY_FONT`.
 pub const BODY_FONT: &str = "Segoe UI";
 /// Code font, mirroring `wnd::format::CODE_FONT`.
@@ -29,6 +38,8 @@ struct Style {
     italic: bool,
     strike: bool,
     code: bool,
+    /// The run's text is LaTeX.
+    math: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +92,14 @@ pub fn looks_like_markdown(text: &str) -> bool {
         if line.starts_with("```") || line.starts_with("~~~") {
             return true;
         }
+        // Display math is unmistakable on its own.
+        if line.starts_with("$$") || line.starts_with("\\[") || line.contains("\\(") {
+            return true;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        if (0..chars.len()).any(|at| chars[at] == '$' && inline_math_at(&chars, at).is_some()) {
+            signals += 1;
+        }
         if heading(line).is_some() || list_marker(line).is_some() || line.starts_with('>') {
             signals += 1;
         }
@@ -129,6 +148,37 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
                 language,
                 text: code.join("\n"),
             });
+            continue;
+        }
+        if let Some((close, rest)) = trimmed
+            .strip_prefix("$$")
+            .map(|rest| ("$$", rest))
+            .or_else(|| trimmed.strip_prefix("\\[").map(|rest| ("\\]", rest)))
+        {
+            // Display math, possibly over several lines.
+            let mut latex = String::new();
+            let mut current = rest.to_owned();
+            index += 1;
+            loop {
+                if let Some(end) = current.find(close) {
+                    latex.push_str(&current[..end]);
+                    let after = current[end + close.len()..].trim().to_owned();
+                    blocks.push(Block::Paragraph(vec![math_run(&latex)]));
+                    if !after.is_empty() {
+                        blocks.push(Block::Paragraph(parse_inline(&after)));
+                    }
+                    break;
+                }
+                latex.push_str(&current);
+                latex.push(' ');
+                if index >= lines.len() {
+                    // Never closed: keep it as text.
+                    blocks.push(Block::Paragraph(parse_inline(trimmed)));
+                    break;
+                }
+                current = lines[index].to_owned();
+                index += 1;
+            }
             continue;
         }
         if let Some(level) = heading(trimmed) {
@@ -346,6 +396,12 @@ fn parse_inline(text: &str) -> Vec<Run> {
 
     while index < chars.len() {
         let ch = chars[index];
+        if let Some((end, latex)) = inline_math_at(&chars, index) {
+            flush(&mut runs, &mut buffer, style, None);
+            runs.push(math_run(&latex));
+            index = end;
+            continue;
+        }
         match ch {
             '\\' if index + 1 < chars.len() => {
                 buffer.push(chars[index + 1]);
@@ -447,6 +503,52 @@ fn parse_inline(text: &str) -> Vec<Run> {
     }
     flush(&mut runs, &mut buffer, style, None);
     runs
+}
+
+fn math_run(latex: &str) -> Run {
+    Run {
+        text: latex.trim().to_owned(),
+        style: Style {
+            math: true,
+            ..Style::default()
+        },
+        link: None,
+    }
+}
+
+/// Inline formula at `start`: `$$…$$`, `\(…\)`, `\[…\]` or `$…$`. A single
+/// `$` pair must hug its content (`$x$`, not `$ 5 and $`) and must not be
+/// followed by a digit, so prices stay text. Returns the index after the
+/// closing delimiter and the LaTeX.
+fn inline_math_at(chars: &[char], start: usize) -> Option<(usize, String)> {
+    let starts_with = |at: usize, text: &str| {
+        let pattern: Vec<char> = text.chars().collect();
+        chars.get(at..at + pattern.len()) == Some(pattern.as_slice())
+    };
+    let find = |from: usize, close: &str| (from..chars.len()).find(|&at| starts_with(at, close));
+    for (open, close) in [("$$", "$$"), ("\\(", "\\)"), ("\\[", "\\]")] {
+        if starts_with(start, open) {
+            let from = start + open.chars().count();
+            let end = find(from, close)?;
+            let latex: String = chars[from..end].iter().collect();
+            if latex.trim().is_empty() {
+                return None;
+            }
+            return Some((end + close.chars().count(), latex));
+        }
+    }
+    if chars.get(start) != Some(&'$') || start > 0 && chars[start - 1] == '\\' {
+        return None;
+    }
+    let first = *chars.get(start + 1)?;
+    if first.is_whitespace() || first == '$' {
+        return None;
+    }
+    let end = (start + 2..chars.len()).find(|&at| chars[at] == '$' && chars[at - 1] != '\\')?;
+    if chars[end - 1].is_whitespace() || chars.get(end + 1).is_some_and(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some((end + 1, chars[start + 1..end].iter().collect()))
 }
 
 /// Parses `[label](target)` starting at `chars[start] == '['`. Returns the
@@ -575,6 +677,12 @@ fn push_block(out: &mut String, block: &Block, width: i32) {
 
 fn push_runs(out: &mut String, runs: &[Run], bold: bool, base_size: i32) {
     for run in runs {
+        if run.style.math {
+            // A placeholder the editor turns into a rendered formula.
+            out.push_str(&format!("\\f0\\fs{base_size} "));
+            escape(out, &format!("{FORMULA_START}{}{FORMULA_END}", run.text));
+            continue;
+        }
         let mut body = String::new();
         if run.style.code {
             body.push_str(&format!("\\f1\\fs{CODE_SIZE} "));
@@ -592,7 +700,13 @@ fn push_runs(out: &mut String, runs: &[Run], bold: bool, base_size: i32) {
         }
         escape(&mut body, &run.text);
         body.push_str(&format!("\\b0\\i0\\strike0\\f0\\fs{base_size} "));
-        match &run.link {
+        // Pasted content decides the target, so only known-safe schemes
+        // become links (the rest stays as its text).
+        match run
+            .link
+            .as_deref()
+            .filter(|target| links::pasted_link_allowed(target))
+        {
             Some(target) => {
                 // Rich Edit drops HYPERLINK fields whose target is a bare local
                 // path, so store those as file URLs; the display text keeps the
@@ -604,9 +718,9 @@ fn push_runs(out: &mut String, runs: &[Run], bold: bool, base_size: i32) {
                         let decoded = links::percent_decode_text(target);
                         links::path_file_url(&decoded).unwrap_or(decoded)
                     }
-                    None => target.clone(),
+                    None => target.to_owned(),
                 };
-                let target = target.replace('"', "%22").replace('\\', "\\\\");
+                let target = links::field_target(&target);
                 out.push_str("{\\field{\\*\\fldinst{HYPERLINK \"");
                 out.push_str(&target);
                 out.push_str("\"}}{\\fldrslt{\\ul ");
@@ -760,6 +874,65 @@ mod tests {
     }
 
     #[test]
+    fn hostile_link_targets_cannot_inject_rtf() {
+        for target in [
+            r"https://x.test/}}{\object\objemb{\objdata 01}}{",
+            r#"https://x.test/a"b"#,
+            "https://例え.jp/ä",
+            "https://x.test/\u{1}ctl",
+        ] {
+            let rtf = convert(&format!("[klik]({target})"));
+            assert_eq!(rtf.matches("\\field").count(), 1, "{rtf}");
+            assert!(!rtf.contains("\\object"), "{rtf}");
+            let start = rtf.find("HYPERLINK \"").expect("link") + "HYPERLINK \"".len();
+            let end = start + rtf[start..].find('"').expect("closing quote");
+            let stored = &rtf[start..end];
+            assert!(
+                stored
+                    .chars()
+                    .all(|ch| (' '..='~').contains(&ch) && !matches!(ch, '{' | '}' | '\\' | '"')),
+                "unsafe target {stored:?}"
+            );
+            assert_eq!(links::percent_decode_text(stored), target.trim(), "{rtf}");
+        }
+    }
+
+    #[test]
+    fn only_safe_schemes_become_links() {
+        for target in [
+            "javascript:alert(1)",
+            "vbscript:x",
+            "search-ms:query=a",
+            "data:text/html,x",
+            "ms-settings:",
+        ] {
+            let rtf = convert(&format!("[klik]({target})"));
+            assert!(!rtf.contains("\\field"), "{target} became a link: {rtf}");
+            assert!(rtf.contains("klik"), "{rtf}");
+        }
+        for target in [
+            "https://x.test",
+            "mailto:a@b.c",
+            "nodi://note/abc",
+            r"C:\Data\a.pdf",
+        ] {
+            let rtf = convert(&format!("[klik]({target})"));
+            assert!(rtf.contains("\\field"), "{target} lost its link: {rtf}");
+        }
+    }
+
+    #[test]
+    fn local_paths_with_braces_and_non_ascii_round_trip() {
+        let rtf = convert(r"[doc](C:\Folder {1}\ä.pdf)");
+        let start = rtf.find("HYPERLINK \"").expect("link") + "HYPERLINK \"".len();
+        let end = start + rtf[start..].find('"').expect("closing quote");
+        assert_eq!(
+            links::file_url_path(&rtf[start..end]).as_deref(),
+            Some(r"C:\Folder {1}\ä.pdf")
+        );
+    }
+
+    #[test]
     fn headings_use_the_editor_sizes() {
         let rtf = convert("# Satu\n\n### Tiga");
         assert!(rtf.contains("\\fs40\\b "), "{rtf}");
@@ -825,6 +998,63 @@ mod tests {
             "{markdown}"
         );
         assert!(markdown.contains("---"), "{markdown}");
+    }
+
+    fn formulas_in(markdown: &str) -> Vec<String> {
+        let rtf = convert(markdown);
+        // Decode the \uN? escapes back to text, then cut out the placeholders.
+        let mut text = String::new();
+        let mut rest = rtf.as_str();
+        while let Some(at) = rest.find("\\u") {
+            text.push_str(&rest[..at]);
+            let digits: String = rest[at + 2..]
+                .chars()
+                .take_while(|ch| *ch == '-' || ch.is_ascii_digit())
+                .collect();
+            let value: i32 = digits.parse().unwrap_or(63);
+            text.push(char::from_u32((value as i16 as u16) as u32).unwrap_or('?'));
+            rest = &rest[at + 2 + digits.len() + 1..];
+        }
+        text.push_str(rest);
+        text.split(FORMULA_START)
+            .skip(1)
+            .map(|part| {
+                part.split(FORMULA_END)
+                    .next()
+                    .unwrap_or("")
+                    .replace("\\{", "{")
+                    .replace("\\}", "}")
+                    .replace("\\\\", "\\")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pasted_formulas_become_placeholders() {
+        assert_eq!(formulas_in("Energi $E = mc^2$ saja"), vec!["E = mc^2"]);
+        assert_eq!(
+            formulas_in(r"Rumus \(a_1 + b_2\) di tengah"),
+            vec!["a_1 + b_2"]
+        );
+        assert_eq!(
+            formulas_in("Lihat:\n\n\\[\n\\frac{a}{b}\n\\]\n\nlanjut"),
+            vec![r"\frac{a}{b}"]
+        );
+        assert_eq!(formulas_in("$$x^2$$"), vec!["x^2"]);
+        // Prices and lone dollars stay text.
+        assert!(formulas_in("Harga $5 dan $10").is_empty());
+        assert!(formulas_in("biaya $ 5 $ total").is_empty());
+        // `_` inside LaTeX is not italic.
+        let rtf = convert("$a_i b_j$");
+        assert!(!rtf.contains("\\i "), "{rtf}");
+    }
+
+    #[test]
+    fn display_math_alone_counts_as_markdown() {
+        assert!(looks_like_markdown("\\[\nx^2\n\\]"));
+        assert!(looks_like_markdown("$$E=mc^2$$"));
+        assert!(looks_like_markdown("Persamaan $x^2$ dan **tebal**"));
+        assert!(!looks_like_markdown("Harga $5 saja"));
     }
 
     #[test]

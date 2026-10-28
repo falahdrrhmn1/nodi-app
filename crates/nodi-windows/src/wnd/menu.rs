@@ -27,6 +27,12 @@ pub const IDM_FILE_SAVE: u16 = 101;
 pub const IDM_FILE_CLOSE_TAB: u16 = 102;
 pub const IDM_FILE_EXIT: u16 = 103;
 pub const IDM_FILE_EXPORT_MD: u16 = 104;
+/// File > New Tab (Ctrl+T, the tab strip's `+`): a new note in a new tab.
+pub const IDM_FILE_NEW_TAB: u16 = 105;
+pub const IDM_FILE_IMPORT_FILES: u16 = 106;
+pub const IDM_FILE_IMPORT_FOLDER: u16 = 107;
+pub const IDM_FILE_EXPORT_AS: u16 = 108;
+pub const IDM_FILE_EXPORT_FOLDER: u16 = 109;
 
 pub const IDM_EDIT_UNDO: u16 = 110;
 pub const IDM_EDIT_REDO: u16 = 111;
@@ -92,6 +98,7 @@ pub const IDM_VIEW_ZOOM_RESET: u16 = 137;
 pub const IDM_VIEW_MARKDOWN: u16 = 138;
 pub const IDM_VIEW_SPELL: u16 = 139;
 pub const IDM_VIEW_OUTLINE: u16 = 142;
+pub const IDM_VIEW_CTRL_SCROLL: u16 = 143;
 
 pub const IDM_THEME_LIGHT: u16 = 300;
 pub const IDM_THEME_DARK: u16 = 301;
@@ -144,6 +151,11 @@ pub const IDM_TOOLS_OPEN_DATA: u16 = 191;
 pub const IDM_TOOLS_RESTORE_BACKUP: u16 = 192;
 pub const IDM_TOOLS_REBUILD_MIRROR: u16 = 193;
 pub const IDM_TOOLS_MIRROR_TOGGLE: u16 = 194;
+pub const IDM_TOOLS_MIRROR_FOLDER: u16 = 195;
+pub const IDM_TOOLS_MIRROR_DEFAULT: u16 = 196;
+pub const IDM_TOOLS_COPY_AI_PATH: u16 = 197;
+pub const IDM_TOOLS_OPEN_AI_FOLDER: u16 = 198;
+pub const IDM_HELP_AI: u16 = 144;
 
 pub const IDM_INSERT_IMAGE: u16 = 200;
 pub const IDM_INSERT_TABLE: u16 = 201;
@@ -158,6 +170,7 @@ pub const IDM_INSERT_OUTPUT_BLOCK: u16 = 208;
 /// Shortcuts and mirrored in docs/SHORTCUTS.md.
 pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+N", "New note (next to the selected one)"),
+    ("Ctrl+T", "New tab (a new note, like the + after the tabs)"),
     ("Ctrl+Shift+N", "New child note"),
     ("Ctrl+S", "Save now (autosave runs anyway)"),
     ("Ctrl+W / Ctrl+F4", "Close tab"),
@@ -252,11 +265,16 @@ pub fn create_menu() -> HMENU {
 
         let file = popup(&[
             Item::Cmd(IDM_FILE_NEW, "&New Note\tCtrl+N"),
+            Item::Cmd(IDM_FILE_NEW_TAB, "New &Tab\tCtrl+T"),
             Item::Cmd(IDM_FILE_SAVE, "&Save\tCtrl+S"),
             Item::Cmd(IDM_FILE_CLOSE_TAB, "&Close Tab\tCtrl+W"),
             Item::Sep,
             Item::Popup(recent, "Recent &Notes"),
+            Item::Cmd(IDM_FILE_IMPORT_FILES, "&Import Files..."),
+            Item::Cmd(IDM_FILE_IMPORT_FOLDER, "Import &Folder..."),
+            Item::Cmd(IDM_FILE_EXPORT_AS, "&Export Note As... (.md, .rtf, .txt)"),
             Item::Cmd(IDM_FILE_EXPORT_MD, "Export Note as &Markdown..."),
+            Item::Cmd(IDM_FILE_EXPORT_FOLDER, "Export F&older (Markdown)..."),
             Item::Sep,
             Item::Cmd(IDM_FILE_EXIT, "E&xit"),
         ]);
@@ -306,6 +324,7 @@ pub fn create_menu() -> HMENU {
             ),
             Item::Cmd(IDM_VIEW_OUTLINE, "&Outline\tCtrl+Alt+O"),
             Item::Checked(IDM_VIEW_SPELL, "&Spell Check"),
+            Item::Checked(IDM_VIEW_CTRL_SCROLL, "Ctrl+Up/Down &Scrolls the View"),
             Item::Sep,
             Item::Popup(theme_menu(), "T&heme"),
             Item::Sep,
@@ -412,6 +431,10 @@ pub fn create_menu() -> HMENU {
                 IDM_TOOLS_MIRROR_TOGGLE,
                 "Keep Markdown Mirror for AI &Agents",
             ),
+            Item::Cmd(IDM_TOOLS_MIRROR_FOLDER, "AI Mirror &Folder..."),
+            Item::Cmd(IDM_TOOLS_MIRROR_DEFAULT, "Use &Default AI Mirror Folder"),
+            Item::Cmd(IDM_TOOLS_COPY_AI_PATH, "&Copy AI Folder Path"),
+            Item::Cmd(IDM_TOOLS_OPEN_AI_FOLDER, "Open AI &Folder"),
             Item::Sep,
             Item::Cmd(IDM_TOOLS_OPEN_DATA, "&Open Data Folder"),
         ]);
@@ -419,6 +442,7 @@ pub fn create_menu() -> HMENU {
 
         let help = popup(&[
             Item::Cmd(IDM_HELP_SHORTCUTS, "&Keyboard Shortcuts\tF1"),
+            Item::Cmd(IDM_HELP_AI, "Using Nodi with &AI Agents"),
             Item::Cmd(IDM_HELP_ABOUT, "&About Nodi"),
         ]);
         attach(bar, help, "&Help");
@@ -492,6 +516,8 @@ pub fn refresh_recent(app: &mut App) {
 /// Reflects `app.settings` in the View/Tools check marks.
 pub fn sync_settings(app: &App) {
     check_item(app, IDM_VIEW_SPELL, app.settings.spell_check);
+    check_item(app, IDM_VIEW_CTRL_SCROLL, app.settings.ctrl_arrow_scroll);
+    crate::wnd::editkeys::set_ctrl_arrow_scroll(app.settings.ctrl_arrow_scroll);
     check_item(app, IDM_THEME_LIGHT, app.settings.theme == Theme::Light);
     check_item(app, IDM_THEME_DARK, app.settings.theme == Theme::Dark);
     check_item(app, IDM_THEME_CUSTOM, app.settings.theme == Theme::Custom);
@@ -544,6 +570,7 @@ pub fn create_accel() -> HACCEL {
     let key = |ch: u8| u16::from(ch);
     let accels = [
         accel(ctrl, key(b'N'), IDM_FILE_NEW),
+        accel(ctrl, key(b'T'), IDM_FILE_NEW_TAB),
         accel(ctrl_shift, key(b'N'), IDM_NOTES_NEW_CHILD),
         accel(ctrl, key(b'S'), IDM_FILE_SAVE),
         accel(ctrl, key(b'W'), IDM_FILE_CLOSE_TAB),
@@ -623,19 +650,25 @@ fn report(app: &mut App, outcome: Result<(), String>) {
 
 pub fn on_command(app: &mut App, id: u16) {
     match id {
-        IDM_FILE_NEW => app.create_note(NodeKind::Note, false),
+        IDM_FILE_NEW | IDM_FILE_NEW_TAB => app.create_note(NodeKind::Note, false),
         IDM_FILE_SAVE => {
             app.save_active();
             status::set_message(app, "Saving...");
         }
         IDM_FILE_CLOSE_TAB => app.close_active_tab(),
         IDM_FILE_EXPORT_MD => app::export_markdown(app),
+        IDM_FILE_EXPORT_AS => crate::wnd::import::export_note(app),
+        IDM_FILE_EXPORT_FOLDER => crate::wnd::import::export_folder(app),
+        IDM_FILE_IMPORT_FILES => crate::wnd::import::import_files(app),
+        IDM_FILE_IMPORT_FOLDER => crate::wnd::import::import_folder(app),
         IDM_FILE_EXIT => {
             // SAFETY: posting to our own top-level window.
             unsafe {
                 PostMessageW(app.hwnd, WM_CLOSE, 0, 0);
             }
         }
+        // Ctrl+Z with the Notes Explorer focused undoes the last tree change.
+        IDM_EDIT_UNDO if app.tree_has_focus() => app.undo_tree_change(),
         IDM_EDIT_UNDO | IDM_EDIT_REDO | IDM_EDIT_CUT | IDM_EDIT_COPY | IDM_EDIT_PASTE
         | IDM_EDIT_SELECT_ALL | IDM_EDIT_PASTE_PLAIN => editor::command(app, id),
         IDM_EDIT_DUPLICATE_LINE => with_editor(app, editor::duplicate_line),
@@ -750,6 +783,7 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_VIEW_MARKDOWN => app::show_markdown(app),
         IDM_VIEW_OUTLINE => app::show_outline(app),
         IDM_VIEW_SPELL => app.toggle_spell_check(),
+        IDM_VIEW_CTRL_SCROLL => app.toggle_ctrl_arrow_scroll(),
         IDM_THEME_LIGHT => app.set_theme(Theme::Light),
         IDM_THEME_DARK => app.set_theme(Theme::Dark),
         IDM_THEME_CUSTOM => app::choose_custom_theme(app),
@@ -796,6 +830,13 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_TOOLS_RESTORE_BACKUP => app.restore_backup_ui(),
         IDM_TOOLS_REBUILD_MIRROR => app.rebuild_mirror(),
         IDM_TOOLS_MIRROR_TOGGLE => app.toggle_mirror(),
+        IDM_TOOLS_MIRROR_FOLDER => app.choose_mirror_folder(),
+        IDM_TOOLS_MIRROR_DEFAULT => {
+            let _ = app.set_mirror_folder(None);
+        }
+        IDM_TOOLS_COPY_AI_PATH => app.copy_ai_folder_path(),
+        IDM_TOOLS_OPEN_AI_FOLDER => app.open_ai_folder(),
+        IDM_HELP_AI => app.explain_ai_mirror(),
         IDM_TOOLS_OPEN_DATA => app.open_data_folder(),
         IDM_HELP_ABOUT => dialogs::about(app.hwnd),
         IDM_HELP_SHORTCUTS => dialogs::shortcuts(app.hwnd),

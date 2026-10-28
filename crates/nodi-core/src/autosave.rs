@@ -147,6 +147,10 @@ struct Pending {
 /// How long the writer must be idle before it updates the Markdown mirror.
 pub const MIRROR_DELAY: Duration = Duration::from_millis(300);
 
+/// How long a failed `tree.json` / `session.json` write waits before the
+/// writer tries again (note saves are retried by the UI).
+pub const RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Writer-side state of the Markdown mirror.
 struct MirrorState {
     enabled: bool,
@@ -270,7 +274,8 @@ impl Pending {
                     let outcome = data
                         .atomic_write(&data.tree_path(), json.as_bytes())
                         .map_err(|err| err.to_string());
-                    if outcome.is_ok() {
+                    let failed = outcome.is_err();
+                    if !failed {
                         state.tree = Some(tree);
                         tree_written = true;
                     }
@@ -279,6 +284,12 @@ impl Pending {
                         seq: 0,
                         result: outcome,
                     });
+                    if failed {
+                        // Kept and retried (see `RETRY_DELAY`): a tree change
+                        // must not wait for the next one to reach the disk.
+                        // A newer tree submitted meanwhile replaces it.
+                        self.tree = Some(json);
+                    }
                 }
                 Err(err) => notify(SaveResult {
                     target: Target::Tree,
@@ -315,17 +326,24 @@ impl Pending {
         }
 
         if let Some(json) = self.session.take() {
-            let outcome = match serde_json::from_str::<Session>(&json) {
-                Ok(_) => data
-                    .atomic_write(&data.session_path(), json.as_bytes())
-                    .map_err(|err| err.to_string()),
-                Err(err) => Err(format!("refusing invalid session.json: {err}")),
+            let (outcome, retry) = match serde_json::from_str::<Session>(&json) {
+                Ok(_) => {
+                    let outcome = data
+                        .atomic_write(&data.session_path(), json.as_bytes())
+                        .map_err(|err| err.to_string());
+                    let retry = outcome.is_err();
+                    (outcome, retry)
+                }
+                Err(err) => (Err(format!("refusing invalid session.json: {err}")), false),
             };
             notify(SaveResult {
                 target: Target::Session,
                 seq: 0,
                 result: outcome,
             });
+            if retry {
+                self.session = Some(json);
+            }
         }
 
         if let Some((json, full)) = self.mirror_rebuild.take() {
@@ -368,11 +386,17 @@ fn run(data: DataDir, rx: Receiver<Message>, notify: Box<dyn Fn(SaveResult) + Se
         requested: None,
     };
     loop {
-        let first = if state.has_work() {
-            match rx.recv_timeout(MIRROR_DELAY) {
+        let retrying = !pending.is_empty();
+        let first = if retrying || state.has_work() {
+            let delay = if retrying { RETRY_DELAY } else { MIRROR_DELAY };
+            match rx.recv_timeout(delay) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
-                    state.run(&data, notify.as_ref());
+                    if retrying {
+                        pending.flush(&data, notify.as_ref(), &mut last_written, &mut state);
+                    } else {
+                        state.run(&data, notify.as_ref());
+                    }
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => break,

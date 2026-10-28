@@ -18,7 +18,7 @@ use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_BACK, VK_CONTROL, VK_INSERT, VK_MENU, VK_RETURN, VK_SHIFT,
+    GetKeyState, VK_BACK, VK_CONTROL, VK_DOWN, VK_INSERT, VK_MENU, VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -42,6 +42,14 @@ thread_local! {
     static SWALLOW_SYN: Cell<bool> = const { Cell::new(false) };
     /// The last `- `/`1. ` marker conversion, until the user types anything.
     static MARKER_UNDO: RefCell<Option<MarkerUndo>> = const { RefCell::new(None) };
+    /// View > "Ctrl+Up/Down Scrolls the View" (mirrors `Settings`).
+    static CTRL_ARROW_SCROLL: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Ctrl+Up/Down scroll the view by one line without moving the caret
+/// (Notepad++) when on; Rich Edit's paragraph jump when off.
+pub fn set_ctrl_arrow_scroll(enabled: bool) {
+    CTRL_ARROW_SCROLL.with(|flag| flag.set(enabled));
 }
 
 pub fn install(editor: HWND, frame: HWND) {
@@ -152,6 +160,15 @@ unsafe extern "system" fn subclass(
         }
         WM_KEYDOWN => {
             let key = wparam as u16;
+            if ctrl
+                && !alt
+                && !shift
+                && (key == VK_UP || key == VK_DOWN)
+                && CTRL_ARROW_SCROLL.with(|flag| flag.get())
+            {
+                editor::scroll_lines(hwnd, if key == VK_UP { -1 } else { 1 });
+                return 0;
+            }
             if ctrl || alt {
                 if key == VK_RETURN {
                     clear_marker_undo();
@@ -533,13 +550,13 @@ fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
         if !image::clipboard_has_rtf() {
             if let Some(html) = image::clipboard_html(frame) {
                 let markdown = nodi_core::html_in::cf_html_to_markdown(&html);
-                if paste_markdown(editor, &markdown) {
+                if paste_markdown(editor, frame, &markdown) {
                     return true;
                 }
             }
             if let Some(text) = image::clipboard_text(frame) {
                 if nodi_core::markdown_in::looks_like_markdown(&text)
-                    && paste_markdown(editor, &text)
+                    && paste_markdown(editor, frame, &text)
                 {
                     return true;
                 }
@@ -561,11 +578,30 @@ fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
     }
 }
 
-/// Converts Markdown to the RTF Nodi uses and inserts it at the caret.
-fn paste_markdown(editor: HWND, markdown: &str) -> bool {
+/// Converts Markdown to the RTF Nodi uses and inserts it at the caret, then
+/// renders the formulas it carried.
+fn paste_markdown(editor: HWND, frame: HWND, markdown: &str) -> bool {
     if markdown.trim().is_empty() {
         return false;
     }
     let rtf = nodi_core::markdown_in::markdown_to_rtf(markdown, format::full_width_twips(editor));
-    editor::insert_rtf(editor, rtf.as_bytes())
+    if !editor::insert_rtf(editor, rtf.as_bytes()) {
+        return false;
+    }
+    let (rendered, kept) = crate::wnd::formula::render_pasted(editor);
+    if rendered > 0 || !kept.is_empty() {
+        let mut message = format!("Pasted with {rendered} formula(s)");
+        if !kept.is_empty() {
+            message.push_str(&format!(
+                "; {} kept as text (unsupported LaTeX): {}",
+                kept.len(),
+                kept.join(", ")
+            ));
+        }
+        // SAFETY: `frame` is our main window, alive while its editors are.
+        if let Some(app) = unsafe { crate::wnd::app_mut(frame) } {
+            crate::wnd::status::set_message(app, &message);
+        }
+    }
+    true
 }

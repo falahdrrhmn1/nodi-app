@@ -15,6 +15,7 @@ pub mod backup;
 pub mod html_in;
 pub mod id;
 pub mod image;
+pub mod import;
 pub mod links;
 pub mod markdown;
 pub mod markdown_in;
@@ -28,4 +29,4 @@ pub mod tree;
 
 pub use id::NoteId;
 pub use storage::{CustomTheme, DataDir, Session, Settings, TabState, Theme, WindowRect};
-pub use tree::{Node, NodeKind, Tree, TreeError};
+pub use tree::{Node, NodeKind, Tree, TreeError, TreeUndo};
