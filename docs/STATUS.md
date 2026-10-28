@@ -41,10 +41,16 @@ same handlers as the menus.
 | extra — picture crop | crop left/top/right/bottom survives save and restart | **PASS** (e2e AD) |
 | extra — local path links | typed, quoted and pasted `C:\…` paths become links and export back as paths | **PASS** (e2e AE) |
 | extra — tree drag & drop | `before` / `after` / `inside`, cycle refusal, dense order, Move Up/Top Level, restart | **PASS** (e2e AF) |
+| extra — dark theme | persisted in `settings.json`, editor pixel is dark, text stays *automatic* in the stored RTF and after switching back | **PASS** (e2e AG + screenshots) |
+| extra — AI Markdown mirror | front matter, rename + move follow, old file kept in `.trash/`, `INDEX.md`, `index.json` | **PASS** (e2e AH + 5 unit tests) |
+| extra — word/char counts | note and selection counts in the status bar | **PASS** (e2e AI) |
+| extra — tab menu | Close Others keeps one tab, notes untouched | **PASS** (e2e AJ) |
+| extra — restore backup | Backup Now, rename, restore → old title back, current state snapshotted first | **PASS** (e2e AK) |
+| extra — recent notes, outline shortcut | recent list stored in the session; Ctrl+Alt+O with real keys | **PASS** (e2e AL) |
 
-Unit and integration tests: `cargo test` — 115 tests pass (nodi-core: tree,
-storage, autosave, backup, search, links, image, RTF, Markdown import/export,
-HTML import, LaTeX parser, math layout, PNG; nodi-windows: table structure,
+Unit and integration tests: `cargo test` — all pass (nodi-core: tree,
+storage, autosave, backup, Markdown mirror, search, links, image, RTF and theme
+colours, Markdown import/export, HTML import, LaTeX parser, math layout, PNG; nodi-windows: table structure,
 link parsing/safety). `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` are clean.
 
@@ -148,6 +154,21 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   expanded folders, zoom, word wrap.
 - Markdown: read-only Markdown view and export (`.md` + picture folder),
   lossy features listed.
+- **Themes**: View > Theme > Light / Dark / Custom... (background, text and
+  accent colours). Applies to all tabs immediately and persists. The editor,
+  tree, tabs, format bar, status bar and title bar follow the theme; menus and
+  the icon toolbar stay light (Windows has no supported dark menus, and the
+  standard toolbar glyphs are black). Notes keep their real colours on disk.
+- **AI Markdown mirror** (Tools > Keep Markdown Mirror for AI Agents, on by
+  default; Tools > Rebuild AI Markdown Mirror): `data\markdown\` holds every
+  note as `.md` with front matter, plus `INDEX.md` and `index.json`. Point an
+  AI agent at that folder and start with `INDEX.md`.
+- Status bar word and character counts (note or selection); View > Spell
+  Check (Rich Edit's own); tab right-click menu (Close, Close Others, Close
+  All, Copy Internal Link, Reveal in Tree) and middle-click to close; File >
+  Recent (last 10); View > Outline (Ctrl+Alt+O) lists the headings and jumps
+  to one; Tools > Restore Backup... (snapshots the current state first);
+  Change Icon... > From file... (`.ico`/`.png`, copied to `data\icons`).
 - Portable build (`scripts/build.ps1` → `dist\Nodi`), data next to the exe.
 
 ### Not done yet / limitations
@@ -158,9 +179,6 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   (crop and exact size are).
 - Dragging picture files from Explorer into a note is not implemented
   (Insert > Image and paste work).
-- Custom icons from local files are not implemented (8 built-in icons).
-- No restore-from-backup menu yet (backups are plain folders in
-  `data\backups`; the app offers a restore only when `tree.json` is corrupt).
 - Formula evaluation (calculating results) is not implemented — rendering only.
 - Older small dialogs (icon picker, Trash, note picker) do not scale with DPI.
 - All tabs of the previous session are loaded at startup (150 tabs ≈ 2.2 s).

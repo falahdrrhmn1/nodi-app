@@ -99,6 +99,9 @@ pub fn insert(editor: HWND, rows: usize, cols: usize) -> Result<(), String> {
     let rows = rows.clamp(1, 255);
     let cols = cols.clamp(1, MAX_CELLS);
     let at = crate::wnd::format::prepare_block(editor);
+    // The caret may inherit an explicit colour (e.g. the grey label of a pasted
+    // code block). New cells must use the automatic text colour instead.
+    crate::wnd::format::set_text_color(editor, None);
     let width = full_width_twips(editor) / cols as i32;
     let cells = vec![plain_cell(width.max(400)); cols];
     let row = row_parms(cols, rows, -1);

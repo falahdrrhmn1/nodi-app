@@ -26,6 +26,10 @@ const WM_USER: u32 = 0x0400;
 
 pub const EM_GETCHARFORMAT: u32 = WM_USER + 58;
 pub const EM_SETCHARFORMAT: u32 = WM_USER + 68;
+pub const EM_SETBKGNDCOLOR: u32 = WM_USER + 67;
+pub const EM_SETLANGOPTIONS: u32 = WM_USER + 120;
+pub const EM_GETLANGOPTIONS: u32 = WM_USER + 121;
+pub const EM_SETEDITSTYLEEX: u32 = WM_USER + 275;
 pub const EM_SETEVENTMASK: u32 = WM_USER + 69;
 pub const EM_SETTEXTMODE: u32 = WM_USER + 89;
 pub const EM_EXGETSEL: u32 = WM_USER + 52;
@@ -271,6 +275,9 @@ pub fn create(app: &App) -> Option<HWND> {
     crate::wnd::editkeys::install(window, app.hwnd);
     crate::wnd::link::enable_auto_detect(window);
     set_word_wrap(window, app.word_wrap);
+    set_background(window, app.palette.editor_bg);
+    apply_default_colour(window);
+    set_spell_check(window, app.settings.spell_check);
     if app.zoom != 100 {
         set_zoom_percent(window, app.zoom);
     }
@@ -318,12 +325,49 @@ pub fn set_change_events(editor: HWND, enabled: bool) {
     }
 }
 
+/// Sets the editor background (`EM_SETBKGNDCOLOR`).
+pub fn set_background(editor: HWND, colour: u32) {
+    // SAFETY: `editor` is a live Rich Edit control.
+    unsafe {
+        SendMessageW(editor, EM_SETBKGNDCOLOR, 0, colour as isize);
+    }
+}
+
+/// Rich Edit's built-in spell checking (Windows 8+). Off unless the user asks
+/// for it; the language options are read-modify-written so font options stay.
+pub fn set_spell_check(editor: HWND, enabled: bool) {
+    const IMF_SPELLCHECKING: u32 = 0x0000_0800;
+    /// The SDK value is not exported by `windows-sys`; see `EM_SETEDITSTYLEEX`.
+    const SES_EX_USETEXTSERVICES: usize = 0x0000_0002;
+    // SAFETY: both messages only read/write the control's own options.
+    unsafe {
+        let options = SendMessageW(editor, EM_GETLANGOPTIONS, 0, 0) as u32;
+        let updated = if enabled {
+            options | IMF_SPELLCHECKING
+        } else {
+            options & !IMF_SPELLCHECKING
+        };
+        SendMessageW(editor, EM_SETLANGOPTIONS, 0, updated as isize);
+        let flags = if enabled { SES_EX_USETEXTSERVICES } else { 0 };
+        SendMessageW(
+            editor,
+            EM_SETEDITSTYLEEX,
+            flags,
+            SES_EX_USETEXTSERVICES as isize,
+        );
+    }
+}
+
 /// Clears the editor (a missing note file is an empty note).
 pub fn clear(editor: HWND) {
     let empty = win::wide("");
     // SAFETY: `empty` is NUL terminated; `editor` is our control.
     unsafe {
         SendMessageW(editor, WM_SETTEXT, 0, empty.as_ptr() as isize);
+    }
+    apply_default_colour(editor);
+    // SAFETY: as above.
+    unsafe {
         SendMessageW(editor, EM_SETMODIFY, 0, 0);
         SendMessageW(editor, EM_EMPTYUNDOBUFFER, 0, 0);
     }
@@ -337,6 +381,7 @@ pub fn load_rtf(editor: HWND, bytes: &[u8]) -> bool {
         return true;
     }
     let ok = stream_in(editor, bytes, SF_RTF);
+    apply_default_colour(editor);
 
     // SAFETY: the control is alive and owned by us.
     unsafe {
@@ -375,8 +420,25 @@ fn stream_in(editor: HWND, bytes: &[u8], flags: usize) -> bool {
 }
 
 /// Streams the whole document out as RTF. `None` when Rich Edit failed.
+/// The colours are the stored ones: dark-theme display colours are folded
+/// back to automatic / black.
 pub fn stream_out_rtf(editor: HWND) -> Option<Vec<u8>> {
-    stream_out(editor, SF_RTF)
+    stream_out(editor, SF_RTF).map(fold_display_colours)
+}
+
+/// Undoes the dark-theme display colours in streamed-out RTF.
+fn fold_display_colours(rtf: Vec<u8>) -> Vec<u8> {
+    match DISPLAY_COLOURS.with(|cell| cell.get()) {
+        Some((auto, black)) => {
+            let text = String::from_utf8_lossy(&rtf);
+            nodi_core::rtf::fold_theme_colors(&text, rgb_parts(auto), rgb_parts(black)).into_bytes()
+        }
+        None => rtf,
+    }
+}
+
+fn rgb_parts(colour: u32) -> (u8, u8, u8) {
+    (colour as u8, (colour >> 8) as u8, (colour >> 16) as u8)
 }
 
 /// `EM_STREAMOUT` into a byte vector with the given `SF_*` flags.
@@ -438,6 +500,76 @@ pub fn plain_text(editor: HWND) -> String {
     String::from_utf16_lossy(&units)
 }
 
+const CFM_COLOR: u32 = 0x4000_0000;
+const CFE_AUTOCOLOR: u32 = 0x4000_0000;
+
+thread_local! {
+    /// Display colours of a dark theme as `(auto, black)` COLORREFs, or `None`
+    /// in the light theme. Rich Edit always paints automatic text with the
+    /// system window-text colour (black), so while a dark theme is active
+    /// automatic and pure-black text are *shown* in these near-white colours;
+    /// [`crate::wnd::theme::fold_bytes`] turns them back before every save.
+    static DISPLAY_COLOURS: std::cell::Cell<Option<(u32, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Sets the dark-theme display colours (see [`DISPLAY_COLOURS`]).
+pub fn set_display_colours(colours: Option<(u32, u32)>) {
+    DISPLAY_COLOURS.with(|cell| cell.set(colours));
+}
+
+/// Maps automatic / black text to the dark-theme display colours.
+fn to_display(format: &mut CharFormat2W) {
+    let Some((auto, black)) = DISPLAY_COLOURS.with(|cell| cell.get()) else {
+        return;
+    };
+    if format.dw_mask & CFM_COLOR == 0 {
+        return;
+    }
+    if format.dw_effects & CFE_AUTOCOLOR != 0 {
+        format.dw_effects &= !CFE_AUTOCOLOR;
+        format.cr_text_color = auto;
+    } else if format.cr_text_color == 0 {
+        format.cr_text_color = black;
+    }
+}
+
+/// Reverses [`to_display`], so callers always see the stored colours.
+fn from_display(format: &mut CharFormat2W) {
+    let Some((auto, black)) = DISPLAY_COLOURS.with(|cell| cell.get()) else {
+        return;
+    };
+    if format.dw_mask & CFM_COLOR == 0 || format.dw_effects & CFE_AUTOCOLOR != 0 {
+        return;
+    }
+    if format.cr_text_color == auto {
+        format.dw_effects |= CFE_AUTOCOLOR;
+        format.cr_text_color = 0;
+    } else if format.cr_text_color == black {
+        format.cr_text_color = 0;
+    }
+}
+
+/// Makes text typed into an empty note use the theme's automatic colour.
+pub fn apply_default_colour(editor: HWND) {
+    let mut format = CharFormat2W {
+        cb_size: size_of::<CharFormat2W>() as u32,
+        dw_mask: CFM_COLOR,
+        dw_effects: CFE_AUTOCOLOR,
+        ..CharFormat2W::default()
+    };
+    to_display(&mut format);
+    // SAFETY: the format lives on the stack for the duration of the call.
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_SETCHARFORMAT,
+            SCF_DEFAULT,
+            &format as *const CharFormat2W as isize,
+        );
+    }
+}
+
 /// Character format of the current selection (`dw_mask` says which fields are
 /// uniform across it).
 pub fn selection_format(editor: HWND) -> CharFormat2W {
@@ -454,6 +586,7 @@ pub fn selection_format(editor: HWND) -> CharFormat2W {
             &mut format as *mut CharFormat2W as isize,
         );
     }
+    from_display(&mut format);
     format
 }
 
@@ -461,6 +594,7 @@ pub fn selection_format(editor: HWND) -> CharFormat2W {
 pub fn set_selection_format(editor: HWND, format: &CharFormat2W) {
     let mut format = *format;
     format.cb_size = size_of::<CharFormat2W>() as u32;
+    to_display(&mut format);
     // SAFETY: `format` is a valid `CHARFORMAT2W` for the call.
     unsafe {
         SendMessageW(
@@ -690,12 +824,20 @@ const SFF_SELECTION: usize = 0x8000;
 
 /// RTF of the current selection.
 pub fn selection_rtf(editor: HWND) -> Option<Vec<u8>> {
-    stream_out(editor, SF_RTF | SFF_SELECTION)
+    stream_out(editor, SF_RTF | SFF_SELECTION).map(fold_display_colours)
 }
 
 /// Replaces the selection with RTF (keeps formatting, pictures, fields).
 pub fn insert_rtf(editor: HWND, rtf: &[u8]) -> bool {
-    stream_in(editor, rtf, SF_RTF | SFF_SELECTION)
+    match DISPLAY_COLOURS.with(|cell| cell.get()) {
+        Some((auto, black)) => {
+            let text = String::from_utf8_lossy(rtf);
+            let themed =
+                nodi_core::rtf::apply_theme_colors(&text, rgb_parts(auto), rgb_parts(black));
+            stream_in(editor, themed.as_bytes(), SF_RTF | SFF_SELECTION)
+        }
+        None => stream_in(editor, rtf, SF_RTF | SFF_SELECTION),
+    }
 }
 
 /// Number of pictures in the document. Rich Edit reports a picture as a plain

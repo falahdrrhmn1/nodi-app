@@ -6,7 +6,10 @@ use std::ptr;
 use nodi_core::tree::Position;
 use nodi_core::{NodeKind, NoteId};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows_sys::Win32::Graphics::Gdi::{
+    ClientToScreen, CreateBitmap, CreateDIBSection, DeleteObject, ScreenToClient, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, RGBQUAD,
+};
 use windows_sys::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_LEFT, SS_NOPREFIX};
 use windows_sys::Win32::UI::Controls::{
     ImageList_BeginDrag, ImageList_Create, ImageList_DragEnter, ImageList_DragLeave,
@@ -30,11 +33,12 @@ use windows_sys::Win32::UI::Shell::{
     SIID_WARNING,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyIcon, DestroyMenu, GetClientRect,
-    GetCursorPos, KillTimer, PostMessageW, SendMessageW, SetMenuDefaultItem, SetTimer,
-    SetWindowTextW, TrackPopupMenu, HICON, HMENU, MF_SEPARATOR, MF_STRING, SB_LINEDOWN, SB_LINEUP,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_TIMER, WM_VSCROLL, WS_CHILD, WS_EX_CLIENTEDGE, WS_VISIBLE,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DestroyIcon, DestroyMenu,
+    GetClientRect, GetCursorPos, KillTimer, LoadImageW, PostMessageW, SendMessageW,
+    SetMenuDefaultItem, SetTimer, SetWindowTextW, TrackPopupMenu, HICON, HMENU, ICONINFO,
+    IMAGE_ICON, LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING, SB_LINEDOWN, SB_LINEUP, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_TIMER, WM_VSCROLL,
+    WS_CHILD, WS_EX_CLIENTEDGE, WS_VISIBLE,
 };
 
 use crate::app::App;
@@ -233,6 +237,146 @@ fn extract(module: &str, resource: i32, fallback: SHSTOCKICONID) -> HICON {
         small
     } else {
         large
+    }
+}
+
+/// Appends a user-chosen icon file (`.ico` or `.png`) to the shared image list
+/// and to `icon_keys`. Returns false when the file cannot be used.
+pub fn add_icon(app: &mut App, key: &'static str, path: &std::path::Path) -> bool {
+    if app.images == 0 {
+        return false;
+    }
+    let icon = icon_from_file(path);
+    if icon.is_null() {
+        return false;
+    }
+    // SAFETY: `app.images` is our image list; the list copies the icon.
+    let index = unsafe { ImageList_ReplaceIcon(app.images, -1, icon) };
+    // SAFETY: the list made its own copy.
+    unsafe {
+        DestroyIcon(icon);
+    }
+    if index < 0 {
+        return false;
+    }
+    app.icon_keys.push(key);
+    true
+}
+
+/// Loads an `.ico` with `LoadImage`, or decodes a `.png` (16–32 px) into an
+/// icon. Small files only: this is a tree glyph, not note content.
+fn icon_from_file(path: &std::path::Path) -> HICON {
+    let is_png = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+    if !is_png {
+        let wide = win::wide(&path.to_string_lossy());
+        // SAFETY: the path buffer outlives the call; LoadImage copies the icon.
+        let icon = unsafe {
+            LoadImageW(
+                ptr::null_mut(),
+                wide.as_ptr(),
+                IMAGE_ICON,
+                16,
+                16,
+                LR_LOADFROMFILE,
+            )
+        };
+        if !icon.is_null() {
+            return icon;
+        }
+        return ptr::null_mut();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return ptr::null_mut();
+    };
+    let Ok(image) = nodi_core::png::decode(&bytes) else {
+        return ptr::null_mut();
+    };
+    if image.width == 0 || image.height == 0 || image.width > 256 || image.height > 256 {
+        return ptr::null_mut();
+    }
+    icon_from_rgba(&image)
+}
+
+/// 16×16 BGRA icon from a decoded PNG (nearest-neighbour scale + centre).
+fn icon_from_rgba(image: &nodi_core::png::Rgba) -> HICON {
+    const SIZE: u32 = 16;
+    let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
+    let scale = (image.width.max(image.height) as f32 / SIZE as f32).max(1.0);
+    let drawn_w = (image.width as f32 / scale).round().max(1.0) as u32;
+    let drawn_h = (image.height as f32 / scale).round().max(1.0) as u32;
+    let offset_x = (SIZE - drawn_w) / 2;
+    let offset_y = (SIZE - drawn_h) / 2;
+    for y in 0..drawn_h {
+        for x in 0..drawn_w {
+            let source_x = (x as f32 * scale) as u32;
+            let source_y = (y as f32 * scale) as u32;
+            let Some((red, green, blue, alpha)) = image.pixel(source_x, source_y) else {
+                continue;
+            };
+            let at = (((y + offset_y) * SIZE + x + offset_x) * 4) as usize;
+            pixels[at] = blue;
+            pixels[at + 1] = green;
+            pixels[at + 2] = red;
+            pixels[at + 3] = alpha;
+        }
+    }
+
+    // SAFETY: all GDI calls below create objects this function owns and frees.
+    unsafe {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: SIZE as i32,
+                // Negative height: top-down rows, the order `pixels` uses.
+                biHeight: -(SIZE as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [RGBQUAD {
+                rgbBlue: 0,
+                rgbGreen: 0,
+                rgbRed: 0,
+                rgbReserved: 0,
+            }],
+        };
+        let mut bits: *mut core::ffi::c_void = ptr::null_mut();
+        let colour = CreateDIBSection(
+            ptr::null_mut(),
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            ptr::null_mut(),
+            0,
+        );
+        if colour.is_null() || bits.is_null() {
+            return ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
+        // A zero mask marks every pixel as opaque; the PNG alpha channel in
+        // the colour bitmap does the real blending.
+        let mask = CreateBitmap(SIZE as i32, SIZE as i32, 1, 1, ptr::null());
+        let icon_info = ICONINFO {
+            fIcon: 1,
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask,
+            hbmColor: colour,
+        };
+        let icon = CreateIconIndirect(&icon_info);
+        DeleteObject(colour);
+        if !mask.is_null() {
+            DeleteObject(mask);
+        }
+        icon
     }
 }
 

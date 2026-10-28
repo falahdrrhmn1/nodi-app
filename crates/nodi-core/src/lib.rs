@@ -19,11 +19,13 @@ pub mod links;
 pub mod markdown;
 pub mod markdown_in;
 pub mod math;
+pub mod mirror;
+pub mod png;
 pub mod rtf;
 pub mod search;
 pub mod storage;
 pub mod tree;
 
 pub use id::NoteId;
-pub use storage::{DataDir, Session, TabState, WindowRect};
+pub use storage::{CustomTheme, DataDir, Session, Settings, TabState, Theme, WindowRect};
 pub use tree::{Node, NodeKind, Tree, TreeError};

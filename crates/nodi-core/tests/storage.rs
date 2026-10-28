@@ -163,6 +163,7 @@ fn session_round_trip() {
         expanded: vec![note_b.clone()],
         word_wrap: false,
         zoom: 125,
+        recent: vec![note_b.clone(), note_a.clone()],
     };
     data.save_session(&session).expect("save session");
     let loaded = data.load_session().expect("load session");

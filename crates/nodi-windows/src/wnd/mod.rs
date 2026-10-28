@@ -12,9 +12,11 @@ pub mod formula;
 pub mod image;
 pub mod link;
 pub mod menu;
+pub mod outline;
 pub mod status;
 pub mod table;
 pub mod tabs;
+pub mod theme;
 pub mod toolbar;
 pub mod tree;
 
@@ -23,15 +25,15 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, DeleteObject, EndPaint, FillRect, GetSysColor, GetSysColorBrush,
-    InvalidateRect, LineTo, MoveToEx, ScreenToClient, SelectObject, UpdateWindow, COLOR_3DFACE,
-    COLOR_3DSHADOW, HBRUSH, HDC, PAINTSTRUCT, PS_SOLID,
+    BeginPaint, CreatePen, DeleteObject, EndPaint, FillRect, GetSysColorBrush, InvalidateRect,
+    LineTo, MoveToEx, ScreenToClient, SelectObject, SetBkColor, SetTextColor, UpdateWindow,
+    COLOR_3DFACE, HBRUSH, HDC, PAINTSTRUCT, PS_SOLID,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows_sys::Win32::System::Ole::OleInitialize;
 use windows_sys::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
+    InitCommonControlsEx, DRAWITEMSTRUCT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
     ICC_TREEVIEW_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR, TCN_SELCHANGE,
 };
 use windows_sys::Win32::UI::HiDpi::{
@@ -51,10 +53,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HTCLIENT, IDI_APPLICATION, MB_ICONERROR, MB_OK,
     MINMAXINFO, MSG, SIZE_MINIMIZED, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_CREATE,
-    WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_QUERYENDSESSION,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN,
-    WS_OVERLAPPEDWINDOW,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ENDSESSION, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NOTIFY, WM_PAINT, WM_QUERYENDSESSION, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, IsDialogMessageW};
 
@@ -315,6 +317,7 @@ unsafe fn create_ui(app: &mut App) -> bool {
 
     tree::create_images(app);
     tree::install_subclass(app);
+    tabs::install_subclass(app);
     app::apply_fonts(app);
     toolbar::refresh_height(app);
 
@@ -323,6 +326,9 @@ unsafe fn create_ui(app: &mut App) -> bool {
     if !app.startup() {
         return false;
     }
+
+    // Settings are known now: theme the chrome before the first paint.
+    theme::apply(app);
 
     layout(app);
     // Pane geometry only exists after the first layout pass, so set the static
@@ -503,10 +509,15 @@ unsafe fn paint_splitter(app: &App) {
 
     let mut client: RECT = std::mem::zeroed();
     GetClientRect(app.hwnd, &mut client);
-    FillRect(hdc, &client, GetSysColorBrush(COLOR_3DFACE));
+    let brush = if app.background_brush.is_null() {
+        GetSysColorBrush(COLOR_3DFACE)
+    } else {
+        app.background_brush
+    };
+    FillRect(hdc, &client, brush);
 
     let x = app.sidebar_width + SPLITTER_WIDTH / 2;
-    let pen = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_3DSHADOW));
+    let pen = CreatePen(PS_SOLID, 1, app.palette.border);
     if !pen.is_null() {
         let previous = SelectObject(hdc, pen);
         MoveToEx(hdc, x, 0, ptr::null_mut());
@@ -670,6 +681,18 @@ pub unsafe extern "system" fn wndproc(
                     };
                     tree::show_context_menu(app, screen);
                     handled = true;
+                } else if wparam as HWND == app.tabctrl {
+                    let screen = (lparam != -1).then(|| POINT {
+                        x: win::x_from_lparam(lparam),
+                        y: win::y_from_lparam(lparam),
+                    });
+                    let index = screen
+                        .and_then(|point| tabs::index_at(app, point))
+                        .or_else(|| tabs::cur_sel(app));
+                    if let Some(index) = index {
+                        tabs::show_context_menu(app, index, screen);
+                    }
+                    handled = true;
                 } else if app.tab_index(wparam as HWND).is_some() {
                     let screen = (lparam != -1).then(|| POINT {
                         x: win::x_from_lparam(lparam),
@@ -693,6 +716,9 @@ pub unsafe extern "system" fn wndproc(
             }
             let header = &*header;
             if let Some(app) = app_mut(hwnd) {
+                if let Some(result) = theme::on_notify(app, header, lparam) {
+                    return result;
+                }
                 if tree::handle_notify(app, header) {
                     return 0;
                 }
@@ -703,6 +729,7 @@ pub unsafe extern "system" fn wndproc(
                 {
                     crate::wnd::format::update_heading_marker(header.hwndFrom);
                     status::update_caret(app);
+                    status::update_counts(app);
                     toolbar::sync_format(app);
                 } else if header.code == link::EN_LINK && app.tab_index(header.hwndFrom).is_some() {
                     // SAFETY: Rich Edit sends an ENLINK for EN_LINK.
@@ -723,6 +750,31 @@ pub unsafe extern "system" fn wndproc(
                 find::on_message(app);
             }
             0
+        }
+
+        WM_DRAWITEM => {
+            if let Some(app) = app_mut(hwnd) {
+                let item = &*(lparam as *const DRAWITEMSTRUCT);
+                if item.hwndItem == app.status && status::draw_item(app, item) {
+                    return 0;
+                }
+                if item.hwndItem == app.tabctrl && tabs::draw_item(app, item) {
+                    return 0;
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        WM_CTLCOLORSTATIC => {
+            if let Some(app) = app_mut(hwnd) {
+                // `wparam` is the control's HDC, `lparam` the control.
+                if lparam as HWND == app.sidebar_title && !app.background_brush.is_null() {
+                    SetTextColor(wparam as HDC, app.palette.window_text);
+                    SetBkColor(wparam as HDC, app.palette.window_bg);
+                    return app.background_brush as LRESULT;
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
         WM_PAINT => {
@@ -746,7 +798,11 @@ pub unsafe extern "system" fn wndproc(
             if !hdc.is_null() {
                 let mut client: RECT = std::mem::zeroed();
                 if GetClientRect(hwnd, &mut client) != 0 {
-                    FillRect(hdc, &client, GetSysColorBrush(COLOR_3DFACE));
+                    let brush = match app_mut(hwnd) {
+                        Some(app) if !app.background_brush.is_null() => app.background_brush,
+                        _ => GetSysColorBrush(COLOR_3DFACE),
+                    };
+                    FillRect(hdc, &client, brush);
                 }
             }
             1
@@ -860,6 +916,11 @@ pub unsafe extern "system" fn wndproc(
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             if !pointer.is_null() {
                 let app = &mut *pointer;
+                if !app.background_brush.is_null() {
+                    // SAFETY: the brush is owned by the app and never reused.
+                    DeleteObject(app.background_brush);
+                    app.background_brush = std::ptr::null_mut();
+                }
                 app::destroy_fonts(app);
                 if app.created {
                     drop(Box::from_raw(pointer));

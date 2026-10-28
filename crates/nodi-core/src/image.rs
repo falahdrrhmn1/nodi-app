@@ -172,6 +172,14 @@ fn le32(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
+/// True for the horizontal-rule picture Insert > Separator uses: at most 8 px
+/// high and at least 50 times as wide as high. A real picture that thin is a
+/// rule in all but name, so it exports as `---` too.
+pub fn is_rule_picture(bytes: &[u8]) -> bool {
+    sniff(bytes)
+        .is_some_and(|info| info.height > 0 && info.height <= 8 && info.width >= info.height * 50)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +190,14 @@ mod tests {
         bytes.extend_from_slice(&height.to_be_bytes());
         bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
         bytes
+    }
+
+    #[test]
+    fn rule_pictures_are_thin_and_wide() {
+        assert!(is_rule_picture(&png_header(600, 6)));
+        assert!(!is_rule_picture(&png_header(600, 20)));
+        assert!(!is_rule_picture(&png_header(100, 6)));
+        assert!(!is_rule_picture(b"not a picture"));
     }
 
     #[test]

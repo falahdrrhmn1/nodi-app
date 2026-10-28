@@ -775,7 +775,7 @@ pub fn remove_list_marker(editor: HWND) -> bool {
 /// recognises it as a separator rather than a formula.
 fn separator_png() -> Vec<u8> {
     const WIDTH: u32 = 600;
-    const HEIGHT: u32 = 3;
+    const HEIGHT: u32 = 6;
     let mut pixels = Vec::with_capacity((WIDTH * HEIGHT * 2) as usize);
     for _ in 0..WIDTH * HEIGHT {
         pixels.push(0x88);
@@ -806,36 +806,31 @@ fn plain_paragraph(editor: HWND) {
     editor::set_selection(editor, from, from);
 }
 
-/// Inserts the horizontal rule picture wrapped in a `nodi-hr:` hyperlink.
+/// Inserts the horizontal-rule picture in a paragraph of its own and leaves
+/// the caret at the start of a new paragraph after it. The rule is a plain
+/// picture, recognised by its shape (`nodi_core::image::is_rule_picture`): a
+/// `nodi-hr:` link around it would be underlined by Rich Edit.
 fn insert_separator_impl(editor: HWND) {
-    plain_paragraph(editor);
-    let (from, to) = editor::selection(editor);
+    let (mut from, to) = editor::selection(editor);
     if to > from {
         editor::set_selection(editor, from, from);
         editor::replace_selection(editor, "", true);
     }
+    if from > editor::paragraph_start(editor, from) {
+        editor::replace_selection(editor, "\r", true);
+        from += 1;
+    }
+    plain_paragraph(editor);
     // `EM_INSERTIMAGE` takes HIMETRIC (0.01 mm); the editor width is in twips.
     let width_twips = full_width_twips(editor);
     let width = (width_twips as i64 * 2540 / 1440) as i32;
-    let height = (30i64 * 2540 / 1440) as i32;
+    // 60 twips = 4 px at 96 DPI: a visibly "thick" rule (>= 3 px at 100 %).
+    let height = (60i64 * 2540 / 1440) as i32;
     if image::insert_sized(editor, &separator_png(), width, height, height, "separator").is_err() {
         return;
     }
-    editor::set_selection(editor, from, from + 1);
-    let picture = editor::selection_rtf(editor)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .and_then(|rtf| nodi_core::rtf::picture_group(&rtf).map(str::to_owned));
-    let Some(picture) = picture else {
-        return;
-    };
-    let wrapped = format!(
-        "{{\\rtf1{{\\field{{\\*\\fldinst{{HYPERLINK \"{}\"}}}}{{\\fldrslt{{{}}}}}}}}}",
-        nodi_core::links::format_rule_link(),
-        picture
-    );
-    if editor::insert_rtf(editor, wrapped.as_bytes()) {
-        editor::set_selection(editor, from + 1, from + 1);
-    }
+    editor::set_selection(editor, from + 1, from + 1);
+    editor::replace_selection(editor, "\r", true);
 }
 
 /// Insert > Separator (Ctrl+Shift+-).
@@ -865,11 +860,6 @@ pub fn separator_from_marker(editor: HWND) -> bool {
     editor::replace_selection(editor, "", true);
     editor::set_selection(editor, start, start);
     insert_separator_impl(editor);
-    // The field is several characters wide, so its end must come from the
-    // paragraph itself; `start + 1` would land inside the field.
-    let after = editor::paragraph_end(editor, start);
-    editor::set_selection(editor, after, after);
-    editor::replace_selection(editor, "\r", true);
     true
 }
 
@@ -1326,7 +1316,7 @@ fn code_colours() -> String {
     let (br, bg, bb) = CODE_BLOCK_BACK;
     let (lr, lg, lb) = CODE_BLOCK_BORDER;
     let mut out = String::from("{\\colortbl ;");
-    // 1..=5: light block, 6..=11: output block.
+    // 1..=5: light block, 6..=11: output block, 12: dark code text.
     for (red, green, blue) in [
         (br, bg, bb),
         (lr, lg, lb),
@@ -1339,6 +1329,7 @@ fn code_colours() -> String {
         (200, 200, 200),
         (220, 220, 220),
         (110, 170, 255),
+        (31, 31, 31),
     ] {
         out.push_str(&format!("\\red{red}\\green{green}\\blue{blue};"));
     }
@@ -1351,7 +1342,9 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
     let (code_back, _border, header_back, label_colour, link_colour, text_colour) = if output {
         (6, 7, 8, 9, 11, "\\cf10")
     } else {
-        (1, 2, 3, 4, 5, "")
+        // #1F1F1F: readable on the light grey code cell and clearly darker
+        // than the grey label.
+        (1, 2, 3, 4, 5, "\\cf12")
     };
     let label = match language.trim() {
         "" if output => "output",
@@ -1373,11 +1366,11 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}"
     ));
     rtf.push_str(&format!(
-        "\\pard\\intbl\\tqr\\tx{}\\f1\\fs16\\cf{label_colour} ",
+        "\\pard\\intbl\\tqr\\tx{}\\f1\\fs16{{\\cf{label_colour} ",
         (width - 200).max(0)
     ));
     rtf.push_str(&rtf_escape(label));
-    rtf.push_str("\\tab{\\field{\\*\\fldinst{HYPERLINK \"");
+    rtf.push_str("}\\cf0\\tab{\\field{\\*\\fldinst{HYPERLINK \"");
     rtf.push_str(&nodi_core::links::format_copy_link());
     rtf.push_str("\"}}{\\fldrslt{\\ul\\cf");
     rtf.push_str(&link_colour.to_string());

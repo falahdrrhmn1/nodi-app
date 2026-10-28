@@ -179,7 +179,7 @@ pub fn find_again(app: &mut App, forward: bool) {
     }
 }
 
-fn report(app: &App, outcome: Outcome) {
+fn report(app: &mut App, outcome: Outcome) {
     let message = match outcome {
         Outcome::Found => "Ready",
         Outcome::Wrapped => "Search wrapped around the note",

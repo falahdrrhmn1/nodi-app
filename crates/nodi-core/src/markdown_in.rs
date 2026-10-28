@@ -511,6 +511,7 @@ fn header() -> String {
         (200, 200, 200),
         (220, 220, 220),
         (110, 170, 255),
+        (31, 31, 31),
     ] {
         colours.push_str(&format!("\\red{red}\\green{green}\\blue{blue};"));
     }
@@ -528,10 +529,10 @@ fn push_block(out: &mut String, block: &Block, width: i32) {
             let size = HEADING_SIZES[level.saturating_sub(1).min(3)];
             out.push_str(&format!("\\pard\\sa120\\sb120\\f0\\fs{size}\\b "));
             push_runs(out, runs, true, size);
-            out.push_str("\\b0\\fs220\\par\n");
+            out.push_str(&format!("\\b0\\fs{BODY_SIZE}\\par\n"));
         }
         Block::Paragraph(runs) => {
-            out.push_str("\\pard\\sa0\\sb0\\f0\\fs220 ");
+            out.push_str(&format!("\\pard\\sa0\\sb0\\f0\\fs{BODY_SIZE} "));
             push_runs(out, runs, false, BODY_SIZE);
             out.push_str("\\par\n");
         }
@@ -623,19 +624,22 @@ fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
         other => other,
     };
     let border = "\\brdrs\\brdrw10\\brdrcf2";
-    // Header row: language label on the left, Copy link at the right.
+    // Header row: language label on the left, Copy link at the right. The
+    // colour is scoped to the label group so it cannot leak into the code row
+    // or into whatever follows the block (that used to turn table cells grey).
     out.push_str(&format!(
         "\\trowd\\trgaph108\\trleft0\\clcbpat3\\clbrdrt{border}\\clbrdrl{border}\
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}\
-         \\pard\\intbl\\tqr\\tx{}\\f1\\fs16\\cf4 ",
+         \\pard\\intbl\\tqr\\tx{}\\f1\\fs16{{\\cf4 ",
         (width - 200).max(0)
     ));
     escape(out, label);
-    out.push_str("\\tab{\\field{\\*\\fldinst{HYPERLINK \"");
+    out.push_str("}\\cf0\\tab{\\field{\\*\\fldinst{HYPERLINK \"");
     out.push_str(&links::format_copy_link());
     out.push_str("\"}}{\\fldrslt{\\ul\\cf5 Copy}}}\\cell\\row");
 
-    // Code row.
+    // Code row: an explicit dark colour (light theme) so it never inherits the
+    // grey label colour from the row above.
     let body = code.trim_end_matches(['\r', '\n']);
     let mut cell = String::new();
     for (index, line) in body.split('\n').enumerate() {
@@ -651,7 +655,8 @@ fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
     out.push_str(&format!(
         "\\trowd\\trgaph108\\trleft0\\clcbpat1\\clbrdrt{border}\\clbrdrl{border}\
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}\
-         \\pard\\intbl\\f1\\fs20{tabs} {cell}\\cell\\row\n\\pard\\f0\\fs{BODY_SIZE}\\par\n"
+         \\pard\\intbl\\f1\\fs20\\cf12{tabs} {cell}\\cell\\row\n\
+         \\pard\\f0\\fs{BODY_SIZE}\\cf0\\par\n"
     ));
 }
 
@@ -672,33 +677,34 @@ fn push_table(out: &mut String, rows: &[Vec<Vec<Run>>], width: i32) {
                 column * index as i32
             ));
         }
-        out.push_str("\\pard\\intbl\\f0\\fs220 ");
+        out.push_str(&format!("\\pard\\intbl\\f0\\fs{BODY_SIZE}\\cf0 "));
         for cell in cells.iter() {
             push_runs(out, cell, false, BODY_SIZE);
             out.push_str("\\cell ");
         }
         out.push_str("\\row\n");
     }
-    out.push_str("\\pard\\f0\\fs220\\par\n");
+    out.push_str(&format!("\\pard\\f0\\fs{BODY_SIZE}\\cf0\\par\n"));
 }
 
 fn push_rule(out: &mut String, width: i32) {
     const WIDTH: u32 = 600;
-    const HEIGHT: u32 = 3;
+    const HEIGHT: u32 = 6;
     let mut pixels = Vec::with_capacity((WIDTH * HEIGHT * 2) as usize);
     for _ in 0..WIDTH * HEIGHT {
         pixels.push(0x88);
         pixels.push(0xFF);
     }
     let png = crate::math::encode_png(WIDTH, HEIGHT, &pixels, "");
+    // A plain picture: inside a link field Rich Edit would underline it, and
+    // the Markdown export recognises the rule by its shape.
     out.push_str(&format!(
-        "\\pard\\sa0\\sb0{{\\field{{\\*\\fldinst{{HYPERLINK \"{}\"}}}}{{\\fldrslt{{\\pict\\pngblip\\picw{WIDTH}\\pich{HEIGHT}\\picwgoal{width}\\pichgoal30 ",
-        links::format_rule_link()
+        "\\pard\\sa0\\sb0{{\\pict\\pngblip\\picw{WIDTH}\\pich{HEIGHT}\\picwgoal{width}\\pichgoal60 "
     ));
     for byte in png {
         out.push_str(&format!("{byte:02x}"));
     }
-    out.push_str("}}}\\par\n");
+    out.push_str("}\\par\n");
 }
 
 fn escape(out: &mut String, text: &str) {
@@ -811,7 +817,8 @@ mod tests {
             rtf.contains("HYPERLINK \"https://example.com/x.png\""),
             "{rtf}"
         );
-        assert!(rtf.contains("nodi-hr:"), "{rtf}");
+        assert!(rtf.contains(r"{\pict\pngblip\picw600\pich6"), "{rtf}");
+        assert!(!rtf.contains("nodi-hr:"), "{rtf}");
         let markdown = round_trip("[Docs](https://example.com/a b)\n\n---");
         assert!(
             markdown.contains("[Docs](https://example.com/a%20b)"),

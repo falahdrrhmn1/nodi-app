@@ -102,9 +102,14 @@ the insert commands.
 | Ctrl+Shift+F | Search in all notes |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Zoom in / out / reset (or Ctrl+mouse wheel) |
 | Ctrl+Shift+M | Show the note as Markdown (read-only) |
+| Ctrl+Alt+O | Outline: list the note's headings and jump to one |
 | F1 | Keyboard shortcut list |
 
 ## Mouse
+
+- Right-click a tab: Close, Close Others, Close All, Copy Internal Link,
+  Reveal in Tree. Middle-click a tab closes it.
+- View > Theme: Light, Dark or Custom... colours.
 
 - Right-click a note in the tree: New Child/Sibling Note, Rename, Change Icon,
   Duplicate, Move Up/Down, **Move to...** (pick any parent or Top level), Move

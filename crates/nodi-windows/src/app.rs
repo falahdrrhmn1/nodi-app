@@ -11,12 +11,15 @@ use std::time::Duration;
 
 use nodi_core::autosave::{Job, SaveRequest, SaveResult, Target, Writer};
 use nodi_core::backup;
-use nodi_core::storage::{Session, TabState, WindowRect, DEFAULT_SIDEBAR_WIDTH};
+use nodi_core::storage::{
+    format_hex_color, CustomTheme, Session, Settings, TabState, Theme, WindowRect,
+    DEFAULT_SIDEBAR_WIDTH,
+};
 use nodi_core::tree::Position;
 use nodi_core::{DataDir, NodeKind, NoteId, Tree};
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL, HFONT, LOGFONTW,
+    CreateFontIndirectW, DeleteObject, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL, HBRUSH, HFONT, LOGFONTW,
 };
 use windows_sys::Win32::UI::Controls::HIMAGELIST;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -30,7 +33,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::win;
 use crate::wnd::form::{Field, Form};
-use crate::wnd::{clipboard, dialogs, editor, image, link, menu, status, table, tabs, tree};
+use crate::wnd::{clipboard, dialogs, editor, image, link, menu, status, table, tabs, theme, tree};
 
 /// Custom message posted by the writer thread with a boxed [`SaveResult`].
 pub const WM_APP_SAVE_RESULT: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 1;
@@ -142,6 +145,18 @@ pub struct App {
     pub word_wrap: bool,
     /// Zoom percentage applied to every editor.
     pub zoom: i32,
+    /// `settings.json` (theme, mirror toggle, spell check).
+    pub settings: Settings,
+    /// Resolved colours for the current theme.
+    pub palette: theme::Palette,
+    /// Frame/splitter background; owned by the app.
+    pub background_brush: HBRUSH,
+    /// The five status-bar texts, so the owner-draw path can redraw them.
+    pub status_text: Vec<String>,
+    /// File > Recent, newest first (also persisted in `session.json`).
+    pub recent: Vec<NoteId>,
+    /// Tab whose context menu is open (right-click on the tab strip).
+    pub tab_context: Option<usize>,
     /// Set once `WM_CREATE` finished: from then on the window procedure owns
     /// the boxed `App` and frees it in `WM_NCDESTROY`.
     pub created: bool,
@@ -202,6 +217,12 @@ impl App {
             pending_new: HashSet::new(),
             word_wrap: true,
             zoom: 100,
+            settings: Settings::default(),
+            palette: theme::Palette::default(),
+            background_brush: ptr::null_mut(),
+            status_text: vec![String::new(); 5],
+            recent: Vec::new(),
+            tab_context: None,
             created: false,
         }
     }
@@ -308,6 +329,12 @@ impl App {
         };
         self.tree = tree;
 
+        // Settings decide the palette before any note is streamed into an
+        // editor, so the very first paint is already themed.
+        self.settings = data.load_settings();
+        self.palette = theme::Palette::from_settings(&self.settings);
+        self.palette.install_display_colours();
+
         // Writer thread: results are posted back as boxed `SaveResult`s. The
         // window handle travels as `isize` so the closure stays `Send`.
         let hwnd_value = self.hwnd as isize;
@@ -328,6 +355,18 @@ impl App {
         ));
         self.data = Some(data.clone());
 
+        // The Markdown mirror is opt-out; a sync at startup (only notes changed
+        // since their mirror file was written) also hands the writer its tree
+        // for the per-save updates.
+        if let Some(writer) = &self.writer {
+            writer.submit(Job::MirrorEnabled(self.settings.markdown_mirror));
+            if self.settings.markdown_mirror {
+                if let Ok(json) = self.tree.to_json() {
+                    writer.submit(Job::MirrorSync(json));
+                }
+            }
+        }
+
         let session = data.load_session().unwrap_or_default();
         if session.sidebar_width > 0 {
             self.sidebar_width = session.sidebar_width;
@@ -335,7 +374,20 @@ impl App {
         self.expanded = session.expanded.iter().cloned().collect();
         self.word_wrap = session.word_wrap;
         self.zoom = session.zoom.clamp(25, 500);
+        self.recent = session
+            .recent
+            .iter()
+            .filter(|id| {
+                self.tree
+                    .get(id)
+                    .is_some_and(|node| node.kind == NodeKind::Note && !node.trashed)
+            })
+            .take(10)
+            .cloned()
+            .collect();
         menu::set_checked(self, menu::IDM_VIEW_WORD_WRAP, self.word_wrap);
+        menu::sync_settings(self);
+        menu::refresh_recent(self);
         if let Some(rect) = session.window {
             self.apply_window_rect(rect);
         }
@@ -351,9 +403,41 @@ impl App {
             self.restore_session_tabs(&session);
         }
 
+        self.load_custom_icons();
         self.rebuild_tree();
         self.maybe_startup_backup();
         true
+    }
+
+    /// Appends every icon the user copied into `data/icons/` to the image list
+    /// (the tree stores keys like `file:star.png`).
+    fn load_custom_icons(&mut self) {
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(data.icons_dir()) else {
+            return;
+        };
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.path())
+            .collect();
+        files.sort();
+        let icons: Vec<(String, std::path::PathBuf)> = files
+            .into_iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| (name.to_string_lossy().into_owned(), path.clone()))
+            })
+            .collect();
+        for (name, path) in icons {
+            let key: &'static str = Box::leak(format!("file:{name}").into_boxed_str());
+            if self.icon_keys.contains(&key) {
+                continue;
+            }
+            tree::add_icon(self, key, &path);
+        }
     }
 
     fn restore_session_tabs(&mut self, session: &Session) {
@@ -466,8 +550,119 @@ impl App {
 
     /// Opens (or re-uses) the tab for a note.
     pub fn open_note(&mut self, id: NoteId) {
-        self.open_note_with(id, None, None);
+        self.open_note_with(id.clone(), None, None);
+        if self.tab_index_for_note(&id).is_some() {
+            self.note_opened(&id);
+        }
         self.save_session_now();
+    }
+
+    /// Records a note in File > Recent (newest first, max 10).
+    fn note_opened(&mut self, id: &NoteId) {
+        self.recent.retain(|recent| recent != id);
+        self.recent.insert(0, id.clone());
+        self.recent.truncate(10);
+        menu::refresh_recent(self);
+    }
+
+    /// File > Recent: opens the entry at `index`.
+    pub fn open_recent(&mut self, index: usize) {
+        let Some(id) = self.recent.get(index).cloned() else {
+            return;
+        };
+        self.open_note(id);
+    }
+
+    /// The tab a context menu acts on: the right-clicked one, else the active.
+    pub fn context_tab(&self) -> Option<usize> {
+        self.tab_context
+            .filter(|index| *index < self.tabs.len())
+            .or(self.active)
+    }
+
+    pub fn close_context_tab(&mut self) {
+        if let Some(index) = self.context_tab() {
+            self.close_tab(index);
+        }
+    }
+
+    /// Tab menu "Close Others": keeps one tab, saves and closes the rest.
+    pub fn close_other_tabs(&mut self) {
+        let Some(keep) = self.context_tab() else {
+            return;
+        };
+        let keep_note = self.tabs[keep].note.clone();
+        for index in (0..self.tabs.len()).rev() {
+            if self.tabs[index].note != keep_note {
+                self.close_tab(index);
+            }
+        }
+        if let Some(index) = self.tab_index_for_note(&keep_note) {
+            self.activate_tab(index);
+        }
+        self.tab_context = None;
+    }
+
+    /// Tab menu "Close All": saves and closes every tab.
+    pub fn close_all_tabs(&mut self) {
+        for index in (0..self.tabs.len()).rev() {
+            self.close_tab(index);
+        }
+        self.tab_context = None;
+    }
+
+    /// Tab menu "Copy Internal Link".
+    pub fn copy_tab_link(&mut self) {
+        let Some(index) = self.context_tab() else {
+            return;
+        };
+        let note = self.tabs[index].note.clone();
+        copy_link_for(self, &note);
+        self.tab_context = None;
+    }
+
+    /// Tab menu "Reveal in Tree": selects the note in the sidebar.
+    pub fn reveal_tab_note(&mut self) {
+        let Some(index) = self.context_tab() else {
+            return;
+        };
+        let note = self.tabs[index].note.clone();
+        self.selected = Some(note.clone());
+        self.expand(self.tree.get(&note).and_then(|node| node.parent.clone()));
+        crate::wnd::tree::select_item(self, &note);
+        crate::wnd::tree::focus_tree(self);
+        self.tab_context = None;
+    }
+
+    /// Drops every tab without submitting it (used before a backup restore,
+    /// where the pending editor content must not overwrite the restored data).
+    fn discard_all_tabs(&mut self) {
+        for index in (0..self.tabs.len()).rev() {
+            let timer = self.tabs[index].timer;
+            if timer != 0 {
+                // SAFETY: killing a timer we started on our own window.
+                unsafe {
+                    KillTimer(self.hwnd, timer);
+                }
+            }
+            let editor_window = self.tabs[index].editor;
+            if !editor_window.is_null() {
+                crate::wnd::format::forget_editor(editor_window);
+                // SAFETY: the editor is a child window of this process.
+                unsafe {
+                    DestroyWindow(editor_window);
+                }
+            }
+            self.tabs.remove(index);
+            tabs::delete(self, index);
+        }
+        self.active = None;
+        self.tab_context = None;
+        status::set_save_state(self, "");
+        status::set_message(self, "Restored from backup");
+        status::clear_caret(self);
+        status::set_counts(self, 0, 0, false);
+        crate::wnd::layout(self);
     }
 
     fn open_note_with(&mut self, id: NoteId, selection: Option<(i32, i32)>, scroll: Option<u32>) {
@@ -491,7 +686,7 @@ impl App {
 
         let bytes = self.data.as_ref().and_then(|data| data.load_note(&id));
         let loaded = match &bytes {
-            Some(bytes) => editor::load_rtf(editor, bytes),
+            Some(bytes) => editor::load_rtf(editor, &theme::theme_bytes(&self.palette, bytes)),
             None => {
                 editor::clear(editor);
                 true
@@ -504,7 +699,10 @@ impl App {
                 Some(previous_bytes) => {
                     let message = "This note could not be read. Open its previous saved version?";
                     if dialogs::ask_yes_no(self.hwnd, message) {
-                        loaded = editor::load_rtf(editor, &previous_bytes);
+                        loaded = editor::load_rtf(
+                            editor,
+                            &theme::theme_bytes(&self.palette, &previous_bytes),
+                        );
                     } else {
                         editor::clear(editor);
                     }
@@ -588,6 +786,7 @@ impl App {
 
         tabs::set_cur(self, index);
         status::update_caret(self);
+        status::update_counts(self);
         crate::wnd::format::update_heading_marker(self.tabs[index].editor);
         crate::wnd::toolbar::sync_format(self);
         status::set_message(self, "Ready");
@@ -638,6 +837,7 @@ impl App {
             status::set_save_state(self, "");
             status::set_message(self, "No note open");
             status::clear_caret(self);
+            status::set_counts(self, 0, 0, false);
             sync_window_title(self);
             tree::focus_tree(self);
         } else {
@@ -765,11 +965,14 @@ impl App {
         }
 
         let editor = self.tabs[index].editor;
-        let Some(rtf) = editor::stream_out_rtf(editor) else {
+        let Some(raw) = editor::stream_out_rtf(editor) else {
             self.tabs[index].last_error = Some("the editor content could not be read".to_owned());
             self.refresh_tab_ui(index);
             return;
         };
+        // Dark mode renders auto/black text through sentinel colour entries;
+        // the note on disk must keep the user's real colours.
+        let rtf = theme::fold_bytes(&self.palette, &raw);
         let txt = editor::plain_text(editor);
         let seq = self.tabs[index].seq + 1;
         let note = self.tabs[index].note.clone();
@@ -855,6 +1058,11 @@ impl App {
             Target::Session => {
                 if let Err(message) = result.result {
                     status::set_message(self, &format!("Session save failed: {message}"));
+                }
+            }
+            Target::Mirror => {
+                if let Err(message) = result.result {
+                    status::set_message(self, &message);
                 }
             }
         }
@@ -976,6 +1184,7 @@ impl App {
             expanded,
             word_wrap: self.word_wrap,
             zoom: self.zoom,
+            recent: self.recent.iter().take(10).cloned().collect(),
         }
     }
 
@@ -1355,6 +1564,320 @@ impl App {
     }
 }
 
+// ------------------------------------------------- settings, theme and tools
+
+impl App {
+    fn save_settings(&self) {
+        if let Some(data) = &self.data {
+            let _ = data.save_settings(&self.settings);
+        }
+    }
+
+    /// View > Theme > Light / Dark.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.settings.theme = theme;
+        theme::apply(self);
+        self.save_settings();
+        menu::sync_settings(self);
+        status::set_message(
+            self,
+            match theme {
+                Theme::Light => "Light theme",
+                Theme::Dark => "Dark theme",
+                Theme::Custom => "Custom theme",
+            },
+        );
+    }
+
+    /// View > Spell Check.
+    pub fn toggle_spell_check(&mut self) {
+        self.settings.spell_check = !self.settings.spell_check;
+        for tab in &self.tabs {
+            editor::set_spell_check(tab.editor, self.settings.spell_check);
+        }
+        self.save_settings();
+        menu::set_checked(self, menu::IDM_VIEW_SPELL, self.settings.spell_check);
+        status::set_message(
+            self,
+            if self.settings.spell_check {
+                "Spell check on"
+            } else {
+                "Spell check off"
+            },
+        );
+    }
+
+    /// Tools > Rebuild AI Markdown Mirror.
+    pub fn rebuild_mirror(&mut self) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        let Ok(json) = self.tree.to_json() else {
+            return;
+        };
+        writer.submit(Job::MirrorRebuild(json));
+        status::set_message(self, "Rebuilding the AI Markdown mirror...");
+    }
+
+    /// Tools > Keep Markdown Mirror for AI Agents.
+    pub fn toggle_mirror(&mut self) {
+        self.settings.markdown_mirror = !self.settings.markdown_mirror;
+        if let Some(writer) = &self.writer {
+            writer.submit(Job::MirrorEnabled(self.settings.markdown_mirror));
+        }
+        self.save_settings();
+        menu::set_checked(
+            self,
+            menu::IDM_TOOLS_MIRROR_TOGGLE,
+            self.settings.markdown_mirror,
+        );
+        if self.settings.markdown_mirror {
+            status::set_message(self, "Markdown mirror on");
+            self.rebuild_mirror();
+        } else {
+            status::set_message(self, "Markdown mirror off");
+        }
+    }
+
+    /// Tools > Restore Backup...
+    pub fn restore_backup_ui(&mut self) {
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        let snapshots = backup::list(&data).unwrap_or_default();
+        if snapshots.is_empty() {
+            dialogs::info(self.hwnd, "There are no backups yet.");
+            return;
+        }
+        let entries: Vec<(String, std::path::PathBuf)> = snapshots
+            .iter()
+            .rev()
+            .map(|path| (snapshot_label(path), path.clone()))
+            .collect();
+        let Some(snapshot) = dialogs::pick_snapshot(self.hwnd, &entries) else {
+            return;
+        };
+        let question = format!(
+            "Restore the backup from {}?\n\n\
+             Nodi snapshots the current state first, so this can be undone.",
+            snapshot
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        if !dialogs::ask_yes_no(self.hwnd, &question) {
+            return;
+        }
+        self.restore_snapshot(&snapshot);
+    }
+
+    /// Restores one snapshot, dropping every open tab first (nothing pending
+    /// may overwrite the restored files). Also used by the `restore-latest`
+    /// test hook.
+    pub fn restore_snapshot(&mut self, snapshot: &std::path::Path) {
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        // Everything queued belongs to the state we are about to replace.
+        self.discard_all_tabs();
+        if let Some(writer) = &self.writer {
+            let _ = writer.flush_blocking(Duration::from_secs(5));
+        }
+
+        match backup::restore(&data, snapshot) {
+            Ok(safety) => match data.load_tree() {
+                Ok(tree) => {
+                    self.tree = tree;
+                    self.recent.clear();
+                    menu::refresh_recent(self);
+                    self.selected = None;
+                    self.context_note = None;
+                    self.expanded.clear();
+                    self.rebuild_tree();
+                    if let Some(id) = self.first_visible_note() {
+                        self.selected = Some(id.clone());
+                        self.open_note(id);
+                    }
+                    self.save_session_now();
+                    status::set_message(
+                        self,
+                        &format!(
+                            "Backup restored (previous state: {})",
+                            safety
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        ),
+                    );
+                }
+                Err(err) => dialogs::error(
+                    self.hwnd,
+                    &format!("The restored tree.json could not be read:\n{err}"),
+                ),
+            },
+            Err(err) => dialogs::error(self.hwnd, &format!("Restore failed:\n{err}")),
+        }
+    }
+
+    /// Test hook: restores the newest snapshot without any dialog.
+    pub fn restore_latest_backup(&mut self) -> Result<String, String> {
+        let Some(data) = self.data.clone() else {
+            return Err("no data directory".to_owned());
+        };
+        let snapshots = backup::list(&data).map_err(|err| err.to_string())?;
+        let Some(latest) = snapshots.last().cloned() else {
+            return Err("no backups".to_owned());
+        };
+        self.restore_snapshot(&latest);
+        Ok(latest
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default())
+    }
+
+    /// Notes > Change Icon... > From file...
+    pub fn add_icon_file(&mut self, path: &std::path::Path) -> Result<&'static str, String> {
+        let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "icon".to_owned());
+        let Some(data) = &self.data else {
+            return Err("No data directory".to_owned());
+        };
+        let stored = data
+            .save_icon(&name, &bytes)
+            .map_err(|err| err.to_string())?;
+        let key: &'static str = Box::leak(format!("file:{name}").into_boxed_str());
+        if !self.icon_keys.contains(&key) && !tree::add_icon(self, key, &stored) {
+            return Err(format!(
+                "{} is not a usable .ico or 16–32 px .png icon.",
+                path.display()
+            ));
+        }
+        Ok(key)
+    }
+
+    /// Removes the icon override, back to the default note/folder glyph.
+    pub fn clear_icon(&mut self, id: NoteId) {
+        if !self.tree.set_icon(&id, None) {
+            return;
+        }
+        let default = self
+            .tree
+            .get(&id)
+            .map(|node| match node.kind {
+                NodeKind::Folder => "folder",
+                NodeKind::Note => "note",
+            })
+            .unwrap_or("note");
+        let index = self
+            .icon_keys
+            .iter()
+            .position(|candidate| *candidate == default)
+            .unwrap_or(0) as i32;
+        tree::set_item_icon(self, &id, index);
+        self.tree_save();
+    }
+}
+
+/// Human label for Tools > Restore Backup: `20260102-030405 — 1.2 MB`.
+fn snapshot_label(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{name} — {}", human_size(directory_size(path)))
+}
+
+fn directory_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// View > Outline (Ctrl+Alt+O).
+pub fn show_outline(app: &mut App) {
+    crate::wnd::outline::show(app);
+}
+
+/// View > Theme > Custom...
+pub fn choose_custom_theme(app: &mut App) {
+    let previous = app.settings.clone();
+    let frame = app.hwnd;
+    let chosen = dialogs::custom_theme(
+        app.hwnd,
+        app.settings.custom.clone(),
+        frame,
+        preview_custom_theme,
+    );
+    match chosen {
+        Some(custom) => {
+            app.settings.custom = custom;
+            app.settings.theme = Theme::Custom;
+            theme::apply(app);
+            app.save_settings();
+            menu::sync_settings(app);
+            status::set_message(app, "Custom theme applied");
+        }
+        None => {
+            // Undo every live preview.
+            app.settings = previous;
+            theme::apply(app);
+            menu::sync_settings(app);
+        }
+    }
+}
+
+/// Live preview from the custom-theme dialog (`COLORREF` values).
+extern "system" fn preview_custom_theme(frame: HWND, background: u32, text: u32, accent: u32) {
+    let from_colorref = |colour: u32| {
+        format_hex_color((
+            (colour & 0xFF) as u8,
+            ((colour >> 8) & 0xFF) as u8,
+            ((colour >> 16) & 0xFF) as u8,
+        ))
+    };
+    // SAFETY: the frame is alive for the whole modal dialog; this is the same
+    // re-entrancy every modal dialog in this app already allows.
+    if let Some(app) = unsafe { crate::wnd::app_mut(frame) } {
+        app.settings.theme = Theme::Custom;
+        app.settings.custom = CustomTheme {
+            background: from_colorref(background),
+            text: from_colorref(text),
+            accent: from_colorref(accent),
+        };
+        theme::apply(app);
+    }
+}
+
 fn snapshot_is_stale(path: &std::path::Path) -> bool {
     match std::fs::metadata(path).and_then(|meta| meta.modified()) {
         Ok(modified) => modified
@@ -1501,6 +2024,7 @@ pub fn on_editor_change(app: &mut App, editor: HWND) {
     }
     app.mark_dirty(editor);
     status::update_caret(app);
+    status::update_counts(app);
     crate::wnd::format::maintain_heading(editor);
     crate::wnd::format::update_heading_marker(editor);
 }
@@ -1577,8 +2101,15 @@ pub fn change_icon(app: &mut App) {
         .get(&id)
         .and_then(|node| node.icon.clone())
         .unwrap_or_default();
-    if let Some(key) = dialogs::pick_icon(app.hwnd, &current) {
-        app.set_icon(id, key);
+    if let Some(choice) = dialogs::pick_icon(app.hwnd, &current) {
+        match choice {
+            dialogs::IconChoice::Builtin(key) => app.set_icon(id, key),
+            dialogs::IconChoice::Remove => app.clear_icon(id),
+            dialogs::IconChoice::File(path) => match app.add_icon_file(&path) {
+                Ok(key) => app.set_icon(id, key),
+                Err(message) => dialogs::error(app.hwnd, &message),
+            },
+        }
     }
 }
 
@@ -1738,12 +2269,17 @@ pub fn copy_internal_link(app: &mut App) {
     let Some(id) = app.context_note.clone().or_else(|| app.selected.clone()) else {
         return;
     };
+    copy_link_for(app, &id);
+}
+
+/// Puts a link to `id` on the clipboard (shared by the tree and tab menus).
+pub fn copy_link_for(app: &mut App, id: &NoteId) {
     let title = app
         .tree
-        .get(&id)
+        .get(id)
         .map(|node| node.title.clone())
         .unwrap_or_default();
-    let url = nodi_core::links::format_note_link(&id);
+    let url = nodi_core::links::format_note_link(id);
     let rtf = link::link_rtf(&title, &url);
     if clipboard::set_text_and_rtf(app.hwnd, &url, &rtf) {
         status::set_message(

@@ -3,16 +3,19 @@
 //! the documented keys).
 
 use std::ptr;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
+use nodi_core::storage::Theme;
 use nodi_core::NodeKind;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_DOWN, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_NEXT, VK_OEM_3, VK_OEM_4, VK_OEM_6,
     VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CheckMenuItem, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, PostMessageW,
-    ACCEL, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL, HMENU, MF_BYCOMMAND, MF_CHECKED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, WM_CLOSE,
+    AppendMenuW, CheckMenuItem, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, DeleteMenu,
+    GetMenuItemCount, PostMessageW, ACCEL, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL, HMENU,
+    MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, WM_CLOSE,
 };
 
 use crate::app::{self, App};
@@ -87,6 +90,23 @@ pub const IDM_VIEW_ZOOM_IN: u16 = 135;
 pub const IDM_VIEW_ZOOM_OUT: u16 = 136;
 pub const IDM_VIEW_ZOOM_RESET: u16 = 137;
 pub const IDM_VIEW_MARKDOWN: u16 = 138;
+pub const IDM_VIEW_SPELL: u16 = 139;
+pub const IDM_VIEW_OUTLINE: u16 = 142;
+
+pub const IDM_THEME_LIGHT: u16 = 300;
+pub const IDM_THEME_DARK: u16 = 301;
+pub const IDM_THEME_CUSTOM: u16 = 302;
+
+/// Tab context menu (right-click / middle-click a tab).
+pub const IDM_TAB_CLOSE: u16 = 250;
+pub const IDM_TAB_CLOSE_OTHERS: u16 = 251;
+pub const IDM_TAB_CLOSE_ALL: u16 = 252;
+pub const IDM_TAB_COPY_LINK: u16 = 253;
+pub const IDM_TAB_REVEAL: u16 = 254;
+
+/// First id of File > Recent (`IDM_RECENT_FIRST + index`).
+pub const IDM_RECENT_FIRST: u16 = 900;
+pub const IDM_RECENT_LAST: u16 = 909;
 
 pub const IDM_HELP_ABOUT: u16 = 140;
 pub const IDM_HELP_SHORTCUTS: u16 = 141;
@@ -121,6 +141,9 @@ pub const IDM_NOTES_MOVE_TO: u16 = 186;
 
 pub const IDM_TOOLS_BACKUP: u16 = 190;
 pub const IDM_TOOLS_OPEN_DATA: u16 = 191;
+pub const IDM_TOOLS_RESTORE_BACKUP: u16 = 192;
+pub const IDM_TOOLS_REBUILD_MIRROR: u16 = 193;
+pub const IDM_TOOLS_MIRROR_TOGGLE: u16 = 194;
 
 pub const IDM_INSERT_IMAGE: u16 = 200;
 pub const IDM_INSERT_TABLE: u16 = 201;
@@ -192,6 +215,12 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
         "Zoom in / out / reset (or Ctrl+mouse wheel)",
     ),
     ("Ctrl+Shift+M", "Show the note as Markdown (read-only)"),
+    ("Ctrl+Alt+O", "Outline: jump to a heading"),
+    (
+        "Right-click a tab",
+        "Close, Close Others, Copy Link, Reveal in Tree",
+    ),
+    ("Middle-click a tab", "Close that tab"),
     ("Double-click a formula", "Edit the formula"),
     ("Double-click a picture", "Picture size"),
     ("F2", "Rename note"),
@@ -204,6 +233,10 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("F1", "This list"),
 ];
 
+/// The File > Recent submenu, so `refresh_recent` can rebuild its items after
+/// every note is opened (menus are created before `App` exists).
+static RECENT_MENU: AtomicIsize = AtomicIsize::new(0);
+
 /// Builds the menu bar. Only commands that work are listed.
 pub fn create_menu() -> HMENU {
     // SAFETY: every call creates/edits menus we own; strings are temporaries
@@ -214,11 +247,15 @@ pub fn create_menu() -> HMENU {
             return ptr::null_mut();
         }
 
+        let recent = popup(&[Item::Cmd(IDM_RECENT_FIRST, "(No recent notes)")]);
+        RECENT_MENU.store(recent as isize, Ordering::Relaxed);
+
         let file = popup(&[
             Item::Cmd(IDM_FILE_NEW, "&New Note\tCtrl+N"),
             Item::Cmd(IDM_FILE_SAVE, "&Save\tCtrl+S"),
             Item::Cmd(IDM_FILE_CLOSE_TAB, "&Close Tab\tCtrl+W"),
             Item::Sep,
+            Item::Popup(recent, "Recent &Notes"),
             Item::Cmd(IDM_FILE_EXPORT_MD, "Export Note as &Markdown..."),
             Item::Sep,
             Item::Cmd(IDM_FILE_EXIT, "E&xit"),
@@ -267,6 +304,10 @@ pub fn create_menu() -> HMENU {
                 IDM_VIEW_MARKDOWN,
                 "&Markdown Source (read-only)\tCtrl+Shift+M",
             ),
+            Item::Cmd(IDM_VIEW_OUTLINE, "&Outline\tCtrl+Alt+O"),
+            Item::Checked(IDM_VIEW_SPELL, "&Spell Check"),
+            Item::Sep,
+            Item::Popup(theme_menu(), "T&heme"),
             Item::Sep,
             Item::Cmd(IDM_VIEW_EXPAND_ALL, "&Expand All Notes"),
             Item::Cmd(IDM_VIEW_COLLAPSE_ALL, "&Collapse All Notes"),
@@ -364,6 +405,14 @@ pub fn create_menu() -> HMENU {
 
         let tools = popup(&[
             Item::Cmd(IDM_TOOLS_BACKUP, "&Backup Now"),
+            Item::Cmd(IDM_TOOLS_RESTORE_BACKUP, "&Restore Backup..."),
+            Item::Sep,
+            Item::Cmd(IDM_TOOLS_REBUILD_MIRROR, "Rebuild AI Markdown &Mirror"),
+            Item::Cmd(
+                IDM_TOOLS_MIRROR_TOGGLE,
+                "Keep Markdown Mirror for AI &Agents",
+            ),
+            Item::Sep,
             Item::Cmd(IDM_TOOLS_OPEN_DATA, "&Open Data Folder"),
         ]);
         attach(bar, tools, "&Tools");
@@ -383,6 +432,70 @@ pub enum Item {
     Checked(u16, &'static str),
     Popup(HMENU, &'static str),
     Sep,
+}
+
+/// View > Theme: Light / Dark / Custom...
+fn theme_menu() -> HMENU {
+    popup(&[
+        Item::Cmd(IDM_THEME_LIGHT, "&Light"),
+        Item::Cmd(IDM_THEME_DARK, "&Dark"),
+        Item::Cmd(IDM_THEME_CUSTOM, "&Custom..."),
+    ])
+}
+
+/// Rebuilds File > Recent from `app.recent` (newest first, max 10).
+pub fn refresh_recent(app: &mut App) {
+    let menu = RECENT_MENU.load(Ordering::Relaxed) as HMENU;
+    if menu.is_null() {
+        return;
+    }
+    // SAFETY: `menu` is the popup created in `create_menu` and lives as long as
+    // the menu bar; texts are temporaries that live for each call.
+    unsafe {
+        while GetMenuItemCount(menu) > 0 {
+            DeleteMenu(menu, 0, MF_BYPOSITION);
+        }
+        if app.recent.is_empty() {
+            AppendMenuW(
+                menu,
+                MF_STRING | MF_GRAYED,
+                0,
+                win::wide("(No recent notes)").as_ptr(),
+            );
+            return;
+        }
+        let entries: Vec<(usize, String)> = app
+            .recent
+            .iter()
+            .take(10)
+            .enumerate()
+            .map(|(index, id)| {
+                let title = app
+                    .tree
+                    .get(id)
+                    .map(|node| node.title.clone())
+                    .unwrap_or_else(|| "Untitled".to_owned());
+                (index, format!("&{}. {title}", index + 1))
+            })
+            .collect();
+        for (index, label) in entries {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                IDM_RECENT_FIRST as usize + index,
+                win::wide(&label).as_ptr(),
+            );
+        }
+    }
+}
+
+/// Reflects `app.settings` in the View/Tools check marks.
+pub fn sync_settings(app: &App) {
+    check_item(app, IDM_VIEW_SPELL, app.settings.spell_check);
+    check_item(app, IDM_THEME_LIGHT, app.settings.theme == Theme::Light);
+    check_item(app, IDM_THEME_DARK, app.settings.theme == Theme::Dark);
+    check_item(app, IDM_THEME_CUSTOM, app.settings.theme == Theme::Custom);
+    check_item(app, IDM_TOOLS_MIRROR_TOGGLE, app.settings.markdown_mirror);
 }
 
 /// Creates a popup menu from `items`.
@@ -477,6 +590,7 @@ pub fn create_accel() -> HACCEL {
         accel(ctrl, VK_OEM_MINUS, IDM_VIEW_ZOOM_OUT),
         accel(ctrl, key(b'0'), IDM_VIEW_ZOOM_RESET),
         accel(ctrl_shift, key(b'M'), IDM_VIEW_MARKDOWN),
+        accel(ctrl_alt, key(b'O'), IDM_VIEW_OUTLINE),
         accel(0, VK_F2, IDM_NOTES_RENAME),
         accel(FALT, VK_UP, IDM_NOTES_MOVE_UP),
         accel(FALT, VK_DOWN, IDM_NOTES_MOVE_DOWN),
@@ -500,7 +614,7 @@ fn accel(modifiers: u8, key: u16, command: u16) -> ACCEL {
 
 /// Shows a message (and keeps the editor focused) when an editor command
 /// fails, e.g. "Select a picture first".
-fn report(app: &App, outcome: Result<(), String>) {
+fn report(app: &mut App, outcome: Result<(), String>) {
     if let Err(message) = outcome {
         status::set_message(app, &message);
         dialogs::info(app.hwnd, &message);
@@ -634,6 +748,11 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_VIEW_ZOOM_OUT => app::zoom(app, Some(false)),
         IDM_VIEW_ZOOM_RESET => app::zoom(app, None),
         IDM_VIEW_MARKDOWN => app::show_markdown(app),
+        IDM_VIEW_OUTLINE => app::show_outline(app),
+        IDM_VIEW_SPELL => app.toggle_spell_check(),
+        IDM_THEME_LIGHT => app.set_theme(Theme::Light),
+        IDM_THEME_DARK => app.set_theme(Theme::Dark),
+        IDM_THEME_CUSTOM => app::choose_custom_theme(app),
         IDM_VIEW_EXPAND_ALL => app.expand_all(),
         IDM_VIEW_COLLAPSE_ALL => app.collapse_all(),
 
@@ -674,11 +793,22 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_NOTES_TRASH_EMPTY => app.empty_trash(),
         IDM_NOTES_PROPERTIES => app::show_properties(app),
         IDM_TOOLS_BACKUP => app.backup_now(),
+        IDM_TOOLS_RESTORE_BACKUP => app.restore_backup_ui(),
+        IDM_TOOLS_REBUILD_MIRROR => app.rebuild_mirror(),
+        IDM_TOOLS_MIRROR_TOGGLE => app.toggle_mirror(),
         IDM_TOOLS_OPEN_DATA => app.open_data_folder(),
         IDM_HELP_ABOUT => dialogs::about(app.hwnd),
         IDM_HELP_SHORTCUTS => dialogs::shortcuts(app.hwnd),
         IDM_TAB_NEXT => app.cycle_tab(1),
         IDM_TAB_PREV => app.cycle_tab(-1),
+        IDM_TAB_CLOSE => app.close_context_tab(),
+        IDM_TAB_CLOSE_OTHERS => app.close_other_tabs(),
+        IDM_TAB_CLOSE_ALL => app.close_all_tabs(),
+        IDM_TAB_COPY_LINK => app.copy_tab_link(),
+        IDM_TAB_REVEAL => app.reveal_tab_note(),
+        id if (IDM_RECENT_FIRST..=IDM_RECENT_LAST).contains(&id) => {
+            app.open_recent((id - IDM_RECENT_FIRST) as usize);
+        }
         _ => {}
     }
 }

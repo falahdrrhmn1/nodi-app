@@ -9,21 +9,24 @@ use std::ptr;
 
 use nodi_core::NoteId;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{GetStockObject, UpdateWindow, DEFAULT_GUI_FONT, HBRUSH};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetStockObject, InvalidateRect, UpdateWindow, DEFAULT_GUI_FONT, HBRUSH,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::SystemServices::SS_OWNERDRAW;
 use windows_sys::Win32::UI::Controls::{EM_SETLIMITTEXT, EM_SETSEL};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetActiveWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgItem, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW,
     IsWindow, LoadCursorW, MessageBoxW, RegisterClassExW, SendMessageW, SetWindowLongPtrW,
     ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW,
     CS_VREDRAW, ES_AUTOHSCROLL, GWLP_USERDATA, IDCANCEL, IDC_ARROW, IDOK, IDYES, LBN_DBLCLK,
     LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
-    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    WM_CREATE, WM_DRAWITEM, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_USER, WNDCLASSEXW, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::win;
@@ -269,16 +272,25 @@ unsafe fn read_text(hwnd: HWND) -> String {
 // -------------------------------------------------------------- icon picker
 
 const IDC_ICON_LIST: i32 = 120;
+const IDC_ICON_FILE: i32 = 121;
+const IDC_ICON_REMOVE: i32 = 122;
+
+/// What the user picked in Change Icon.
+pub enum IconChoice {
+    Builtin(&'static str),
+    File(std::path::PathBuf),
+    Remove,
+}
 
 struct PickIconState {
     entries: Vec<(&'static str, String)>,
     current: String,
     list: HWND,
-    result: Option<&'static str>,
+    result: Option<IconChoice>,
 }
 
-/// Shows the built-in icon set. Returns the chosen key.
-pub fn pick_icon(owner: HWND, current: &str) -> Option<&'static str> {
+/// Shows the built-in icon set plus "From file..." / "Remove icon".
+pub fn pick_icon(owner: HWND, current: &str) -> Option<IconChoice> {
     // SAFETY: the whole dialog lifetime is managed here; every pointer passed
     // out lives in the boxed state or on this stack frame.
     unsafe {
@@ -295,7 +307,7 @@ pub fn pick_icon(owner: HWND, current: &str) -> Option<&'static str> {
             "NodiPickIcon",
             "Change Icon",
             320,
-            300,
+            340,
             state_ptr as *mut core::ffi::c_void,
         );
         if dialog.is_null() {
@@ -337,11 +349,33 @@ unsafe extern "system" fn pick_icon_proc(
                 child(
                     hwnd,
                     "BUTTON",
+                    "From file...",
+                    BS_PUSHBUTTON as u32,
+                    IDC_ICON_FILE,
+                    12,
+                    244,
+                    100,
+                    26,
+                );
+                child(
+                    hwnd,
+                    "BUTTON",
+                    "Remove icon",
+                    BS_PUSHBUTTON as u32,
+                    IDC_ICON_REMOVE,
+                    122,
+                    244,
+                    110,
+                    26,
+                );
+                child(
+                    hwnd,
+                    "BUTTON",
                     "OK",
                     BS_DEFPUSHBUTTON as u32,
                     IDOK,
                     132,
-                    244,
+                    284,
                     75,
                     26,
                 );
@@ -352,7 +386,7 @@ unsafe extern "system" fn pick_icon_proc(
                     BS_PUSHBUTTON as u32,
                     IDCANCEL,
                     217,
-                    244,
+                    284,
                     75,
                     26,
                 );
@@ -373,8 +407,24 @@ unsafe extern "system" fn pick_icon_proc(
             if id == IDOK || double_click {
                 if let Some(state) = dialog_state::<PickIconState>(hwnd) {
                     if let Some(index) = selected_index(state.list) {
-                        state.result = state.entries.get(index).map(|(key, _)| *key);
+                        state.result = state
+                            .entries
+                            .get(index)
+                            .map(|(key, _)| IconChoice::Builtin(key));
                     }
+                }
+                DestroyWindow(hwnd);
+            } else if id == IDC_ICON_FILE {
+                let path = open_image_file(hwnd);
+                if let Some(path) = path {
+                    if let Some(state) = dialog_state::<PickIconState>(hwnd) {
+                        state.result = Some(IconChoice::File(path.into()));
+                    }
+                    DestroyWindow(hwnd);
+                }
+            } else if id == IDC_ICON_REMOVE {
+                if let Some(state) = dialog_state::<PickIconState>(hwnd) {
+                    state.result = Some(IconChoice::Remove);
                 }
                 DestroyWindow(hwnd);
             } else if id == IDCANCEL {
@@ -872,6 +922,486 @@ pub fn open_folder(owner: HWND) -> Option<String> {
     }
     let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
     (length > 0).then(|| String::from_utf16_lossy(&buffer[..length]))
+}
+
+/// Standard "Open" dialog restricted to icon files.
+pub fn open_image_file(owner: HWND) -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OPENFILENAMEW,
+    };
+    let filter: Vec<u16> = "Icons (*.ico;*.png)\0*.ico;*.png\0All files (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut buffer = vec![0u16; 4096];
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrFile = buffer.as_mut_ptr();
+    dialog.nMaxFile = buffer.len() as u32;
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    // SAFETY: the pointers refer to buffers that outlive the call.
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+        return None;
+    }
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    Some(String::from_utf16_lossy(&buffer[..length]))
+}
+
+// ----------------------------------------------------------- restore backup
+
+const IDC_SNAPSHOT_LIST: i32 = 130;
+
+struct SnapshotState {
+    entries: Vec<(String, std::path::PathBuf)>,
+    list: HWND,
+    result: Option<std::path::PathBuf>,
+}
+
+/// Tools > Restore Backup: a list of snapshots (label already contains date
+/// and size). Returns the chosen snapshot directory.
+pub fn pick_snapshot(
+    owner: HWND,
+    entries: &[(String, std::path::PathBuf)],
+) -> Option<std::path::PathBuf> {
+    // SAFETY: as in `pick_icon`.
+    unsafe {
+        ensure_class("NodiSnapshots", Some(snapshot_proc));
+        let state = Box::new(SnapshotState {
+            entries: entries.to_vec(),
+            list: ptr::null_mut(),
+            result: None,
+        });
+        let state_ptr = Box::into_raw(state);
+        let dialog = create_dialog(
+            owner,
+            "NodiSnapshots",
+            "Restore Backup",
+            460,
+            340,
+            state_ptr as *mut core::ffi::c_void,
+        );
+        if dialog.is_null() {
+            drop(Box::from_raw(state_ptr));
+            return None;
+        }
+        run_modal(owner, dialog);
+        let state = Box::from_raw(state_ptr);
+        state.result
+    }
+}
+
+unsafe extern "system" fn snapshot_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_NCCREATE => {
+            let create = lparam as *const CREATESTRUCTW;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*create).lpCreateParams as isize);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_CREATE => {
+            if let Some(state) = dialog_state::<SnapshotState>(hwnd) {
+                child(
+                    hwnd,
+                    "Static",
+                    "Backups (newest first):",
+                    0,
+                    -1,
+                    12,
+                    12,
+                    420,
+                    18,
+                );
+                state.list = child(
+                    hwnd,
+                    "LISTBOX",
+                    "",
+                    listbox_style(),
+                    IDC_SNAPSHOT_LIST,
+                    12,
+                    34,
+                    420,
+                    230,
+                );
+                child(
+                    hwnd,
+                    "BUTTON",
+                    "Restore",
+                    BS_DEFPUSHBUTTON as u32,
+                    IDOK,
+                    272,
+                    274,
+                    75,
+                    26,
+                );
+                child(
+                    hwnd,
+                    "BUTTON",
+                    "Cancel",
+                    BS_PUSHBUTTON as u32,
+                    IDCANCEL,
+                    357,
+                    274,
+                    75,
+                    26,
+                );
+                for (label, _) in &state.entries {
+                    add_string(state.list, label);
+                }
+                if !state.entries.is_empty() {
+                    SendMessageW(state.list, LB_SETCURSEL, 0, 0);
+                }
+                SetFocus(state.list);
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = win::loword(wparam) as i32;
+            let code = win::hiword(wparam) as u32;
+            if id == IDOK || (id == IDC_SNAPSHOT_LIST && code == LBN_DBLCLK) {
+                if let Some(state) = dialog_state::<SnapshotState>(hwnd) {
+                    if let Some(index) = selected_index(state.list) {
+                        state.result = state.entries.get(index).map(|(_, path)| path.clone());
+                    }
+                }
+                DestroyWindow(hwnd);
+            } else if id == IDCANCEL {
+                DestroyWindow(hwnd);
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_NCDESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ------------------------------------------------------------ custom theme
+
+const IDC_THEME_BG_BUTTON: i32 = 150;
+const IDC_THEME_TEXT_BUTTON: i32 = 151;
+const IDC_THEME_ACCENT_BUTTON: i32 = 152;
+const IDC_THEME_BG_SWATCH: i32 = 160;
+const IDC_THEME_TEXT_SWATCH: i32 = 161;
+const IDC_THEME_ACCENT_SWATCH: i32 = 162;
+const IDC_THEME_RESET: i32 = 170;
+
+type PreviewFn = extern "system" fn(HWND, u32, u32, u32);
+
+struct ThemeState {
+    /// `#rrggbb` values, in the same shape as `CustomTheme`.
+    values: [String; 3],
+    brushes: [HBRUSH; 3],
+    preview: PreviewFn,
+    frame: HWND,
+    result: Option<nodi_core::storage::CustomTheme>,
+}
+
+fn colorref(text: &str) -> u32 {
+    match nodi_core::storage::parse_hex_color(text) {
+        Some((red, green, blue)) => red as u32 | (green as u32) << 8 | (blue as u32) << 16,
+        None => 0,
+    }
+}
+
+fn hex_of(colour: u32) -> String {
+    nodi_core::storage::format_hex_color((
+        (colour & 0xFF) as u8,
+        ((colour >> 8) & 0xFF) as u8,
+        ((colour >> 16) & 0xFF) as u8,
+    ))
+}
+
+impl ThemeState {
+    fn new(current: &nodi_core::storage::CustomTheme, preview: PreviewFn, frame: HWND) -> Self {
+        Self {
+            values: [
+                current.background.clone(),
+                current.text.clone(),
+                current.accent.clone(),
+            ],
+            brushes: [ptr::null_mut(); 3],
+            preview,
+            frame,
+            result: None,
+        }
+    }
+
+    fn current(&self) -> nodi_core::storage::CustomTheme {
+        nodi_core::storage::CustomTheme {
+            background: self.values[0].clone(),
+            text: self.values[1].clone(),
+            accent: self.values[2].clone(),
+        }
+    }
+
+    fn notify(&self) {
+        (self.preview)(
+            self.frame,
+            colorref(&self.values[0]),
+            colorref(&self.values[1]),
+            colorref(&self.values[2]),
+        );
+    }
+}
+
+/// View > Theme > Custom...: three `ChooseColor` picks with live preview.
+pub fn custom_theme(
+    owner: HWND,
+    current: nodi_core::storage::CustomTheme,
+    frame: HWND,
+    preview: PreviewFn,
+) -> Option<nodi_core::storage::CustomTheme> {
+    // SAFETY: as in `pick_icon`.
+    unsafe {
+        ensure_class("NodiCustomTheme", Some(theme_proc));
+        let state = Box::new(ThemeState::new(&current, preview, frame));
+        let state_ptr = Box::into_raw(state);
+        let dialog = create_dialog(
+            owner,
+            "NodiCustomTheme",
+            "Custom Theme",
+            360,
+            220,
+            state_ptr as *mut core::ffi::c_void,
+        );
+        if dialog.is_null() {
+            drop(Box::from_raw(state_ptr));
+            return None;
+        }
+        run_modal(owner, dialog);
+        let state = Box::from_raw(state_ptr);
+        for brush in state.brushes {
+            if !brush.is_null() {
+                // SAFETY: every brush was created by this dialog.
+                windows_sys::Win32::Graphics::Gdi::DeleteObject(brush);
+            }
+        }
+        state.result
+    }
+}
+
+unsafe extern "system" fn theme_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_NCCREATE => {
+            let create = lparam as *const CREATESTRUCTW;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*create).lpCreateParams as isize);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_CREATE => {
+            if dialog_state::<ThemeState>(hwnd).is_some() {
+                for (row, (label, button, swatch)) in [
+                    (
+                        "Editor background:",
+                        IDC_THEME_BG_BUTTON,
+                        IDC_THEME_BG_SWATCH,
+                    ),
+                    ("Editor text:", IDC_THEME_TEXT_BUTTON, IDC_THEME_TEXT_SWATCH),
+                    (
+                        "Selection accent:",
+                        IDC_THEME_ACCENT_BUTTON,
+                        IDC_THEME_ACCENT_SWATCH,
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let y = 12 + row as i32 * 42;
+                    child(hwnd, "Static", label, 0, -1, 12, y + 4, 120, 18);
+                    child(
+                        hwnd,
+                        "Static",
+                        "",
+                        SS_OWNERDRAW | WS_BORDER,
+                        swatch,
+                        140,
+                        y,
+                        80,
+                        26,
+                    );
+                    child(
+                        hwnd,
+                        "BUTTON",
+                        "Choose...",
+                        BS_PUSHBUTTON as u32,
+                        button,
+                        230,
+                        y,
+                        110,
+                        26,
+                    );
+                }
+                child(
+                    hwnd,
+                    "BUTTON",
+                    "Reset",
+                    BS_PUSHBUTTON as u32,
+                    IDC_THEME_RESET,
+                    12,
+                    150,
+                    75,
+                    26,
+                );
+                child(
+                    hwnd,
+                    "BUTTON",
+                    "OK",
+                    BS_DEFPUSHBUTTON as u32,
+                    IDOK,
+                    180,
+                    150,
+                    75,
+                    26,
+                );
+                child(
+                    hwnd,
+                    "BUTTON",
+                    "Cancel",
+                    BS_PUSHBUTTON as u32,
+                    IDCANCEL,
+                    265,
+                    150,
+                    75,
+                    26,
+                );
+                SendMessageW(hwnd, WM_USER + 1, 0, 0);
+            }
+            0
+        }
+        msg if msg == WM_USER + 1 => {
+            // Refresh the three swatches from `values`.
+            if let Some(state) = dialog_state::<ThemeState>(hwnd) {
+                for index in 0..3 {
+                    if !state.brushes[index].is_null() {
+                        windows_sys::Win32::Graphics::Gdi::DeleteObject(state.brushes[index]);
+                    }
+                    // SAFETY: creates the brush the dialog owns from now on.
+                    state.brushes[index] = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(
+                        colorref(&state.values[index]),
+                    );
+                    let swatch = [
+                        IDC_THEME_BG_SWATCH,
+                        IDC_THEME_TEXT_SWATCH,
+                        IDC_THEME_ACCENT_SWATCH,
+                    ][index];
+                    let control = GetDlgItem(hwnd, swatch);
+                    if !control.is_null() {
+                        InvalidateRect(control, ptr::null(), 1);
+                    }
+                }
+            }
+            0
+        }
+        WM_DRAWITEM => {
+            let item = lparam as *const windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT;
+            if !item.is_null() {
+                let item = &*item;
+                let index = match item.CtlID as i32 {
+                    IDC_THEME_BG_SWATCH => Some(0),
+                    IDC_THEME_TEXT_SWATCH => Some(1),
+                    IDC_THEME_ACCENT_SWATCH => Some(2),
+                    _ => None,
+                };
+                if let Some(index) = index {
+                    if let Some(state) = dialog_state::<ThemeState>(hwnd) {
+                        windows_sys::Win32::Graphics::Gdi::FillRect(
+                            item.hDC,
+                            &item.rcItem,
+                            state.brushes[index],
+                        );
+                        return 1;
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_COMMAND => {
+            let id = win::loword(wparam) as i32;
+            match id {
+                IDC_THEME_BG_BUTTON | IDC_THEME_TEXT_BUTTON | IDC_THEME_ACCENT_BUTTON => {
+                    let index = match id {
+                        IDC_THEME_BG_BUTTON => 0,
+                        IDC_THEME_TEXT_BUTTON => 1,
+                        _ => 2,
+                    };
+                    if let Some(state) = dialog_state::<ThemeState>(hwnd) {
+                        let initial = colorref(&state.values[index]);
+                        if let Some(chosen) = choose_color(hwnd, initial) {
+                            state.values[index] = hex_of(chosen);
+                            SendMessageW(hwnd, WM_USER + 1, 0, 0);
+                            state.notify();
+                        }
+                    }
+                }
+                IDC_THEME_RESET => {
+                    if let Some(state) = dialog_state::<ThemeState>(hwnd) {
+                        let defaults = nodi_core::storage::CustomTheme::default();
+                        state.values = [
+                            defaults.background.clone(),
+                            defaults.text.clone(),
+                            defaults.accent.clone(),
+                        ];
+                        SendMessageW(hwnd, WM_USER + 1, 0, 0);
+                        state.notify();
+                    }
+                }
+                IDOK => {
+                    if let Some(state) = dialog_state::<ThemeState>(hwnd) {
+                        state.result = Some(state.current());
+                    }
+                    DestroyWindow(hwnd);
+                }
+                IDCANCEL => {
+                    DestroyWindow(hwnd);
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_NCDESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn choose_color(owner: HWND, initial: u32) -> Option<u32> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
+    };
+    let mut custom = [0u32; 16];
+    let mut dialog: CHOOSECOLORW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<CHOOSECOLORW>() as u32;
+    dialog.hwndOwner = owner;
+    dialog.rgbResult = initial;
+    dialog.lpCustColors = custom.as_mut_ptr();
+    dialog.Flags = CC_FULLOPEN | CC_RGBINIT;
+    // SAFETY: every pointer refers to this stack frame and outlives the call.
+    if unsafe { ChooseColorW(&mut dialog) } == 0 {
+        None
+    } else {
+        Some(dialog.rgbResult)
+    }
 }
 
 // Keep the instance handle import used (documentation for the class instance).

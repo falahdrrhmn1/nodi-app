@@ -15,7 +15,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR};
 use nodi_core::tree::Position;
 
 use crate::app::App;
-use crate::wnd::{editkeys, editor, format, formula, image, link, menu, table, toolbar, tree};
+use crate::wnd::{
+    editkeys, editor, format, formula, image, link, menu, outline, status, table, tabs, toolbar,
+    tree,
+};
 
 /// `dwData` of every test command ('NODT').
 pub const MAGIC: usize = 0x4E4F_4454;
@@ -74,6 +77,146 @@ fn run(app: &mut App, line: &str) -> String {
             }
             Err(_) => "bad id".to_owned(),
         },
+        ("counts", _) => app
+            .status_text
+            .get(status::PART_COUNTS)
+            .cloned()
+            .unwrap_or_default(),
+        ("recent", _) => app
+            .recent
+            .iter()
+            .map(|id| {
+                app.tree
+                    .get(id)
+                    .map(|node| node.title.clone())
+                    .unwrap_or_else(|| "?".to_owned())
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
+        ("theme", _) => {
+            let name = match app.settings.theme {
+                nodi_core::storage::Theme::Light => "light",
+                nodi_core::storage::Theme::Dark => "dark",
+                nodi_core::storage::Theme::Custom => "custom",
+            };
+            format!(
+                "{name} dark={} bg=#{:06x} text=#{:06x} spell={} mirror={}",
+                u8::from(app.palette.dark),
+                app.palette.editor_bg,
+                app.palette.editor_text,
+                u8::from(app.settings.spell_check),
+                u8::from(app.settings.markdown_mirror),
+            )
+        }
+        ("spell", _) => {
+            let want = rest.trim();
+            let is_on = app.settings.spell_check;
+            if (want == "on" && !is_on) || (want == "off" && is_on) {
+                app.toggle_spell_check();
+            }
+            u8::from(app.settings.spell_check).to_string()
+        }
+        ("mirror", _) => {
+            let want = rest.trim();
+            if want == "now" {
+                app.rebuild_mirror();
+            } else if (want == "on" || want == "off")
+                && (want == "on") != app.settings.markdown_mirror
+            {
+                app.toggle_mirror();
+            }
+            u8::from(app.settings.markdown_mirror).to_string()
+        }
+        ("outline", Some(window)) => outline::headings(&editor::plain_text(window))
+            .iter()
+            .map(|entry| format!("{}|{}|{}", entry.level, entry.offset, entry.label.trim()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ("outline-jump", Some(window)) => {
+            let index: usize = rest.trim().parse().unwrap_or(0);
+            let entries = outline::headings(&editor::plain_text(window));
+            match entries.get(index.saturating_sub(1)) {
+                Some(entry) => {
+                    editor::set_selection(window, entry.offset, entry.offset);
+                    editor::scroll_caret(window);
+                    status::update_caret(app);
+                    status::update_counts(app);
+                    format!("{}", entry.offset)
+                }
+                None => "no heading".to_owned(),
+            }
+        }
+        ("restore-latest", _) => match app.restore_latest_backup() {
+            Ok(name) => name,
+            Err(message) => message,
+        },
+        ("close-others", _) => {
+            if let Ok(index) = rest.trim().parse::<usize>() {
+                app.tab_context = Some(index);
+            }
+            if app.tab_context.is_none() {
+                app.tab_context = Some(0);
+            }
+            app.close_other_tabs();
+            app.tabs.len().to_string()
+        }
+        ("close-all", _) => {
+            if let Ok(index) = rest.trim().parse::<usize>() {
+                if app.tabs.get(index).is_some() {
+                    app.tab_context = Some(index);
+                }
+            }
+            app.close_all_tabs();
+            app.tabs.len().to_string()
+        }
+        ("mirror-now", _) => {
+            app.rebuild_mirror();
+            "ok".to_owned()
+        }
+        ("icon-from-file", _) => {
+            let Some(id) = app.selected.clone().or_else(|| app.context_note.clone()) else {
+                return "no selection".to_owned();
+            };
+            match app.add_icon_file(std::path::Path::new(rest.trim())) {
+                Ok(key) => {
+                    app.set_icon(id, key);
+                    key.to_owned()
+                }
+                Err(message) => message,
+            }
+        }
+        ("tabcount", _) => app.tabs.len().to_string(),
+        ("editorrect", Some(window)) => {
+            let mut rect = windows_sys::Win32::Foundation::RECT::default();
+            // SAFETY: `rect` is a valid out-parameter; `window` is ours.
+            let ok = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(window, &mut rect)
+            };
+            if ok == 0 {
+                "none".to_owned()
+            } else {
+                format!(
+                    "{}x{}+{}+{}",
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    rect.left,
+                    rect.top
+                )
+            }
+        }
+        ("tabanchor", _) => {
+            let index = rest
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|_| app.active.unwrap_or(0));
+            match app.tabs.get(index) {
+                Some(_) => {
+                    let point = tabs::screen_anchor(app, index);
+                    format!("{} {}", point.x, point.y)
+                }
+                None => "none".to_owned(),
+            }
+        }
         ("select-title", _) => {
             let found = app
                 .tree

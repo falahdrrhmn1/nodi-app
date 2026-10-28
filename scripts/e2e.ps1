@@ -44,6 +44,8 @@ public static class NodiHook {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int command);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint threadId);
+    [DllImport("user32.dll")] static extern bool SwitchDesktop(IntPtr hDesktop);
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint to, bool on);
     [DllImport("user32.dll")] static extern void SwitchToThisWindow(IntPtr hwnd, bool altTab);
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
@@ -122,6 +124,8 @@ public static class NodiHook {
     /// `AttachThreadInput` dance is the usual workaround for the foreground
     /// lock; the return value is checked by comparing `GetForegroundWindow`.
     public static bool Foreground(IntPtr hwnd) {
+        IntPtr cur = GetThreadDesktop(GetCurrentThreadId());
+        if (cur != IntPtr.Zero) SwitchDesktop(cur);
         ShowWindow(hwnd, 9); // SW_RESTORE
         // The "Alt trick": a synthetic Alt press ends the foreground lock.
         keybd_event(0x12, 0, 0, UIntPtr.Zero);
@@ -1179,6 +1183,166 @@ Test-Case 'AF' 'tree drag and drop before / after / inside' {
     Assert (@($nodes | Where-Object title -eq 'Gamma')[0].order -eq 1) 'Gamma order changed'
     ''
 }
+# --------------------------------------------------------------- batch 4 (AG-AL)
+Test-Case 'AG' 'dark theme: persists, editor is dark, stored colours stay automatic' {
+    $data = New-DataDir 'AG'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 301' | Out-Null            # View > Theme > Dark
+    Invoke-Nodi $nodi 'type Teks gelap' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    $live = Invoke-Nodi $nodi 'fmt 0 4'
+    Stop-Nodi $nodi
+    $settings = Get-Content -Raw (Join-Path $data 'settings.json') | ConvertFrom-Json
+    Assert ($settings.theme -eq 'dark') "theme not persisted: $($settings.theme)"
+
+    $nodi = Start-Nodi $data
+    $theme = Invoke-Nodi $nodi 'theme'
+    Assert ($theme -like 'dark dark=1 bg=#1e1e1e*') "theme after restart: $theme"
+    # The editor really paints dark: sample the empty area below the text.
+    . (Join-Path $PSScriptRoot 'probe-lib.ps1')
+    $shot = Join-Path $data 'shot.png'
+    Save-Shot $nodi $shot | Out-Null
+    $rect = (Invoke-Nodi $nodi 'editorrect') -split '[x+]'
+    $window = New-Object NodiShot+RECT
+    [NodiShot]::GetWindowRect($nodi.Hwnd, [ref]$window) | Out-Null
+    $bitmap = [Drawing.Bitmap]::FromFile($shot)
+    $x = [int]$rect[2] - $window.L + [int]$rect[0] / 2
+    $y = [int]$rect[3] - $window.T + [int]$rect[1] - 20
+    $pixel = $bitmap.GetPixel($x, $y)
+    $bitmap.Dispose()
+    Assert ($pixel.R -lt 60 -and $pixel.G -lt 60 -and $pixel.B -lt 60) "editor is not dark at ($x,$y): $pixel"
+
+    # Back to light: the text is automatic (black), not the dark display colour.
+    Invoke-Nodi $nodi 'cmd 300' | Out-Null
+    $light = Invoke-Nodi $nodi 'fmt 0 4'
+    Stop-Nodi $nodi
+    Assert ($live -match 'colour=auto') "dark-theme text does not read as automatic: $live"
+    Assert ($light -match 'colour=auto') "text is not automatic after switching back: $light"
+    $rtf = Get-ChildItem (Join-Path $data 'notes') -Filter *.rtf | Select-Object -First 1
+    $markdownView = [IO.File]::ReadAllText($rtf.FullName)
+    Assert ($markdownView -notmatch '\\cf[1-9][0-9]* ?Teks gelap') 'stored text carries a display colour'
+    "(pixel $($pixel.R),$($pixel.G),$($pixel.B))"
+}
+
+Test-Case 'AH' 'Markdown mirror follows create, rename and move' {
+    $data = New-DataDir 'AH'
+    $mirror = Join-Path $data 'markdown'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'rename-selected Rapat' | Out-Null
+    Invoke-Nodi $nodi 'type Agenda minggu ini' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    $file = Join-Path $mirror 'Rapat.md'
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while (-not ((Test-Path $file) -and (Get-Content -Raw $file).Contains('Agenda minggu ini')) -and $watch.ElapsedMilliseconds -lt 4000) {
+        Start-Sleep -Milliseconds 100
+    }
+    Assert (Test-Path $file) 'Rapat.md was not written'
+    $body = Get-Content -Raw $file
+    Assert ($body.StartsWith('---')) "no front matter:`n$body"
+    Assert ($body.Contains('Agenda minggu ini')) "text missing:`n$body"
+
+    Invoke-Nodi $nodi 'rename-selected Rapat Besar' | Out-Null
+    Invoke-Nodi $nodi 'cmd 174' | Out-Null            # New Folder
+    Invoke-Nodi $nodi 'rename-selected Kantor' | Out-Null
+    Invoke-Nodi $nodi 'cancel-rename' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'move-rel Rapat Besar inside Kantor') -eq 'ok') 'move failed'
+    $moved = Join-Path $mirror 'Kantor\Rapat Besar.md'
+    $watch.Restart()
+    while (-not (Test-Path $moved) -and $watch.ElapsedMilliseconds -lt 4000) { Start-Sleep -Milliseconds 100 }
+    Stop-Nodi $nodi
+    Assert (Test-Path $moved) 'the mirror did not follow the rename + move'
+    Assert ((Get-Content -Raw $moved).Contains('Agenda minggu ini')) 'moved mirror lost its text'
+    Assert (-not (Test-Path $file)) 'the old mirror file is still there'
+    $kept = @(Get-ChildItem -Recurse (Join-Path $mirror '.trash') -Filter 'Rapat.md').Count
+    Assert ($kept -ge 1) 'the old mirror file was not kept in .trash'
+    $index = Get-Content -Raw (Join-Path $mirror 'INDEX.md')
+    Assert ($index.Contains('Rapat Besar')) "INDEX.md:`n$index"
+    $json = Get-Content -Raw (Join-Path $mirror 'index.json') | ConvertFrom-Json
+    Assert ($json.notes.Count -ge 1 -or $json.Count -ge 1) 'index.json is empty'
+    ''
+}
+
+Test-Case 'AI' 'status bar counts words and characters' {
+    $data = New-DataDir 'AI'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'type satu dua tiga' | Out-Null
+    $counts = Invoke-Nodi $nodi 'counts'
+    Invoke-Nodi $nodi 'select 0 8' | Out-Null
+    $selected = Invoke-Nodi $nodi 'counts'
+    Stop-Nodi $nodi
+    Assert ($counts -match '\b3 words') "note counts: $counts"
+    Assert ($counts -match '\b13 ch') "note chars: $counts"
+    Assert ($selected -match '\b2 words') "selection counts: $selected"
+    "($counts / $selected)"
+}
+
+Test-Case 'AJ' 'tab menu: Close Others keeps one tab' {
+    $data = New-DataDir 'AJ'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    $before = Invoke-Nodi $nodi 'tabcount'
+    $after = Invoke-Nodi $nodi 'close-others 1'
+    $tree = @((Read-Tree $data).nodes).Count
+    Stop-Nodi $nodi
+    Assert ($before -eq '3') "expected 3 tabs, got $before"
+    Assert ($after -eq '1') "Close Others left $after tabs"
+    Assert ($tree -eq 3) 'closing tabs must not delete notes'
+    ''
+}
+
+Test-Case 'AK' 'restore backup round trip' {
+    $data = New-DataDir 'AK'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'rename-selected Sebelum' | Out-Null
+    Assert ((Wait-State $nodi 'Saved' 3000) -ge 0) 'never Saved'
+    $backups = Join-Path $data 'backups'
+    $count = @(Get-ChildItem $backups -Directory -ErrorAction SilentlyContinue).Count
+    Invoke-Nodi $nodi 'cmd 190' | Out-Null            # Tools > Backup Now
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while (@(Get-ChildItem $backups -Directory -ErrorAction SilentlyContinue).Count -le $count -and $watch.ElapsedMilliseconds -lt 5000) {
+        Start-Sleep -Milliseconds 100
+    }
+    Start-Sleep -Milliseconds 300
+    Invoke-Nodi $nodi 'rename-selected Sesudah' | Out-Null
+    $restored = Invoke-Nodi $nodi 'restore-latest'
+    $title = (Invoke-Nodi $nodi 'tabs') -split "`n" | Select-Object -Last 1
+    Stop-Nodi $nodi
+    $nodes = (Read-Tree $data).nodes
+    Assert (@($nodes | Where-Object title -eq 'Sebelum').Count -eq 1) "restore did not bring 'Sebelum' back ($restored): $(($nodes | ForEach-Object title) -join ',')"
+    $snapshots = @(Get-ChildItem $backups -Directory).Count
+    Assert ($snapshots -ge $count + 2) "restore must snapshot the current state first ($snapshots snapshots)"
+    "(restored $restored, tab '$title')"
+}
+
+Test-Case 'AL' 'recent notes and Ctrl+Alt+O with real keys' {
+    $data = New-DataDir 'AL'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'rename-selected Pertama' | Out-Null
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Kedua' | Out-Null
+    Invoke-Nodi $nodi 'select-title Pertama' | Out-Null
+    $recent = Invoke-Nodi $nodi 'recent'
+    Assert ($recent -match 'Pertama' -and $recent -match 'Kedua') "recent list: $recent"
+    if (-not [NodiHook]::Foreground($nodi.Hwnd)) {
+        Stop-Nodi $nodi
+        return "NOT TESTED (real keys): foreground; recent '$recent'"
+    }
+    Add-Type -AssemblyName System.Windows.Forms
+    Start-Sleep -Milliseconds 250
+    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    Start-Sleep -Milliseconds 100
+    [System.Windows.Forms.SendKeys]::SendWait('^%o')
+    Start-Sleep -Milliseconds 300
+    $last = Invoke-Nodi $nodi 'lastcmd'
+    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    Stop-Nodi $nodi
+    $session = Get-Content -Raw (Join-Path $data 'session.json')
+    Assert ($last -match '142') "Ctrl+Alt+O did not reach View > Outline: $last"
+    Assert ($session -match 'recent') 'recent notes are not stored in the session'
+    "(recent $recent)"
+}
+
 # --------------------------------------------------------------------- report
 
 $failed = 0
@@ -1187,4 +1351,5 @@ foreach ($entry in $results.GetEnumerator()) {
     if ($entry.Value -like 'FAIL*') { $failed++ }
 }
 "--- $($results.Count - $failed) passed, $failed failed"
-exit $failed
+# Dot-sourcing (probe scripts) must not exit the caller.
+if ($MyInvocation.InvocationName -ne '.') { exit $failed }

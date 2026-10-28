@@ -62,7 +62,19 @@ data/notes/<id>.txt       plain-text sidecar for search
 data/notes/<id>.rtf.prev  previous good version
 data/backups/<ts>/        snapshots (daily at startup + Tools > Backup Now), keep 20
 data/recovery/            leftover .tmp files after a crash, purged notes
+data/settings.json        theme (light/dark/custom colours), spell check, mirror on/off
+data/icons/               note icons chosen from files
+data/markdown/            Markdown mirror for AI agents (derived, never read back)
+  INDEX.md, index.json    outline + machine-readable list of every note
+  <folders>/<title>.md    front matter (id, title, parent, path, dates) + Markdown
+  .trash/<ts>/            mirror files of renamed/moved/trashed notes
 ```
+
+The Markdown mirror is written by the writer thread after the writer has been
+idle for 300 ms (and once on shutdown), so it never delays `Saved` or exit:
+saved notes are converted from the RTF just written, and a tree change only
+re-plans paths (`mirror::sync` converts just the notes whose place changed).
+At startup a mirror file newer than its note is trusted as it is.
 
 ## Save pipeline (no data loss is priority #1)
 
@@ -100,15 +112,24 @@ data/recovery/            leftover .tmp files after a crash, purged notes
   therefore stored as a picture inside a `HYPERLINK "nodi-math:<LaTeX>"` field.
 - Without an OLE callback Rich Edit only pastes text/RTF; clipboard pictures
   (PNG, DIB) are inserted by Nodi.
+- Automatic text colour is always painted with the system window-text colour
+  (black); `EM_SETBKGNDCOLOR` only changes the background. Dark themes
+  therefore *display* automatic and pure-black text through two near-white
+  colour-table entries: `editor::set_selection_format` / `insert_rtf` /
+  `apply_default_colour` map to them, and `stream_out_rtf` / `selection_rtf`
+  fold them back, so every consumer (autosave, Markdown, mirror, links) sees
+  the stored colours. Text without any `\cf` gets an explicit one when themed.
+- Rich Edit forces `\ul` and the link colour on a field result, so the
+  separator is a plain, very flat picture recognised by its shape
+  (`image::is_rule_picture`), not a `nodi-hr:` link (older notes still work).
 
 ## Markdown
 
 Visual editing is the source of truth. Markdown is generated on demand
-(View > Markdown Source, File > Export Note as Markdown) and never written back
-into the note, so nothing is lost silently. Features Markdown cannot express
-are listed in the export dialog. Markdown source *editing* (Markdown → RTF) is
-not implemented yet; the core keeps the conversion in `nodi-core` so it can be
-added (and reused on Android) later.
+(View > Markdown Source, File > Export Note as Markdown, the AI mirror) and
+never written back into the note, so nothing is lost silently. Features
+Markdown cannot express are listed in the export dialog. Markdown → RTF
+(`markdown_in`, `html_in`) is used for pasting from ChatGPT and web pages.
 
 ## Android later
 

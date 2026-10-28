@@ -183,7 +183,11 @@ impl<'a> Reader<'a> {
             let hex = std::mem::take(&mut self.picture_hex);
             let bytes = decode_hex(&hex);
             let target = self.link.as_deref();
-            if target.is_some_and(crate::links::is_rule_link) {
+            // Older notes mark the rule with a `nodi-hr:` link; newer ones only
+            // by the picture's shape (Rich Edit underlines link results).
+            if target.is_some_and(crate::links::is_rule_link)
+                || crate::image::is_rule_picture(&bytes)
+            {
                 self.push_inline(Inline::Rule);
             } else if let Some(latex) = target.and_then(crate::links::parse_math_link) {
                 self.push_inline(Inline::Math(latex));

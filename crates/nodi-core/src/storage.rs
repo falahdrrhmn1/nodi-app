@@ -88,6 +88,26 @@ impl DataDir {
         self.root.join("session.json")
     }
 
+    /// `settings.json`
+    pub fn settings_path(&self) -> PathBuf {
+        self.root.join("settings.json")
+    }
+
+    /// `markdown/` — the AI-agent-readable mirror (derived, never read back).
+    pub fn markdown_dir(&self) -> PathBuf {
+        self.root.join("markdown")
+    }
+
+    /// `icons/` - copies of note icons the user picked from a file.
+    pub fn icons_dir(&self) -> PathBuf {
+        self.root.join("icons")
+    }
+
+    /// `icons/<name>` for a user-supplied icon.
+    pub fn icon_path(&self, name: &str) -> PathBuf {
+        self.icons_dir().join(name)
+    }
+
     /// `notes/`
     pub fn notes_dir(&self) -> PathBuf {
         self.root.join("notes")
@@ -142,6 +162,8 @@ impl DataDir {
             self.backups_dir(),
             self.logs_dir(),
             self.recovery_dir(),
+            self.icons_dir(),
+            self.markdown_dir(),
         ] {
             fs::create_dir_all(dir)?;
         }
@@ -284,6 +306,29 @@ impl DataDir {
     pub fn save_note(&self, id: &NoteId, rtf: &[u8], txt: &str) -> io::Result<()> {
         self.atomic_write_keep_prev(&self.note_path(id), rtf)?;
         self.atomic_write(&self.note_txt_path(id), txt.as_bytes())
+    }
+
+    /// Copies a user-chosen icon into `icons/` and returns its path. The name
+    /// is reduced to safe characters; the extension is preserved so the tree
+    /// loader knows whether to use `LoadImage` or the PNG decoder.
+    pub fn save_icon(&self, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+        let mut safe: String = name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ' ') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        safe = safe.trim().trim_end_matches('.').to_owned();
+        if safe.is_empty() {
+            safe = "icon.bin".to_owned();
+        }
+        let path = self.icon_path(&safe);
+        self.atomic_write(&path, bytes)?;
+        Ok(path)
     }
 
     /// Reads `session.json`, falling back to defaults when the file is absent.
@@ -460,6 +505,9 @@ pub struct Session {
     /// Editor zoom in percent.
     #[serde(default = "default_zoom")]
     pub zoom: i32,
+    /// File > Recent, newest first.
+    #[serde(default)]
+    pub recent: Vec<NoteId>,
 }
 
 fn default_sidebar_width() -> i32 {
@@ -484,6 +532,7 @@ impl Default for Session {
             expanded: Vec::new(),
             word_wrap: true,
             zoom: 100,
+            recent: Vec::new(),
         }
     }
 }
@@ -501,6 +550,120 @@ impl Session {
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+    }
+}
+
+/// Colour theme chosen in View > Theme.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Light,
+    Dark,
+    Custom,
+}
+
+/// The three colours picked in View > Theme > Custom...
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomTheme {
+    /// Editor background, `#rrggbb`.
+    pub background: String,
+    /// Editor text, `#rrggbb`.
+    pub text: String,
+    /// Selection/highlight accent, `#rrggbb`.
+    pub accent: String,
+}
+
+impl Default for CustomTheme {
+    fn default() -> Self {
+        Self {
+            background: "#ffffff".to_owned(),
+            text: "#1f1f1f".to_owned(),
+            accent: "#cce8ff".to_owned(),
+        }
+    }
+}
+
+/// App-wide settings (`settings.json`). Missing files and unknown fields are
+/// fine; every value has a safe default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default)]
+    pub theme: Theme,
+    #[serde(default)]
+    pub custom: CustomTheme,
+    /// Tools > "Keep Markdown mirror for AI agents" (default ON).
+    #[serde(default = "default_true")]
+    pub markdown_mirror: bool,
+    /// View > Spell Check (default off).
+    #[serde(default)]
+    pub spell_check: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::Light,
+            custom: CustomTheme::default(),
+            markdown_mirror: true,
+            spell_check: false,
+        }
+    }
+}
+
+impl Settings {
+    /// The `settings.json` text.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+
+    /// Replaces an unparsable colour with its default so a hand-edited file
+    /// can never make the editor unreadable.
+    pub fn clamp(&mut self) {
+        let defaults = CustomTheme::default();
+        for (value, fallback) in [
+            (&mut self.custom.background, &defaults.background),
+            (&mut self.custom.text, &defaults.text),
+            (&mut self.custom.accent, &defaults.accent),
+        ] {
+            if parse_hex_color(value).is_none() {
+                *value = (*fallback).clone();
+            }
+        }
+    }
+}
+
+/// Parses `#rrggbb` (or `rrggbb`) into RGB bytes.
+pub fn parse_hex_color(text: &str) -> Option<(u8, u8, u8)> {
+    let hex = text.trim().strip_prefix('#').unwrap_or(text.trim());
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some((red, green, blue))
+}
+
+/// Formats RGB bytes as `#rrggbb`.
+pub fn format_hex_color((red, green, blue): (u8, u8, u8)) -> String {
+    format!("#{red:02x}{green:02x}{blue:02x}")
+}
+
+impl DataDir {
+    /// Reads `settings.json`; missing or corrupt files fall back to defaults.
+    pub fn load_settings(&self) -> Settings {
+        let mut settings = fs::read_to_string(self.settings_path())
+            .ok()
+            .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+            .unwrap_or_default();
+        settings.clamp();
+        settings
+    }
+
+    /// Saves `settings.json` atomically.
+    pub fn save_settings(&self, settings: &Settings) -> io::Result<()> {
+        self.atomic_write(&self.settings_path(), settings.to_json().as_bytes())
     }
 }
 

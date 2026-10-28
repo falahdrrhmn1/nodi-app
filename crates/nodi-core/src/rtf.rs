@@ -143,6 +143,276 @@ pub fn has_picture(rtf: &str) -> bool {
     rtf.contains("{\\pict")
 }
 
+/// Folds theme-rendered colours back to their storage meaning before saving.
+///
+/// Dark mode displays automatic text as `auto_rgb` (near-white) and pure black
+/// text as `black_rgb` (a second, one-step-different near-white) so black text
+/// stays readable. This function rewrites every `\cfN` that refers to those two
+/// colour-table entries: `auto_rgb` becomes `\cf0` (automatic) and `black_rgb`
+/// becomes the table entry for black (added when missing). Other colours are
+/// untouched, so the RTF stored on disk keeps the note's real colours.
+pub fn fold_theme_colors(rtf: &str, auto_rgb: (u8, u8, u8), black_rgb: (u8, u8, u8)) -> String {
+    if auto_rgb == black_rgb {
+        return rtf.to_owned();
+    }
+    let Some(start) = rtf.find("{\\colortbl") else {
+        return rtf.to_owned();
+    };
+    let Some(len) = group_len(&rtf[start..]) else {
+        return rtf.to_owned();
+    };
+    let end = start + len;
+    let header_len = "{\\colortbl".len();
+    let body = &rtf[start + header_len..end - 1];
+
+    // Entry 0 is the implicit "auto" slot before the first semicolon.
+    let mut entries: Vec<Option<(u8, u8, u8)>> = vec![None];
+    let mut segments: Vec<&str> = body.split(';').skip(1).collect();
+    // The text after the final semicolon is not an entry.
+    if segments
+        .last()
+        .is_some_and(|segment| segment.trim().is_empty())
+    {
+        segments.pop();
+    }
+    for segment in segments {
+        let rgb = (
+            control_value(segment, "\\red").unwrap_or(0).clamp(0, 255) as u8,
+            control_value(segment, "\\green").unwrap_or(0).clamp(0, 255) as u8,
+            control_value(segment, "\\blue").unwrap_or(0).clamp(0, 255) as u8,
+        );
+        let has_colour =
+            segment.contains("\\red") || segment.contains("\\green") || segment.contains("\\blue");
+        entries.push(has_colour.then_some(rgb));
+    }
+
+    let auto_index = entries
+        .iter()
+        .position(|entry| *entry == Some(auto_rgb))
+        .map(|index| index as i32);
+    let Some(auto_index) = auto_index else {
+        return rtf.to_owned();
+    };
+
+    let mut table = rtf[start..end].to_owned();
+    // The theme rendered black text through a second sentinel entry; fold it
+    // back to the note's real black entry (appended when the note has none).
+    let rendered_black = entries
+        .iter()
+        .position(|entry| *entry == Some(black_rgb))
+        .map(|index| index as i32);
+    let black_index = match entries
+        .iter()
+        .position(|entry| *entry == Some((0, 0, 0)))
+        .map(|index| index as i32)
+    {
+        Some(index) => index,
+        None => {
+            let index = entries.len() as i32;
+            let at = table.len() - 1;
+            table.insert_str(at, "\\red0\\green0\\blue0;");
+            index
+        }
+    };
+
+    let mut mappings = vec![(auto_index, 0)];
+    if let Some(rendered) = rendered_black {
+        if rendered != black_index {
+            mappings.push((rendered, black_index));
+        }
+    }
+    let replaced = rewrite_color_refs(&rtf[..start], &mappings);
+    let rest = rewrite_color_refs(&rtf[end..], &mappings);
+    format!("{replaced}{table}{rest}")
+}
+
+/// Applies display-only theme colours before streaming RTF into an editor.
+///
+/// Automatic text (`\cf0`) is pointed at an `auto_rgb` colour-table entry and
+/// every explicit pure-black entry at a `black_rgb` entry, so a dark theme can
+/// render otherwise-black text light without changing the RTF on disk:
+/// [`fold_theme_colors`] reverses both before the next save.
+///
+/// Text that never names a colour is automatic too, so an explicit `\cf0` is
+/// added where the document body starts and after every `\plain` (and a
+/// colour table when the RTF has none).
+pub fn apply_theme_colors(rtf: &str, auto_rgb: (u8, u8, u8), black_rgb: (u8, u8, u8)) -> String {
+    // Re-applying to an already themed document must first undo the previous
+    // pass, otherwise the sentinel entries would be folded into each other.
+    let folded = fold_theme_colors(rtf, auto_rgb, black_rgb);
+    if auto_rgb == black_rgb || !folded.starts_with("{\\rtf") {
+        return folded;
+    }
+    let folded = with_explicit_auto_colour(&folded);
+    let Some(start) = folded.find("{\\colortbl") else {
+        return folded;
+    };
+    let Some(len) = group_len(&folded[start..]) else {
+        return folded;
+    };
+    let end = start + len;
+    let header_len = "{\\colortbl".len();
+    let body = &folded[start + header_len..end - 1];
+
+    let mut entries = colour_entries(body);
+    let mut table = folded[start..end].to_owned();
+    let auto_index = ensure_colour(&mut entries, &mut table, auto_rgb);
+    let black_index = ensure_colour(&mut entries, &mut table, black_rgb);
+
+    let mut mappings = vec![(0, auto_index)];
+    for (index, entry) in entries.iter().enumerate() {
+        if *entry == Some((0, 0, 0)) {
+            mappings.push((index as i32, black_index));
+        }
+    }
+    let replaced = rewrite_color_refs(&folded[..start], &mappings);
+    let rest = rewrite_color_refs(&folded[end..], &mappings);
+    format!("{replaced}{table}{rest}")
+}
+
+/// Parses the inside of a `{\colortbl ...}` group. Index 0 is the implicit
+/// automatic slot before the first semicolon; `None` marks it and any entry
+/// without an explicit colour.
+fn colour_entries(body: &str) -> Vec<Option<(u8, u8, u8)>> {
+    let mut entries: Vec<Option<(u8, u8, u8)>> = vec![None];
+    let mut segments: Vec<&str> = body.split(';').skip(1).collect();
+    if segments
+        .last()
+        .is_some_and(|segment| segment.trim().is_empty())
+    {
+        segments.pop();
+    }
+    for segment in segments {
+        let rgb = (
+            control_value(segment, "\\red").unwrap_or(0).clamp(0, 255) as u8,
+            control_value(segment, "\\green").unwrap_or(0).clamp(0, 255) as u8,
+            control_value(segment, "\\blue").unwrap_or(0).clamp(0, 255) as u8,
+        );
+        let has_colour =
+            segment.contains("\\red") || segment.contains("\\green") || segment.contains("\\blue");
+        entries.push(has_colour.then_some(rgb));
+    }
+    entries
+}
+
+/// Returns the index of `rgb` in the table, appending it when missing.
+fn ensure_colour(
+    entries: &mut Vec<Option<(u8, u8, u8)>>,
+    table: &mut String,
+    (red, green, blue): (u8, u8, u8),
+) -> i32 {
+    if let Some(index) = entries
+        .iter()
+        .position(|entry| *entry == Some((red, green, blue)))
+    {
+        return index as i32;
+    }
+    let index = entries.len() as i32;
+    entries.push(Some((red, green, blue)));
+    let at = table.len().saturating_sub(1);
+    table.insert_str(at, &format!("\\red{red}\\green{green}\\blue{blue};"));
+    index
+}
+
+/// Replaces `\cfN` for the given index pairs (control-word aware, so `\cf1`
+/// never eats the prefix of `\cf12`). Other colour references are left alone.
+/// Adds a colour table when there is none, and an explicit `\cf0` at the start
+/// of the body and after every `\plain` that is not followed by a `\cf`
+/// already (so applying twice adds nothing).
+fn with_explicit_auto_colour(rtf: &str) -> String {
+    let mut text = rtf.to_owned();
+    if !text.contains("{\\colortbl") {
+        let at = text
+            .find("{\\fonttbl")
+            .and_then(|start| group_len(&text[start..]).map(|len| start + len))
+            .unwrap_or("{\\rtf1".len().min(text.len()));
+        text.insert_str(at, "{\\colortbl ;}");
+    }
+    let Some(table) = text.find("{\\colortbl") else {
+        return text;
+    };
+    let Some(len) = group_len(&text[table..]) else {
+        return text;
+    };
+    let body = table + len;
+    if !text[body..].starts_with("\\cf0") {
+        text.insert_str(body, "\\cf0 ");
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 1 < bytes.len()
+            && bytes[index + 1].is_ascii()
+            && !bytes[index + 1].is_ascii_alphabetic()
+        {
+            // `\\`, `\{`, `\}`, `\'xx`, ...: an escape, never a control word.
+            out.push_str(&text[index..index + 2]);
+            index += 2;
+            continue;
+        }
+        if text[index..].starts_with("\\plain") {
+            let after = index + "\\plain".len();
+            let word_ends = bytes.get(after).is_none_or(|b| !b.is_ascii_alphanumeric());
+            if word_ends {
+                out.push_str("\\plain");
+                index = after;
+                let rest = text[index..].trim_start_matches(' ');
+                if !rest.starts_with("\\cf") {
+                    out.push_str("\\cf0");
+                }
+                continue;
+            }
+        }
+        let ch = text[index..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn rewrite_color_refs(text: &str, mappings: &[(i32, i32)]) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 1 < bytes.len()
+            && bytes[index + 1].is_ascii()
+            && !bytes[index + 1].is_ascii_alphabetic()
+        {
+            // An escape such as `\\` (literal backslash): skip both bytes so
+            // text like `\\cf1` is never read as a colour reference.
+            out.push_str(&text[index..index + 2]);
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'\\' && text[index..].starts_with("\\cf") {
+            let digits_start = index + 3;
+            let mut digits_end = digits_start;
+            while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+                digits_end += 1;
+            }
+            if digits_end > digits_start {
+                if let Ok(value) = text[digits_start..digits_end].parse::<i32>() {
+                    if let Some((_, to)) = mappings.iter().find(|(from, _)| *from == value) {
+                        out.push_str("\\cf");
+                        out.push_str(&to.to_string());
+                        index = digits_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = text[index..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
 /// The first complete `{\pict ...}` group.
 pub fn picture_group(rtf: &str) -> Option<&str> {
     pict_group(rtf)
@@ -289,5 +559,106 @@ mod tests {
     fn no_picture_is_none() {
         assert!(picture_goal("{\\rtf1 hello\\par}").is_none());
         assert!(!has_picture("{\\rtf1 hello}"));
+    }
+
+    #[test]
+    fn folds_theme_auto_colour_to_automatic() {
+        let rtf = "{\\rtf1\\ansi{\\colortbl ;\\red230\\green230\\blue230;\\red255\\green0\\blue0;}\\cf1 auto\\cf2 red\\cf0 plain}";
+        let folded = fold_theme_colors(rtf, (230, 230, 230), (0, 0, 0));
+        assert!(folded.contains("\\cf0 auto"));
+        assert!(folded.contains("\\cf2 red"));
+        // Black did not exist in the table: it is appended for a later save.
+        assert!(folded.contains("\\red0\\green0\\blue0;"));
+    }
+
+    #[test]
+    fn folds_theme_black_to_the_existing_black_entry() {
+        let rtf = "{\\rtf1{\\colortbl ;\\red230\\green230\\blue230;\\red0\\green0\\blue0;}\\cf1 auto\\cf2 black\\cf1 again}";
+        let folded = fold_theme_colors(rtf, (230, 230, 230), (0, 0, 0));
+        assert_eq!(folded.matches("\\cf0 auto").count(), 1);
+        assert!(folded.contains("\\cf0 again"));
+        assert!(folded.contains("\\cf2 black"));
+        assert_eq!(folded.matches("\\red0\\green0\\blue0;").count(), 1);
+    }
+
+    #[test]
+    fn fold_ignores_other_colours_and_missing_tables() {
+        let plain = "{\\rtf1\\cf1 nothing}";
+        assert_eq!(fold_theme_colors(plain, (230, 230, 230), (0, 0, 0)), plain);
+        let rtf =
+            "{\\rtf1{\\colortbl ;\\red230\\green230\\blue230;\\red255\\green0\\blue0;}\\cf1 auto\\cf10 ten\\cf2 red}";
+        let folded = fold_theme_colors(rtf, (230, 230, 230), (0, 0, 0));
+        assert!(folded.contains("\\cf0 auto"));
+        assert!(folded.contains("\\cf10 ten"));
+        assert!(folded.contains("\\cf2 red"));
+    }
+
+    #[test]
+    fn theme_colours_round_trip_through_fold() {
+        let rtf = "{\\rtf1{\\colortbl ;\\red0\\green0\\blue0;\\red255\\green0\\blue0;}\\cf0 auto\\cf1 black\\cf2 red}";
+        let themed = apply_theme_colors(rtf, (230, 230, 230), (231, 231, 231));
+        assert!(themed.contains("\\red230\\green230\\blue230;"));
+        assert!(themed.contains("\\red231\\green231\\blue231;"));
+        // cf0 and cf1 now point at the sentinels; the explicit red survives.
+        assert!(themed.contains("\\cf3 auto"));
+        assert!(themed.contains("\\cf4 black"));
+        assert!(themed.contains("\\cf2 red"));
+
+        let folded = fold_theme_colors(&themed, (230, 230, 230), (231, 231, 231));
+        assert!(folded.contains("\\cf0 auto"));
+        assert!(folded.contains("\\cf1 black"));
+        assert!(folded.contains("\\cf2 red"));
+    }
+
+    #[test]
+    fn theme_colours_are_idempotent() {
+        let rtf = "{\\rtf1{\\colortbl ;\\red0\\green0\\blue0;}\\cf0 auto\\cf1 black}";
+        let once = apply_theme_colors(rtf, (230, 230, 230), (231, 231, 231));
+        let twice = apply_theme_colors(&once, (230, 230, 230), (231, 231, 231));
+        assert_eq!(once, twice);
+    }
+
+    const AUTO: (u8, u8, u8) = (230, 230, 230);
+    const BLACK: (u8, u8, u8) = (231, 231, 231);
+
+    #[test]
+    fn theme_colours_add_a_table_when_there_is_none() {
+        let rtf = r"{\rtf1{\fonttbl{\f0 Segoe UI;}}\pard plain text\par}";
+        let themed = apply_theme_colors(rtf, AUTO, BLACK);
+        assert!(themed.contains(r"\red230\green230\blue230;"), "{themed}");
+        assert!(themed.contains(r"}\cf1 \pard plain text"), "{themed}");
+        let folded = fold_theme_colors(&themed, AUTO, BLACK);
+        assert!(folded.contains(r"\cf0 \pard plain text"), "{folded}");
+    }
+
+    #[test]
+    fn text_without_a_colour_and_after_plain_is_themed() {
+        let rtf = r"{\rtf1{\colortbl ;\red255\green0\blue0;}\pard body \cf1 red\plain after\plain\cf1 red2}";
+        let themed = apply_theme_colors(rtf, AUTO, BLACK);
+        // Entry 2 is the auto sentinel: the body start and the first `\plain`
+        // point at it; the explicit red stays red.
+        assert!(themed.contains(r"}\cf2 \pard body"), "{themed}");
+        assert!(themed.contains(r"\plain\cf2 after"), "{themed}");
+        assert!(themed.contains(r"\plain\cf1 red2"), "{themed}");
+        // The first fold may append a real black entry; after that it is stable.
+        let again = apply_theme_colors(&themed, AUTO, BLACK);
+        assert_eq!(apply_theme_colors(&again, AUTO, BLACK), again);
+        assert!(!again.contains(r"\cf0\cf"), "{again}");
+    }
+
+    #[test]
+    fn escaped_backslashes_are_not_colour_references() {
+        let rtf = r"{\rtf1{\colortbl ;\red0\green0\blue0;}\pard C:\\cf1\\x \cf1 hitam}";
+        let themed = apply_theme_colors(rtf, AUTO, BLACK);
+        assert!(themed.contains(r"C:\\cf1\\x"), "{themed}");
+        let folded = fold_theme_colors(&themed, AUTO, BLACK);
+        assert!(folded.contains(r"C:\\cf1\\x \cf1 hitam"), "{folded}");
+    }
+
+    #[test]
+    fn non_ascii_after_a_backslash_does_not_panic() {
+        let rtf = "{\\rtf1{\\colortbl ;}\\pard a\\é b\\plain\u{00e9}}";
+        let themed = apply_theme_colors(rtf, AUTO, BLACK);
+        assert!(themed.contains('é'));
     }
 }
