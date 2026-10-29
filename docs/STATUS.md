@@ -243,6 +243,14 @@ See `docs/tasks/rev2-batch6.md` (requests) and `rev2-batch6-REPORT.md`.
 - Pasted HTML cannot make Nodi read network (UNC) paths or contact local
   addresses: picture paths must be on a local drive, downloads go only to
   public IP addresses, and HTTP redirects are not followed.
+  Known residual risk: the address WinHTTP actually connected to is checked
+  after the request is answered, so with DNS rebinding one GET (no login —
+  autologon policy HIGH —, no cookies, no proxy, no body) can reach a local
+  address before Nodi drops the answer. Pinning the IP would need a custom
+  TLS client.
+- Import sources stored in `tree.json` are only used as canonical local-drive
+  `.md`/`.markdown`/`.rtf`/`.txt` paths without commas, quotes or wildcards
+  (Show Original File, Save Back).
 - Pasted HTML/Markdown can only create web, mail, `file:`/drive-path and Nodi
   links; every link target is percent-encoded before it goes into the RTF, so
   a crafted address cannot add RTF (objects, fields) to a note.

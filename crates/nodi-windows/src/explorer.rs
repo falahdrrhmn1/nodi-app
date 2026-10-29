@@ -370,6 +370,38 @@ impl App {
     pub fn import_source(&self, id: &NoteId) -> Option<String> {
         let source = self.tree.get(id).and_then(|node| node.source.clone())?;
         let path = nodi_core::links::local_path(&source)?;
+        // A comma or quote would become another Explorer argument
+        // (`/select,a,b`); wildcards, a second colon (streams) or `..` make
+        // the path mean something else than it shows.
+        let odd = path
+            .chars()
+            .any(|ch| matches!(ch, ',' | '"' | '*' | '?' | '<' | '>' | '|'))
+            || path[2..].contains(':')
+            || path[2..].contains("\\\\")
+            || path[2..].contains("//")
+            || path.split(['\\', '/']).any(|part| part == "..");
+        if odd {
+            return None;
+        }
+        // Where it really points (junctions, `8.3` names) must still be a
+        // local drive; that real path is what Explorer and Save Back get.
+        let path = match std::fs::canonicalize(&path) {
+            Ok(real) => {
+                let real = real.to_string_lossy().into_owned();
+                let plain = real.strip_prefix("\\\\?\\")?.to_owned();
+                let bytes = plain.as_bytes();
+                let local = bytes.len() > 2
+                    && bytes[0].is_ascii_alphabetic()
+                    && bytes[1] == b':'
+                    && bytes[2] == b'\\';
+                if !local {
+                    return None;
+                }
+                plain
+            }
+            // A file that is gone keeps its recorded (checked) path.
+            Err(_) => path,
+        };
         let extension = std::path::Path::new(&path)
             .extension()?
             .to_str()?

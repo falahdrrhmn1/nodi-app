@@ -56,7 +56,9 @@ fn is_public(address: &std::net::IpAddr) -> bool {
                 || (first & 0xFFC0) == 0xFE80 // link-local
                 || (first & 0xFFC0) == 0xFEC0 // site-local
                 || first == 0x2002 // 6to4: wraps any IPv4 address
-                || (first == 0x0064 && second == 0xFF9B) // NAT64
+                || (first == 0x0064 && second == 0xFF9B) // NAT64, all of 64:ff9b::/32
+                || (first == 0x2001 && second == 0x0000) // Teredo
+                || (first == 0x0100 && second == 0x0000) // discard-only
                 || v6.to_ipv4().is_some()) // IPv4-compatible
         }
     }
@@ -65,8 +67,12 @@ fn is_public(address: &std::net::IpAddr) -> bool {
 /// The remote address the request really connected to
 /// (`WINHTTP_OPTION_CONNECTION_INFO`).
 unsafe fn connected_address(request: *mut core::ffi::c_void) -> Option<std::net::IpAddr> {
-    // WINHTTP_CONNECTION_INFO: cbSize, then two SOCKADDR_STORAGE (128 bytes,
-    // 8-byte aligned): the local address at 8, the remote one at 136.
+    // WINHTTP_CONNECTION_INFO on x64 (`repr(C)` in windows-sys): cbSize, then
+    // two SOCKADDR_STORAGE (128 bytes, 8-byte aligned): the local address at
+    // 8, the remote one at 136. (Only 32-bit x86 packs it to 4: remote at
+    // 132.)
+    #[cfg(not(target_pointer_width = "64"))]
+    compile_error!("WINHTTP_CONNECTION_INFO offsets below are for 64-bit Windows");
     let mut buffer = [0u64; 33];
     let length = std::mem::size_of_val(&buffer) as u32;
     let bytes = buffer.as_mut_ptr() as *mut u8;
@@ -171,6 +177,14 @@ pub fn get(url: &str, max_bytes: usize, deadline: std::time::Instant) -> Option<
         if request.0.is_null() {
             return None;
         }
+        // Never send the Windows login automatically to whatever answers.
+        let high: u32 = 2; // WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH
+        WinHttpSetOption(
+            request.0,
+            77, // WINHTTP_OPTION_AUTOLOGON_POLICY
+            &high as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
         // A redirect could point at an internal address: refuse them all.
         let never: u32 = 0; // WINHTTP_OPTION_REDIRECT_POLICY_NEVER
         WinHttpSetOption(
@@ -185,7 +199,9 @@ pub fn get(url: &str, max_bytes: usize, deadline: std::time::Instant) -> Option<
             return None;
         }
         // The name may have resolved differently for WinHTTP than for the
-        // check above (DNS rebinding): verify where the request really went.
+        // check above (DNS rebinding): verify where the request really went
+        // and drop the answer if it was not a public address. (The GET itself
+        // has gone out by then; it carries no login, cookie or body.)
         if !connected_address(request.0).is_some_and(|address| is_public(&address)) {
             return None;
         }
@@ -260,6 +276,9 @@ mod tests {
         for wrapped in [
             "2002:c0a8:0101::1",
             "64:ff9b::c0a8:101",
+            "64:ff9b:1::c0a8:101",
+            "2001:0:4136:e378::1",
+            "100::1",
             "fec0::1",
             "::c0a8:101",
         ] {
