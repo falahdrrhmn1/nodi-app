@@ -46,6 +46,13 @@ crates/nodi-windows   Win32 shell, binary nodi.exe
   wnd/form.rs         small DPI-aware modal form used by several dialogs
   wnd/dialogs.rs      message boxes, icon picker, trash, note picker, file dialogs
   wnd/clipboard.rs    clipboard writing
+  wnd/editword.rs     Ctrl+Backspace / Ctrl+Delete in every Edit control
+  wnd/gutter.rs       line-number strip (paragraph numbers, cached starts)
+  wnd/pattern.rs      background lines / grid / dots (key-colour MaskBlt)
+  wnd/net.rs          WinHTTP download for pictures in pasted web pages
+  explorer.rs         multi-selection, lock, sort, refresh, import source
+  prefs.rs            Tools > Preferences
+  themes.rs           theme presets menu, Theme Editor, copy/paste themes
 ```
 
 ## Data (portable, never AppData)
@@ -127,6 +134,29 @@ At startup a mirror file newer than its note is trusted as it is.
 - Rich Edit forces `\ul` and the link colour on a field result, so the
   separator is a plain, very flat picture recognised by its shape
   (`image::is_rule_picture`), not a `nodi-hr:` link (older notes still work).
+
+## Lists (batch 6)
+
+Rich Edit numbers every run of consecutive numbered paragraphs 1, 2, 3…
+whatever their indent, and its RTF does not keep a restart at 1. Nodi
+therefore numbers like an outline itself (`format::renumber`): a list
+continues at its own indent across deeper items and indented continuation
+paragraphs, a deeper list starts at 1, plain text or a bullet at the same
+indent ends it; items that do not simply follow the paragraph before get
+`PFNS_NEWNUMBER` + an explicit start. A user's "Restart Numbering" is stored
+as a number-to-text distance one twip larger than normal (`\pnindent361`),
+which Rich Edit keeps. `editor::load_rtf` renumbers every loaded note that has
+numbered paragraphs. Deeper bullets and checklist boxes (`☐`/`☑`) are a
+literal glyph + tab with a hanging indent.
+
+## Themes (batch 6)
+
+A theme is a full colour set (`ThemeSpec`): note, window, tree, tabs,
+accent, borders, line numbers, background pattern, plus the chrome font.
+The menu bar is painted through the `WM_UAHDRAWMENU*` messages (as Notepad++
+does), pop-up menus use uxtheme's `SetPreferredAppMode`, the title bar DWM's
+dark-mode attribute. The note's own colours never change (see the display
+sentinels above).
 
 ## Markdown
 

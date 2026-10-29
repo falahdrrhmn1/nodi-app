@@ -6,17 +6,18 @@
 //! Every save folds those sentinels back ([`nodi_core::rtf::fold_theme_colors`]),
 //! so `notes/*.rtf` keeps the colours the user chose.
 //!
-//! Menus and message boxes stay in the system theme: Windows has no supported
-//! API for dark menus (only the undocumented `SetPreferredAppMode`), and a
-//! half-dark menu is worse than a consistently light one. Everything else —
-//! frame, editor, tree, tabs, toolbars, status bar, splitter and title bar — is
-//! themed here.
+//! Every part of the window follows the theme: title bar (DWM), menu bar
+//! (drawn here through the `WM_UAHDRAWMENU*` messages Windows sends to let
+//! applications paint it, as Notepad++ does), pop-up menus (uxtheme's dark
+//! mode switch), toolbars, tree, tabs, line numbers, editor and status bar.
+//! Themes are full colour sets ([`ThemeSpec`]): presets, plus the user's own
+//! saved themes.
 
 use std::mem::size_of;
 use std::ptr;
 
 use nodi_core::rtf::{apply_theme_colors, fold_theme_colors};
-use nodi_core::storage::{parse_hex_color, Settings, Theme};
+use nodi_core::storage::{parse_hex_color, Settings, Theme, ThemeSpec};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
@@ -47,10 +48,16 @@ pub struct Palette {
     pub editor_bg: u32,
     pub editor_text: u32,
     pub tree_bg: u32,
+    pub tree_text: u32,
     pub tab_bg: u32,
     pub tab_active: u32,
     pub accent: u32,
     pub border: u32,
+    /// Line-number strip.
+    pub gutter_bg: u32,
+    pub gutter_text: u32,
+    /// Lines / grid / dots behind the text (View > Background).
+    pub pattern: u32,
     /// Colour-table entry that replaces automatic text while displayed.
     pub auto_sentinel: Option<(u8, u8, u8)>,
     /// Colour-table entry that replaces explicit black while displayed.
@@ -106,75 +113,262 @@ fn nudge((red, green, blue): (u8, u8, u8)) -> (u8, u8, u8) {
     }
 }
 
+/// One theme colour list in [`ThemeSpec`] field order: note bg, note text,
+/// window bg, window text, tree bg, tree text, tab bar, active tab, accent,
+/// border, line numbers, background pattern.
+type Colours = [&'static str; 12];
+
+fn spec(name: &str, colours: Colours) -> ThemeSpec {
+    let [editor_bg, editor_text, window_bg, window_text, tree_bg, tree_text, tab_bg, tab_active, accent, border, gutter_text, pattern] =
+        colours;
+    ThemeSpec {
+        name: name.to_owned(),
+        editor_bg: editor_bg.to_owned(),
+        editor_text: editor_text.to_owned(),
+        window_bg: window_bg.to_owned(),
+        window_text: window_text.to_owned(),
+        tree_bg: tree_bg.to_owned(),
+        tree_text: tree_text.to_owned(),
+        tab_bg: tab_bg.to_owned(),
+        tab_active: tab_active.to_owned(),
+        accent: accent.to_owned(),
+        border: border.to_owned(),
+        gutter_text: gutter_text.to_owned(),
+        pattern: pattern.to_owned(),
+        ui_font: "Segoe UI".to_owned(),
+        ui_size: 9,
+    }
+}
+
+/// Built-in themes: light ones first, then dark ones modelled on popular
+/// editor themes (VS Code Dark+ / Dark Modern, Monokai, Dracula, One Dark,
+/// Nord, Solarized, Gruvbox, Tokyo Night, Catppuccin).
+pub fn presets() -> Vec<ThemeSpec> {
+    vec![
+        spec(
+            "Light",
+            [
+                "#ffffff", "#1f1f1f", "#f0f0f0", "#1f1f1f", "#ffffff", "#1f1f1f", "#f0f0f0",
+                "#ffffff", "#cce8ff", "#c8c8c8", "#9a9a9a", "#e3e9f0",
+            ],
+        ),
+        spec(
+            "Paper",
+            [
+                "#fbf8f1", "#3b3a36", "#efe9dc", "#3b3a36", "#f6f1e6", "#3b3a36", "#ece5d6",
+                "#fbf8f1", "#f3d9a4", "#d8cfbd", "#a59d8c", "#ebe2cf",
+            ],
+        ),
+        spec(
+            "GitHub Light",
+            [
+                "#ffffff", "#1f2328", "#f6f8fa", "#1f2328", "#f6f8fa", "#1f2328", "#eaeef2",
+                "#ffffff", "#ddf4ff", "#d0d7de", "#8c959f", "#e7ecf0",
+            ],
+        ),
+        spec(
+            "Solarized Light",
+            [
+                "#fdf6e3", "#586e75", "#eee8d5", "#586e75", "#eee8d5", "#586e75", "#e4ddc8",
+                "#fdf6e3", "#d6e6ea", "#d6ceb5", "#93a1a1", "#eee6d0",
+            ],
+        ),
+        spec(
+            "Dark",
+            [
+                "#1e1e1e", "#d4d4d4", "#252526", "#cccccc", "#252526", "#cccccc", "#2d2d2d",
+                "#1e1e1e", "#264f78", "#3c3c3c", "#858585", "#2a2a2a",
+            ],
+        ),
+        spec(
+            "Dark Modern",
+            [
+                "#1f1f1f", "#cccccc", "#181818", "#cccccc", "#181818", "#cccccc", "#181818",
+                "#1f1f1f", "#0e639c", "#2b2b2b", "#6e7681", "#2a2a2a",
+            ],
+        ),
+        spec(
+            "Monokai",
+            [
+                "#272822", "#f8f8f2", "#1e1f1c", "#f8f8f2", "#1e1f1c", "#f8f8f2", "#34352f",
+                "#272822", "#49483e", "#3e3d32", "#90908a", "#32332c",
+            ],
+        ),
+        spec(
+            "Dracula",
+            [
+                "#282a36", "#f8f8f2", "#21222c", "#f8f8f2", "#21222c", "#f8f8f2", "#191a21",
+                "#282a36", "#44475a", "#44475a", "#6272a4", "#303241",
+            ],
+        ),
+        spec(
+            "One Dark",
+            [
+                "#282c34", "#abb2bf", "#21252b", "#abb2bf", "#21252b", "#abb2bf", "#21252b",
+                "#282c34", "#3e4451", "#181a1f", "#636d83", "#2f343d",
+            ],
+        ),
+        spec(
+            "Nord",
+            [
+                "#2e3440", "#d8dee9", "#3b4252", "#d8dee9", "#2e3440", "#d8dee9", "#3b4252",
+                "#2e3440", "#434c5e", "#4c566a", "#616e88", "#353c4a",
+            ],
+        ),
+        spec(
+            "Solarized Dark",
+            [
+                "#002b36", "#93a1a1", "#073642", "#93a1a1", "#073642", "#93a1a1", "#073642",
+                "#002b36", "#274642", "#0e4a59", "#586e75", "#06323e",
+            ],
+        ),
+        spec(
+            "Gruvbox Dark",
+            [
+                "#282828", "#ebdbb2", "#1d2021", "#ebdbb2", "#1d2021", "#ebdbb2", "#3c3836",
+                "#282828", "#504945", "#3c3836", "#7c6f64", "#32302f",
+            ],
+        ),
+        spec(
+            "Tokyo Night",
+            [
+                "#1a1b26", "#c0caf5", "#16161e", "#a9b1d6", "#16161e", "#a9b1d6", "#16161e",
+                "#1a1b26", "#33467c", "#101014", "#3b4261", "#1f2030",
+            ],
+        ),
+        spec(
+            "Catppuccin Mocha",
+            [
+                "#1e1e2e", "#cdd6f4", "#181825", "#cdd6f4", "#181825", "#cdd6f4", "#11111b",
+                "#1e1e2e", "#45475a", "#313244", "#6c7086", "#252536",
+            ],
+        ),
+        spec(
+            "High Contrast",
+            [
+                "#000000", "#ffffff", "#000000", "#ffffff", "#000000", "#ffffff", "#000000",
+                "#1a1a1a", "#00468c", "#6fc3df", "#ffffff", "#1a1a1a",
+            ],
+        ),
+    ]
+}
+
+/// The older three-colour custom theme (`settings.custom`) as a full theme.
+fn custom_spec(custom: &nodi_core::CustomTheme) -> ThemeSpec {
+    let background = hex_colour(&custom.background, 0x00FF_FFFF);
+    let dark = luminance(background) < 0.5;
+    let shade = |amount: u8| {
+        let colour = if dark {
+            lighten(background, amount)
+        } else {
+            darken(background, amount)
+        };
+        nodi_core::storage::format_hex_color((
+            (colour & 0xFF) as u8,
+            ((colour >> 8) & 0xFF) as u8,
+            ((colour >> 16) & 0xFF) as u8,
+        ))
+    };
+    ThemeSpec {
+        name: "Custom".to_owned(),
+        editor_bg: custom.background.clone(),
+        editor_text: custom.text.clone(),
+        window_bg: shade(10),
+        window_text: custom.text.clone(),
+        tree_bg: custom.background.clone(),
+        tree_text: custom.text.clone(),
+        tab_bg: shade(12),
+        tab_active: custom.background.clone(),
+        accent: custom.accent.clone(),
+        border: shade(36),
+        gutter_text: shade(90),
+        pattern: shade(14),
+        ..ThemeSpec::default()
+    }
+}
+
+/// The theme `settings` selects: a saved theme of the user's, a preset, or
+/// (older files) Light / Dark / the three-colour Custom theme.
+pub fn active_spec(settings: &Settings) -> ThemeSpec {
+    let name = if settings.theme_name.is_empty() {
+        match settings.theme {
+            Theme::Light => "Light".to_owned(),
+            Theme::Dark => "Dark".to_owned(),
+            Theme::Custom => return custom_spec(&settings.custom),
+        }
+    } else {
+        settings.theme_name.clone()
+    };
+    settings
+        .my_themes
+        .iter()
+        .find(|theme| theme.name == name)
+        .cloned()
+        .or_else(|| presets().into_iter().find(|theme| theme.name == name))
+        .unwrap_or_default()
+}
+
+thread_local! {
+    /// Face and point size of the chrome font of the active theme.
+    static UI_FONT: std::cell::RefCell<(String, u32)> =
+        std::cell::RefCell::new(("Segoe UI".to_owned(), 9));
+}
+
+/// Face and size (points) the tree, tabs and status bar use.
+pub fn ui_font() -> (String, u32) {
+    UI_FONT.with(|font| font.borrow().clone())
+}
+
+fn rgb_of(colour: u32) -> (u8, u8, u8) {
+    (
+        (colour & 0xFF) as u8,
+        ((colour >> 8) & 0xFF) as u8,
+        ((colour >> 16) & 0xFF) as u8,
+    )
+}
+
+fn mix(a: u32, b: u32) -> u32 {
+    let (ar, ag, ab) = rgb_of(a);
+    let (br, bg, bb) = rgb_of(b);
+    rgb(
+        ((u16::from(ar) + u16::from(br)) / 2) as u8,
+        ((u16::from(ag) + u16::from(bg)) / 2) as u8,
+        ((u16::from(ab) + u16::from(bb)) / 2) as u8,
+    )
+}
+
 impl Palette {
     pub fn from_settings(settings: &Settings) -> Self {
-        match settings.theme {
-            Theme::Light => Self {
-                dark: false,
-                window_bg: rgb(240, 240, 240),
-                window_text: rgb(31, 31, 31),
-                editor_bg: rgb(255, 255, 255),
-                editor_text: rgb(31, 31, 31),
-                tree_bg: rgb(255, 255, 255),
-                tab_bg: rgb(240, 240, 240),
-                tab_active: rgb(255, 255, 255),
-                accent: rgb(204, 232, 255),
-                border: rgb(200, 200, 200),
-                auto_sentinel: None,
-                black_sentinel: None,
-            },
-            Theme::Dark => Self {
-                dark: true,
-                window_bg: rgb(32, 32, 32),
-                window_text: rgb(230, 230, 230),
-                editor_bg: rgb(30, 30, 30),
-                editor_text: rgb(230, 230, 230),
-                tree_bg: rgb(37, 37, 38),
-                tab_bg: rgb(43, 43, 43),
-                tab_active: rgb(30, 30, 30),
-                accent: rgb(43, 87, 154),
-                border: rgb(70, 70, 70),
-                auto_sentinel: Some((230, 230, 230)),
-                black_sentinel: Some((231, 231, 231)),
-            },
-            Theme::Custom => {
-                let custom = &settings.custom;
-                let background = hex_colour(&custom.background, 0x00FF_FFFF);
-                let text = hex_colour(&custom.text, 0x001F_1F1F);
-                let accent = hex_colour(&custom.accent, 0x00FF_E8CC);
-                let dark = luminance(background) < 0.5;
-                let text_rgb = (
-                    (text & 0xFF) as u8,
-                    ((text >> 8) & 0xFF) as u8,
-                    ((text >> 16) & 0xFF) as u8,
-                );
-                Self {
-                    dark,
-                    window_bg: if dark {
-                        lighten(background, 10)
-                    } else {
-                        darken(background, 12)
-                    },
-                    window_text: text,
-                    editor_bg: background,
-                    editor_text: text,
-                    tree_bg: background,
-                    tab_bg: if dark {
-                        lighten(background, 12)
-                    } else {
-                        darken(background, 8)
-                    },
-                    tab_active: background,
-                    accent,
-                    border: if dark {
-                        lighten(background, 34)
-                    } else {
-                        darken(background, 40)
-                    },
-                    auto_sentinel: Some(text_rgb),
-                    black_sentinel: Some(nudge(text_rgb)),
-                }
-            }
+        Self::from_spec(&active_spec(settings))
+    }
+
+    pub fn from_spec(spec: &ThemeSpec) -> Self {
+        let colour = |text: &str| hex_colour(text, 0);
+        let editor_bg = colour(&spec.editor_bg);
+        let editor_text = colour(&spec.editor_text);
+        let window_bg = colour(&spec.window_bg);
+        let dark = luminance(editor_bg) < 0.5;
+        // Automatic (and explicitly black) text is shown in the theme's text
+        // colour, except on a classic light page with near-black text.
+        let plain_light = !dark && luminance(editor_text) < 0.13;
+        let text_rgb = rgb_of(editor_text);
+        Self {
+            dark,
+            window_bg,
+            window_text: colour(&spec.window_text),
+            editor_bg,
+            editor_text,
+            tree_bg: colour(&spec.tree_bg),
+            tree_text: colour(&spec.tree_text),
+            tab_bg: colour(&spec.tab_bg),
+            tab_active: colour(&spec.tab_active),
+            accent: colour(&spec.accent),
+            border: colour(&spec.border),
+            gutter_bg: mix(editor_bg, window_bg),
+            gutter_text: colour(&spec.gutter_text),
+            pattern: colour(&spec.pattern),
+            auto_sentinel: (!plain_light).then_some(text_rgb),
+            black_sentinel: (!plain_light).then_some(nudge(text_rgb)),
         }
     }
 
@@ -272,6 +466,15 @@ pub fn apply(app: &mut App) {
     new.install_display_colours();
     app.palette = new;
 
+    let spec = active_spec(&app.settings);
+    let font = (spec.ui_font.clone(), spec.ui_size);
+    if UI_FONT.with(|current| *current.borrow() != font) {
+        UI_FONT.with(|current| *current.borrow_mut() = font);
+        crate::app::recreate_fonts(app);
+        crate::wnd::layout(app);
+    }
+    set_dark_menus(new.dark);
+
     if !app.background_brush.is_null() {
         // SAFETY: we created this brush and replace it below.
         unsafe {
@@ -314,24 +517,22 @@ pub fn apply(app: &mut App) {
                 SetWindowTheme(window, sub_app, ptr::null());
             }
         }
+        crate::wnd::pattern::set(app.settings.background, new.pattern, new.editor_bg);
         for tab in &app.tabs {
             SetWindowTheme(tab.editor, sub_app, ptr::null());
             editor::set_background(tab.editor, new.editor_bg);
+            InvalidateRect(tab.editor, ptr::null(), 1);
             editor::set_spell_check(tab.editor, app.settings.spell_check);
         }
 
         // TreeView has built-in colours for its items; the selected row keeps
         // the system highlight, which is readable in both palettes.
         if !app.tree_view.is_null() {
-            let text = if new.dark {
-                new.window_text
-            } else {
-                0xFFFF_FFFF // CLR_NONE: back to the system default
-            };
-            let background = if new.dark { new.tree_bg } else { 0xFFFF_FFFF };
-            SendMessageW(app.tree_view, TVM_SETBKCOLOR, 0, background as isize);
-            SendMessageW(app.tree_view, TVM_SETTEXTCOLOR, 0, text as isize);
+            SendMessageW(app.tree_view, TVM_SETBKCOLOR, 0, new.tree_bg as isize);
+            SendMessageW(app.tree_view, TVM_SETTEXTCOLOR, 0, new.tree_text as isize);
         }
+        // The menu bar is repainted in the new colours.
+        windows_sys::Win32::UI::WindowsAndMessaging::DrawMenuBar(app.hwnd);
 
         // The sidebar caption is a static control without its own colours.
         if !app.sidebar_title.is_null() {
@@ -341,6 +542,7 @@ pub fn apply(app: &mut App) {
 
     status::reapply(app);
     tabs::invalidate(app);
+    crate::wnd::gutter::refresh(app);
 
     // SAFETY: invalidating our own windows.
     unsafe {
@@ -375,10 +577,11 @@ pub unsafe fn on_notify(app: &App, header: &NMHDR, lparam: LPARAM) -> Option<LRE
     }
     let draw = &mut *(lparam as *mut NMTBCUSTOMDRAW);
     if header.hwndFrom == app.toolbar {
-        // The icon toolbar uses Windows' black standard glyphs, unreadable on
-        // a dark strip; it stays light like the menu bar right above it.
+        // The icon toolbar uses Windows' coloured standard glyphs with dark
+        // outlines: a strip a little lighter than the window keeps them
+        // readable while the top of the window follows the theme.
         if draw.nmcd.dwDrawStage == CDDS_PREPAINT && !draw.nmcd.hdc.is_null() {
-            fill(draw.nmcd.hdc, &draw.nmcd.rc, rgb(240, 240, 240));
+            fill(draw.nmcd.hdc, &draw.nmcd.rc, icon_strip(&app.palette));
         }
         return Some(CDRF_DODEFAULT as LRESULT);
     }
@@ -418,3 +621,167 @@ pub unsafe fn on_notify(app: &App, header: &NMHDR, lparam: LPARAM) -> Option<LRE
 /// Constant declared here so `mod.rs` can match the tree background helper.
 pub const TVM_SETBKCOLOR: u32 = 0x1100 + 29;
 pub const TVM_SETTEXTCOLOR: u32 = 0x1100 + 30;
+
+/// Background of the icon toolbar in a dark theme.
+fn icon_strip(palette: &Palette) -> u32 {
+    lighten(palette.window_bg, 38)
+}
+
+/// Dark pop-up menus through uxtheme's `SetPreferredAppMode` (ordinal 135)
+/// and `FlushMenuThemes` (136), the switch Windows' own apps use. Missing on
+/// old Windows versions: then the menus simply stay light.
+fn set_dark_menus(dark: bool) {
+    type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+    type FlushMenuThemes = unsafe extern "system" fn();
+    let name = win::wide("uxtheme.dll");
+    // SAFETY: uxtheme is a system DLL; the ordinals have these signatures on
+    // every Windows 10/11 build that exports them, and are checked for null.
+    unsafe {
+        let module = windows_sys::Win32::System::LibraryLoader::LoadLibraryW(name.as_ptr());
+        if module.is_null() {
+            return;
+        }
+        let set = windows_sys::Win32::System::LibraryLoader::GetProcAddress(module, 135 as _);
+        let flush = windows_sys::Win32::System::LibraryLoader::GetProcAddress(module, 136 as _);
+        if let (Some(set), Some(flush)) = (set, flush) {
+            let set: SetPreferredAppMode = std::mem::transmute(set);
+            let flush: FlushMenuThemes = std::mem::transmute(flush);
+            // 2 = ForceDark, 3 = ForceLight.
+            set(if dark { 2 } else { 3 });
+            flush();
+        }
+    }
+}
+
+// ------------------------------------------------------------- dark menu bar
+
+/// The default light theme keeps Windows' own menu bar; every other theme
+/// paints it in its window colours.
+fn paints_menu_bar(palette: &Palette) -> bool {
+    palette.dark || palette.window_bg != rgb(240, 240, 240)
+}
+
+/// `WM_UAHDRAWMENU`: Windows asks the window to paint the menu bar strip.
+pub const WM_UAHDRAWMENU: u32 = 0x0091;
+/// `WM_UAHDRAWMENUITEM`: one menu bar item.
+pub const WM_UAHDRAWMENUITEM: u32 = 0x0092;
+
+#[repr(C)]
+struct UahMenu {
+    menu: windows_sys::Win32::UI::WindowsAndMessaging::HMENU,
+    hdc: HDC,
+    flags: u32,
+}
+
+#[repr(C)]
+struct UahDrawMenuItem {
+    dis: windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT,
+    um: UahMenu,
+    position: i32,
+}
+
+/// Paints the menu bar (dark themes only). Returns `None` to let Windows
+/// draw it (light themes).
+pub unsafe fn on_uah(app: &App, msg: u32, lparam: LPARAM) -> Option<LRESULT> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DrawTextW, SetBkMode, SetTextColor, DT_CENTER, DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER,
+        TRANSPARENT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetMenuBarInfo, GetMenuStringW, GetWindowRect, MENUBARINFO, MF_BYPOSITION, OBJID_MENU,
+    };
+    if !paints_menu_bar(&app.palette) {
+        return None;
+    }
+    match msg {
+        WM_UAHDRAWMENU => {
+            let menu = &*(lparam as *const UahMenu);
+            let mut info: MENUBARINFO = std::mem::zeroed();
+            info.cbSize = size_of::<MENUBARINFO>() as u32;
+            if GetMenuBarInfo(app.hwnd, OBJID_MENU, 0, &mut info) == 0 {
+                return None;
+            }
+            let mut window = windows_sys::Win32::Foundation::RECT::default();
+            GetWindowRect(app.hwnd, &mut window);
+            let mut bar = info.rcBar;
+            bar.left -= window.left;
+            bar.right -= window.left;
+            bar.top -= window.top;
+            bar.bottom -= window.top;
+            // One pixel more: Windows draws a light line under the bar.
+            bar.bottom += 1;
+            fill(menu.hdc, &bar, app.palette.window_bg);
+            Some(0)
+        }
+        WM_UAHDRAWMENUITEM => {
+            let item = &*(lparam as *const UahDrawMenuItem);
+            let mut text = [0u16; 128];
+            let length = GetMenuStringW(
+                item.um.menu,
+                item.position as u32,
+                text.as_mut_ptr(),
+                text.len() as i32,
+                MF_BYPOSITION,
+            );
+            const ODS_SELECTED: u32 = 0x0001;
+            const ODS_GRAYED: u32 = 0x0002;
+            const ODS_HOTLIGHT: u32 = 0x0040;
+            const ODS_NOACCEL: u32 = 0x0100;
+            let state = item.dis.itemState;
+            let hot = state & (ODS_SELECTED | ODS_HOTLIGHT) != 0;
+            let background = if hot && app.palette.dark {
+                lighten(app.palette.window_bg, 28)
+            } else if hot {
+                darken(app.palette.window_bg, 22)
+            } else {
+                app.palette.window_bg
+            };
+            fill(item.dis.hDC, &item.dis.rcItem, background);
+            SetBkMode(item.dis.hDC, TRANSPARENT as i32);
+            let colour = if state & ODS_GRAYED != 0 {
+                app.palette.gutter_text
+            } else {
+                app.palette.window_text
+            };
+            SetTextColor(item.dis.hDC, colour);
+            let mut rect = item.dis.rcItem;
+            let mut flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
+            if state & ODS_NOACCEL != 0 {
+                flags |= DT_HIDEPREFIX;
+            }
+            DrawTextW(item.dis.hDC, text.as_ptr(), length.max(0), &mut rect, flags);
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// After the non-client area is painted: covers the light line Windows
+/// draws between a dark menu bar and the client area.
+pub unsafe fn after_ncpaint(app: &App) {
+    use windows_sys::Win32::Graphics::Gdi::{GetWindowDC, ReleaseDC};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetMenuBarInfo, GetWindowRect, MENUBARINFO, OBJID_MENU,
+    };
+    if !paints_menu_bar(&app.palette) {
+        return;
+    }
+    let mut info: MENUBARINFO = std::mem::zeroed();
+    info.cbSize = size_of::<MENUBARINFO>() as u32;
+    if GetMenuBarInfo(app.hwnd, OBJID_MENU, 0, &mut info) == 0 {
+        return;
+    }
+    let mut window = windows_sys::Win32::Foundation::RECT::default();
+    GetWindowRect(app.hwnd, &mut window);
+    let line = windows_sys::Win32::Foundation::RECT {
+        left: info.rcBar.left - window.left,
+        right: info.rcBar.right - window.left,
+        top: info.rcBar.bottom - window.top,
+        bottom: info.rcBar.bottom - window.top + 1,
+    };
+    let dc = GetWindowDC(app.hwnd);
+    if !dc.is_null() {
+        fill(dc, &line, app.palette.window_bg);
+        ReleaseDC(app.hwnd, dc);
+    }
+}

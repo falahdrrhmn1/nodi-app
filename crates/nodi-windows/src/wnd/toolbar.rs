@@ -404,20 +404,27 @@ fn create_combos(app: &mut App, bar: HWND) {
         windows_sys::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST as u32
             | windows_sys::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS as u32,
     );
-    let font_combo = create_combo(
-        app,
-        bar,
-        FONT_COMBO_ID,
-        windows_sys::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST as u32
-            | windows_sys::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS as u32,
-    );
-    let size_combo = create_combo(
-        app,
-        bar,
-        SIZE_COMBO_ID,
-        windows_sys::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST as u32
-            | windows_sys::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS as u32,
-    );
+    // Font and size can be typed: the text is completed from the list and
+    // applied on Enter (or when an item is picked from the open list), never
+    // while typing.
+    let typed = windows_sys::Win32::UI::WindowsAndMessaging::CBS_DROPDOWN as u32
+        | windows_sys::Win32::UI::WindowsAndMessaging::CBS_AUTOHSCROLL as u32
+        | windows_sys::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS as u32;
+    let font_combo = create_combo(app, bar, FONT_COMBO_ID, typed);
+    let size_combo = create_combo(app, bar, SIZE_COMBO_ID, typed);
+    for combo in [font_combo, size_combo] {
+        // SAFETY: the edit box is the combo's first child; the subclass
+        // lives as long as the control.
+        unsafe {
+            let edit = windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(
+                combo,
+                windows_sys::Win32::UI::WindowsAndMessaging::GW_CHILD,
+            );
+            if !edit.is_null() {
+                SetWindowSubclass(edit, Some(combo_edit_proc), 2, app.hwnd as usize);
+            }
+        }
+    }
 
     app.style_combo = style_combo;
     app.font_combo = font_combo;
@@ -441,7 +448,7 @@ fn create_combos(app: &mut App, bar: HWND) {
         for face in installed_fonts(bar) {
             combo_add(font_combo, &face);
         }
-        combo_select_text(font_combo, format::BODY_FONT);
+        combo_select_text(font_combo, &format::body_font());
     }
     if !size_combo.is_null() {
         for points in 8..=72 {
@@ -698,7 +705,7 @@ pub fn sync_format(app: &mut App) {
         let name = if current.dw_mask & editor::CFM_FACE != 0 {
             format::face_name(&current)
         } else {
-            format::BODY_FONT.to_owned()
+            format::body_font()
         };
         if !combo_select_text(app.font_combo, &name) {
             combo_add(app.font_combo, &name);
@@ -762,6 +769,9 @@ pub fn size_text(app: &mut App) -> String {
 
 /// Applies style `level` (0 = Normal, 1..=4 = Heading).
 pub fn apply_style(app: &mut App, level: usize) {
+    if crate::wnd::editor::refuse_if_locked(app) {
+        return;
+    }
     let Some(editor) = app.active_editor() else {
         return;
     };
@@ -775,6 +785,9 @@ pub fn apply_style(app: &mut App, level: usize) {
 }
 
 fn apply_face(app: &mut App, name: &str) {
+    if crate::wnd::editor::refuse_if_locked(app) {
+        return;
+    }
     if name.is_empty() {
         return;
     }
@@ -802,12 +815,15 @@ fn apply_face(app: &mut App, name: &str) {
 }
 
 fn apply_size(app: &mut App, points: i32) {
+    if crate::wnd::editor::refuse_if_locked(app) {
+        return;
+    }
     let Some(editor) = app.active_editor() else {
         return;
     };
     let format = editor::CharFormat2W {
         dw_mask: editor::CFM_SIZE,
-        y_height: points.clamp(8, 72) * 20,
+        y_height: points.clamp(1, 400) * 20,
         ..editor::CharFormat2W::default()
     };
     editor::set_selection_format(editor, &format);
@@ -819,7 +835,200 @@ fn apply_size(app: &mut App, points: i32) {
     sync_format(app);
 }
 
-/// `CBN_SELCHANGE` from one of the format comboboxes.
+/// `WM_COMMAND` code the typed combos' edit boxes send for Enter.
+pub const COMBO_COMMIT: u16 = 0x0700;
+/// `WM_COMMAND` code for Escape in a typed combo.
+pub const COMBO_CANCEL: u16 = 0x0701;
+
+/// Keys of the font/size combos' edit boxes: Enter applies, Escape goes back
+/// to the note, typed letters are completed from the list.
+unsafe extern "system" fn combo_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+    _id: usize,
+    frame: usize,
+) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetDlgCtrlID, GetParent, PostMessageW, WM_CHAR, WM_COMMAND, WM_KEYDOWN,
+    };
+    let combo = GetParent(hwnd);
+    match msg {
+        WM_KEYDOWN if wparam == 0x0D || wparam == 0x1B => {
+            let code = if wparam == 0x0D {
+                COMBO_COMMIT
+            } else {
+                COMBO_CANCEL
+            };
+            let id = GetDlgCtrlID(combo) as usize & 0xFFFF;
+            PostMessageW(
+                frame as HWND,
+                WM_COMMAND,
+                id | (usize::from(code) << 16),
+                combo as isize,
+            );
+            return 0;
+        }
+        // No beep for the Enter / Escape characters.
+        WM_CHAR if wparam == 0x0D || wparam == 0x1B => return 0,
+        WM_CHAR if wparam >= 0x20 && wparam != 0x7F => {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            complete_typed(combo, hwnd);
+            return result;
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+/// Completes the typed prefix with the first matching list item and selects
+/// the completed part, so typing on replaces it.
+unsafe fn complete_typed(combo: HWND, edit: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowTextW, CB_FINDSTRING, CB_GETLBTEXT, CB_GETLBTEXTLEN,
+    };
+    let typed = combo_text(edit);
+    let mut from = 0u32;
+    let mut to = 0u32;
+    SendMessageW(
+        edit,
+        EM_GETSEL_EDIT,
+        &mut from as *mut u32 as usize,
+        &mut to as *mut u32 as isize,
+    );
+    let typed_units = typed.encode_utf16().count();
+    if typed.is_empty() || to as usize != typed_units {
+        return;
+    }
+    let wide = win::wide(&typed);
+    let index = SendMessageW(combo, CB_FINDSTRING, usize::MAX, wide.as_ptr() as isize);
+    if index < 0 {
+        return;
+    }
+    let length = SendMessageW(combo, CB_GETLBTEXTLEN, index as usize, 0);
+    if length <= 0 {
+        return;
+    }
+    let mut buffer = vec![0u16; length as usize + 1];
+    SendMessageW(
+        combo,
+        CB_GETLBTEXT,
+        index as usize,
+        buffer.as_mut_ptr() as isize,
+    );
+    buffer.truncate(length as usize);
+    if buffer.len() <= typed_units {
+        return;
+    }
+    // Keep what was typed (its case), complete the rest from the item.
+    let mut completed: Vec<u16> = typed.encode_utf16().collect();
+    completed.extend_from_slice(&buffer[typed_units..]);
+    completed.push(0);
+    SetWindowTextW(edit, completed.as_ptr());
+    SendMessageW(edit, EM_SETSEL_EDIT, typed_units, -1);
+}
+
+const EM_GETSEL_EDIT: u32 = 0x00B0;
+const EM_SETSEL_EDIT: u32 = 0x00B1;
+
+/// The list item matching `text`: exactly (ignoring case) or, failing that,
+/// the first item starting with it.
+fn combo_match(combo: HWND, text: &str) -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CB_FINDSTRING, CB_FINDSTRINGEXACT};
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let wide = win::wide(text);
+    // SAFETY: plain combo queries with a NUL-terminated string.
+    let index = unsafe {
+        let exact = SendMessageW(
+            combo,
+            CB_FINDSTRINGEXACT,
+            usize::MAX,
+            wide.as_ptr() as isize,
+        );
+        if exact >= 0 {
+            exact
+        } else {
+            SendMessageW(combo, CB_FINDSTRING, usize::MAX, wide.as_ptr() as isize)
+        }
+    };
+    combo_item(combo, index)
+}
+
+/// Text of list item `index` of `combo`.
+fn combo_item(combo: HWND, index: isize) -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CB_GETLBTEXT, CB_GETLBTEXTLEN};
+    if index < 0 {
+        return None;
+    }
+    // SAFETY: plain combo queries; the buffer is sized from the length.
+    unsafe {
+        let length = SendMessageW(combo, CB_GETLBTEXTLEN, index as usize, 0).max(0) as usize;
+        let mut buffer = vec![0u16; length + 1];
+        SendMessageW(
+            combo,
+            CB_GETLBTEXT,
+            index as usize,
+            buffer.as_mut_ptr() as isize,
+        );
+        buffer.truncate(length);
+        Some(String::from_utf16_lossy(&buffer))
+    }
+}
+
+/// Font/size combo: an item was picked from the open list (`CBN_SELENDOK`),
+/// Enter was pressed in its edit box ([`COMBO_COMMIT`]) or Escape
+/// ([`COMBO_CANCEL`]).
+pub fn on_combo_commit(app: &mut App, combo: HWND, code: u16) {
+    if app.suppress_combo > 0 {
+        return;
+    }
+    let text = if code == COMBO_COMMIT {
+        combo_text(combo)
+    } else {
+        // SAFETY: plain combo query.
+        let index = unsafe {
+            SendMessageW(
+                combo,
+                windows_sys::Win32::UI::WindowsAndMessaging::CB_GETCURSEL,
+                0,
+                0,
+            )
+        };
+        combo_item(combo, index).unwrap_or_default()
+    };
+    if code != COMBO_CANCEL {
+        if combo == app.font_combo {
+            if let Some(face) = combo_match(combo, &text) {
+                apply_face(app, &face);
+                return;
+            }
+            let message = format!("No installed font is called {}", text.trim());
+            crate::wnd::status::set_message(app, &message);
+        } else if combo == app.size_combo {
+            match text.trim().parse::<f32>() {
+                Ok(points) if (1.0..=400.0).contains(&points) => {
+                    apply_size(app, points.round() as i32);
+                    return;
+                }
+                _ => crate::wnd::status::set_message(app, "Type a font size in points, e.g. 12"),
+            }
+        }
+    }
+    sync_format(app);
+    if let Some(editor) = app.active_editor() {
+        // SAFETY: focusing our own editor.
+        unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor);
+        }
+    }
+}
+
+/// `CBN_SELCHANGE` from one of the format comboboxes. Only the style combo
+/// applies at once; font and size wait for [`on_combo_commit`].
 pub fn on_combo(app: &mut App, combo: HWND) {
     if app.suppress_combo > 0 {
         return;
@@ -836,12 +1045,6 @@ pub fn on_combo(app: &mut App, combo: HWND) {
         };
         if index >= 0 {
             apply_style(app, index as usize);
-        }
-    } else if combo == app.font_combo {
-        apply_face(app, &combo_text(app.font_combo));
-    } else if combo == app.size_combo {
-        if let Ok(points) = combo_text(app.size_combo).parse::<i32>() {
-            apply_size(app, points);
         }
     }
 }
@@ -964,6 +1167,9 @@ fn show_palette_at(app: &App, highlight: bool, colours: &[(&str, u32)]) -> Optio
 
 /// Shows the text-colour or highlight palette (toolbar button or its arrow).
 pub fn show_palette(app: &mut App, highlight: bool) {
+    if crate::wnd::editor::refuse_if_locked(app) {
+        return;
+    }
     let Some(editor) = app.active_editor() else {
         return;
     };
@@ -1026,4 +1232,22 @@ pub unsafe fn on_dropdown(app: &mut App, lparam: isize) {
     } else if command == IDM_TOOLBAR_HIGHLIGHT {
         show_palette(app, true);
     }
+}
+
+/// True when `name` is an installed font (the font combo lists them all).
+pub fn font_installed(app: &App, name: &str) -> bool {
+    if app.font_combo.is_null() {
+        return true;
+    }
+    let wide = win::wide(name.trim());
+    // SAFETY: plain combo query with a NUL-terminated string.
+    let index = unsafe {
+        SendMessageW(
+            app.font_combo,
+            windows_sys::Win32::UI::WindowsAndMessaging::CB_FINDSTRINGEXACT,
+            usize::MAX,
+            wide.as_ptr() as isize,
+        )
+    };
+    index >= 0
 }

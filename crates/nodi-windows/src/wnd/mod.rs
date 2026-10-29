@@ -5,15 +5,19 @@ pub mod context;
 pub mod dialogs;
 pub mod editkeys;
 pub mod editor;
+pub mod editword;
 pub mod find;
 pub mod form;
 pub mod format;
 pub mod formula;
+pub mod gutter;
 pub mod image;
 pub mod import;
 pub mod link;
 pub mod menu;
+pub mod net;
 pub mod outline;
+pub mod pattern;
 pub mod status;
 pub mod table;
 pub mod tabs;
@@ -199,6 +203,9 @@ unsafe fn run_inner() -> i32 {
         if result <= 0 {
             break;
         }
+        if editword::handle(&message) {
+            continue;
+        }
         // The modeless Find/Replace dialog handles its own keys (Tab, Enter).
         let find_dialog = find::dialog();
         if !find_dialog.is_null() && IsDialogMessageW(find_dialog, &message) != 0 {
@@ -305,6 +312,7 @@ unsafe fn create_ui(app: &mut App) -> bool {
     app.tree_view = tree::create(app);
     app.tabctrl = tabs::create(app);
     app.status = status::create(app);
+    app.gutter = gutter::create(app);
 
     if app.toolbar.is_null()
         || app.formatbar.is_null()
@@ -340,6 +348,51 @@ unsafe fn create_ui(app: &mut App) -> bool {
 }
 
 /// Positions every child window for the current client size.
+/// A `DeferWindowPos` batch; falls back to `SetWindowPos` when the batch
+/// cannot be created. The moves happen together when it is dropped.
+struct Batch(windows_sys::Win32::UI::WindowsAndMessaging::HDWP);
+
+impl Batch {
+    unsafe fn new(count: i32) -> Self {
+        Self(windows_sys::Win32::UI::WindowsAndMessaging::BeginDeferWindowPos(count))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn pos(
+        &mut self,
+        window: HWND,
+        after: HWND,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        flags: u32,
+    ) {
+        if window.is_null() {
+            return;
+        }
+        if !self.0.is_null() {
+            self.0 = windows_sys::Win32::UI::WindowsAndMessaging::DeferWindowPos(
+                self.0, window, after, x, y, width, height, flags,
+            );
+        }
+        if self.0.is_null() {
+            SetWindowPos(window, after, x, y, width, height, flags);
+        }
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the handle came from BeginDeferWindowPos/DeferWindowPos.
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::EndDeferWindowPos(self.0);
+            }
+        }
+    }
+}
+
 pub fn layout(app: &mut App) {
     if app.hwnd.is_null() {
         return;
@@ -422,9 +475,12 @@ pub fn layout(app: &mut App) {
         let sidebar = app.sidebar_width.clamp(min_sidebar, max_sidebar);
         app.sidebar_width = sidebar;
 
+        // The content area moves as one batch, so dragging the splitter does
+        // not show the tree, tabs and editor at different widths in between.
+        let mut batch = Batch::new(5);
         let header_height = app.scale(24).max(app.scale(18));
         let tree_height = (content_height - header_height).max(0);
-        SetWindowPos(
+        batch.pos(
             app.sidebar_title,
             ptr::null_mut(),
             0,
@@ -433,7 +489,7 @@ pub fn layout(app: &mut App) {
             header_height,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
-        SetWindowPos(
+        batch.pos(
             app.tree_view,
             ptr::null_mut(),
             0,
@@ -446,7 +502,7 @@ pub fn layout(app: &mut App) {
         let right_x = sidebar + SPLITTER_WIDTH;
         let right_width = (width - right_x).max(0);
         let tab_height = tabs::measure_height(app).min(content_height);
-        SetWindowPos(
+        batch.pos(
             app.tabctrl,
             ptr::null_mut(),
             right_x,
@@ -458,19 +514,31 @@ pub fn layout(app: &mut App) {
 
         let editor_top = top + tab_height;
         let editor_height = (content_height - tab_height).max(0);
+        let gutter_width = gutter::width(app).min(right_width);
+        batch.pos(
+            app.gutter,
+            ptr::null_mut(),
+            right_x,
+            editor_top,
+            gutter_width,
+            editor_height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         // Hidden editors are sized when they become active (see
         // `App::activate_tab_impl`), so many open tabs stay cheap.
         if let Some(editor) = app.active_editor() {
-            SetWindowPos(
+            batch.pos(
                 editor,
                 ptr::null_mut(),
-                right_x,
+                right_x + gutter_width,
                 editor_top,
-                right_width,
+                right_width - gutter_width,
                 editor_height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+
+        drop(batch);
 
         status::layout_parts(app, width);
 
@@ -636,6 +704,12 @@ pub unsafe extern "system" fn wndproc(
                     && toolbar::is_format_combo(app, child)
                 {
                     toolbar::on_combo(app, child);
+                } else if (code == windows_sys::Win32::UI::WindowsAndMessaging::CBN_SELENDOK as u16
+                    || code == toolbar::COMBO_COMMIT
+                    || code == toolbar::COMBO_CANCEL)
+                    && (child == app.font_combo || child == app.size_combo)
+                {
+                    toolbar::on_combo_commit(app, child, code);
                 } else if code == 0 || (code == 1 && child.is_null()) {
                     // 0 = menu / toolbar button, 1 = accelerator (shortcut).
                     menu::on_command(app, id);
@@ -742,6 +816,9 @@ pub unsafe extern "system" fn wndproc(
                 if let Some(result) = theme::on_notify(app, header, lparam) {
                     return result;
                 }
+                if let Some(result) = tree::notify_result(app, header, lparam) {
+                    return result;
+                }
                 if tree::handle_notify(app, header) {
                     return 0;
                 }
@@ -829,6 +906,30 @@ pub unsafe extern "system" fn wndproc(
                 }
             }
             1
+        }
+
+        // Alt+<letter> without a menu entry: close instead of the default
+        // beep (Preferences > Sounds off).
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MENUCHAR if !dialogs::sounds() => {
+            (windows_sys::Win32::UI::WindowsAndMessaging::MNC_CLOSE as isize) << 16
+        }
+
+        theme::WM_UAHDRAWMENU | theme::WM_UAHDRAWMENUITEM => {
+            if let Some(app) = app_mut(hwnd) {
+                if let Some(result) = theme::on_uah(app, msg, lparam) {
+                    return result;
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_NCPAINT
+        | windows_sys::Win32::UI::WindowsAndMessaging::WM_NCACTIVATE => {
+            let result = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if let Some(app) = app_mut(hwnd) {
+                theme::after_ncpaint(app);
+            }
+            result
         }
 
         WM_SETCURSOR => {
@@ -953,5 +1054,15 @@ pub unsafe extern "system" fn wndproc(
         }
 
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Re-splits the status bar parts for the frame's current width (the counts
+/// part grew or shrank).
+pub fn relayout_status(app: &App) {
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    // SAFETY: `rect` is a valid out parameter for our frame window.
+    if unsafe { GetClientRect(app.hwnd, &mut rect) } != 0 {
+        status::layout_parts(app, rect.right - rect.left);
     }
 }

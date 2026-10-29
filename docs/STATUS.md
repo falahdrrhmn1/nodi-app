@@ -60,6 +60,19 @@ same handlers as the menus.
 | extra — status counts | `Lines · Words · Chars` and the selection's counts | **PASS** (e2e AW) |
 | **save torture** | `scripts/persist-torture.ps1 -Cycles 20 -Runs 3`: every cycle restarts Nodi and compares every note's text and Markdown and the tree with what was there before closing; closing rotates over WM_CLOSE right after typing (buffer still `Modified`), Ctrl+S + close, Windows shutdown messages, and `Stop-Process -Force` after `Saved` | **PASS**: 2 × 60 cycles, 0 mismatches (plus ≈130 earlier starts by the harness author) |
 
+| batch 6 — lists | any depth, Backspace after a deeper bullet removes it, outline numbering (nested starts at 1, Shift+Tab continues), Restart Numbering kept after restart | **PASS** (e2e BA) |
+| batch 6 — checklist | `[ ] ` / `[x] `, Enter continues, Ctrl+Enter ticks, Markdown task list | **PASS** (e2e BB, BR) |
+| batch 6 — typing helpers | two quick spaces → `. `, pause keeps two; Ctrl+Backspace in the Link dialog (real keys) | **PASS** (e2e BC, BD) |
+| batch 6 — Notes Explorer | Ctrl+click (real mouse) several notes, trash all, Ctrl+Z restores all; lock (read-only, no rename/trash); sort by name with numbers; Trash last | **PASS** (e2e BE, BF, BG) |
+| batch 6 — page break | `----` + Enter, survives restart, `page-break-after` in Markdown | **PASS** (e2e BH) |
+| batch 6 — paste | terminal box table → table; HTML task list and embedded picture | **PASS** (e2e BI, BR) |
+| batch 6 — import / export | export all as md/rtf/txt, complete backup copy, restore from it; import into a folder keeps the source, Save Back keeps the old file | **PASS** (e2e BJ, BK) |
+| batch 6 — themes, sounds, view | preset + copy/paste own theme; silent dialog; line numbers & paragraph `Ln`; default font, font box applies on Enter only; Shift+click (real mouse); background persists | **PASS** (e2e BL–BQ) |
+| batch 6 — save torture | `persist-torture.ps1 -Cycles 20 -Runs 2` with new content (outline numbers, checklist, page break, picture, pasted terminal table) and a fifth close mode: Ctrl+S then `Stop-Process -Force` at once (often while `Saving...`) — the last edit may be lost, nothing else | **PASS**: 40 cycles, 0 mismatches. Found on the way: after a kill during a save the next start stopped at a "leftover files" dialog before the window appeared → now a status-bar line |
+| batch 6 — heavy note | `stress-heavy.ps1`: 3000 paragraphs, 15 pictures, 15 page breaks, numbered lists, checklists, tables (150 000 characters); killed 0–40 ms after Ctrl+S, mostly during `Saving...` | **PASS**: 10 + 8 kills, every reopen the new or the previous complete version, 0 damaged. Found on the way: Enter in a numbered list of such a note took > 10 s (renumbering the whole note, a status-bar update per paragraph) → only the list around the caret is renumbered, without selection notifications (note built in 8–11 s instead of timing out) |
+| batch 6 — low memory | the heavy-note run with a second process holding 1.5 GB (≈ 970 MB of 7.7 GB left) | **PASS**: 8 kills, 0 damaged |
+| batch 6 — mixed content | heading, nested numbers, checklist, page break, picture, table: identical Markdown and text after close (no Ctrl+S) and reopen | **PASS** (e2e BS) |
+
 Unit and integration tests: `cargo test` — all pass (nodi-core: tree,
 storage, autosave, backup, Markdown mirror, search, links, image, RTF and theme
 colours, Markdown import/export, HTML import, LaTeX parser, math layout, PNG; nodi-windows: table structure,
@@ -204,7 +217,17 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   Change Icon... > From file... (`.ico`/`.png`, copied to `data\icons`).
 - Portable build (`scripts/build.ps1` → `dist\Nodi`), data next to the exe.
 
+### Batch 6 (2026-10-29)
+See `docs/tasks/rev2-batch6.md` (requests) and `rev2-batch6-REPORT.md`.
+
 ### Not done yet / limitations
+- **Colour emoji**: Windows' Rich Edit control draws emoji in colour only in
+  its Direct2D mode, which a normal (windowed) control cannot switch on; every
+  `EM_SETEDITSTYLEEX` flag was tried. Emoji show as Segoe UI Emoji outlines.
+- An animated GIF is pasted / dropped as a still picture (its first frame).
+- Pictures of pasted web pages are fetched only from public internet
+  addresses (never from the LAN, `localhost` or `\\server\share`, which
+  could leak the Windows login); those stay links.
 - **Typing** inline Markdown (`**bold**`, `` `code` ``) still does not convert;
   pasting Markdown does (see above). The Markdown view stays read-only and the
   note itself is the source of truth.
@@ -217,6 +240,9 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   to be reused).
 
 ## Security notes
+- Pasted HTML cannot make Nodi read network (UNC) paths or contact local
+  addresses: picture paths must be on a local drive, downloads go only to
+  public IP addresses, and HTTP redirects are not followed.
 - Pasted HTML/Markdown can only create web, mail, `file:`/drive-path and Nodi
   links; every link target is percent-encoded before it goes into the RTF, so
   a crafted address cannot add RTF (objects, fields) to a note.

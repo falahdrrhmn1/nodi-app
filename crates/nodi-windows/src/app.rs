@@ -11,10 +11,7 @@ use std::time::Duration;
 
 use nodi_core::autosave::{Job, SaveRequest, SaveResult, Target, Writer};
 use nodi_core::backup;
-use nodi_core::storage::{
-    format_hex_color, CustomTheme, Session, Settings, TabState, Theme, WindowRect,
-    DEFAULT_SIDEBAR_WIDTH,
-};
+use nodi_core::storage::{Session, Settings, TabState, WindowRect, DEFAULT_SIDEBAR_WIDTH};
 use nodi_core::tree::Position;
 use nodi_core::{DataDir, NodeKind, NoteId, Tree};
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND};
@@ -129,6 +126,8 @@ pub struct App {
     pub tree_view: HWND,
     pub tabctrl: HWND,
     pub status: HWND,
+    /// Line-number strip left of the editor (View > Line Numbers).
+    pub gutter: HWND,
 
     pub toolbar_visible: bool,
     pub status_visible: bool,
@@ -162,6 +161,11 @@ pub struct App {
     /// Notes Explorer changes Ctrl+Z (tree focused) can take back, newest
     /// last; at most [`TREE_UNDO_LIMIT`], this session only.
     pub tree_undo: Vec<nodi_core::TreeUndo>,
+    /// Notes Explorer multi-selection (Ctrl+click / Shift+click), in tree
+    /// order; empty or one entry = just the normal selection.
+    pub multi: Vec<NoteId>,
+    /// Where a Shift+click range starts.
+    pub multi_anchor: Option<NoteId>,
     /// Set once `WM_CREATE` finished: from then on the window procedure owns
     /// the boxed `App` and frees it in `WM_NCDESTROY`.
     pub created: bool,
@@ -210,6 +214,7 @@ impl App {
             tree_view: ptr::null_mut(),
             tabctrl: ptr::null_mut(),
             status: ptr::null_mut(),
+            gutter: ptr::null_mut(),
             toolbar_visible: true,
             status_visible: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
@@ -229,6 +234,8 @@ impl App {
             recent: Vec::new(),
             tab_context: None,
             tree_undo: Vec::new(),
+            multi: Vec::new(),
+            multi_anchor: None,
             created: false,
         }
     }
@@ -278,7 +285,18 @@ impl App {
         }
 
         match data.recover_leftovers() {
-            Ok(paths) if !paths.is_empty() => dialogs::recovered(self.hwnd, &paths),
+            // An interrupted save (crash, power cut, killed process) leaves
+            // its unfinished temp file; the note itself is the last complete
+            // version. Say so in the status bar instead of a dialog that
+            // would stop the start before the window is even shown.
+            Ok(paths) if !paths.is_empty() => {
+                let message = format!(
+                    "An interrupted save was found: {} unfinished file(s) kept in \
+                     data\\recovery — your notes are the last complete versions",
+                    paths.len()
+                );
+                status::set_message(self, &message);
+            }
             Ok(_) => {}
             Err(err) => dialogs::error(
                 self.hwnd,
@@ -338,6 +356,7 @@ impl App {
         // Settings decide the palette before any note is streamed into an
         // editor, so the very first paint is already themed.
         self.settings = data.load_settings();
+        self.apply_body_font();
         let chosen = self.settings.markdown_dir.trim();
         if !chosen.is_empty() {
             data.set_markdown_dir(Some(std::path::PathBuf::from(chosen)));
@@ -850,6 +869,13 @@ impl App {
             editor::scroll_to_line(editor, line);
         }
         editor::set_change_events(editor, true);
+        if self.tree.is_locked(&id) {
+            editor::set_read_only(editor, true);
+            status::set_message(
+                self,
+                "This note is locked (read-only) — right-click > Unlock to edit",
+            );
+        }
 
         let title = self
             .tree
@@ -1099,7 +1125,17 @@ impl App {
         let seq = self.tabs[index].seq + 1;
         let note = self.tabs[index].note.clone();
         // A note that was never renamed by hand is titled by its first line;
-        // checking at save time keeps it off the keystroke path.
+        // checking at save time keeps it off the keystroke path. Notes made
+        // before titles followed the text still carry the default title:
+        // they follow too, once, as soon as they get text (not when locked).
+        let default_title = self.tree.get(&note).is_some_and(|node| {
+            !node.auto_title
+                && !node.locked
+                && matches!(node.title.as_str(), "New Note" | "Untitled")
+        });
+        if default_title && !txt.trim().is_empty() && !self.tree.is_locked(&note) {
+            self.tree.set_auto_title(&note, true);
+        }
         if let Some(title) = self.tree.follow_text(&note, &txt) {
             self.tree_save();
             tree::set_item_text(self, &note, &title);
@@ -1406,11 +1442,15 @@ impl App {
     /// Creates a note/folder relative to the selected (or context) node.
     pub fn create_note(&mut self, kind: NodeKind, as_child: bool) {
         let anchor = self.context_note.clone().or_else(|| self.selected.clone());
-        let parent = match (&anchor, as_child) {
+        let mut parent = match (&anchor, as_child) {
             (Some(id), true) => Some(id.clone()),
             (Some(id), false) => self.tree.get(id).and_then(|node| node.parent.clone()),
             (None, _) => None,
         };
+        // Nothing new goes into a locked folder: it lands next to it.
+        while let Some(locked) = parent.clone().filter(|id| self.tree.is_locked(id)) {
+            parent = self.tree.get(&locked).and_then(|node| node.parent.clone());
+        }
         let title = match kind {
             NodeKind::Note => "New Note",
             NodeKind::Folder => "New Folder",
@@ -1557,7 +1597,7 @@ impl App {
 
     pub fn rename_node(&mut self, id: NoteId, title: String) {
         let title = title.trim().to_owned();
-        if title.is_empty() {
+        if title.is_empty() || !self.check_unlocked(&id) {
             return;
         }
         let change = self.tree.rename_undo(&id, &title);
@@ -1630,9 +1670,28 @@ impl App {
     /// Notes > Move to...: pick any other node (or the top level) as the new
     /// parent and move the selection there as the last child.
     pub fn move_selected_to_picker(&mut self) {
-        let Some(id) = self.context_note.clone().or_else(|| self.selected.clone()) else {
+        let ids = self.selection_ids();
+        let Some(id) = ids.first().cloned() else {
             return;
         };
+        if ids.len() > 1 {
+            let mut entries: Vec<(Option<NoteId>, String)> =
+                vec![(None, "— Top level —".to_owned())];
+            for node in self.tree.iter_ordered() {
+                if node.trashed || ids.iter().any(|moved| self.tree.is_within(&node.id, moved)) {
+                    continue;
+                }
+                let depth = self.tree.ancestors(&node.id).len();
+                entries.push((
+                    Some(node.id.clone()),
+                    format!("{}{}", "    ".repeat(depth), node.title),
+                ));
+            }
+            if let Some(choice) = dialogs::move_to(self.hwnd, &entries) {
+                self.move_selection_into(choice);
+            }
+            return;
+        }
         let mut entries: Vec<(Option<NoteId>, String)> = vec![(None, "— Top level —".to_owned())];
         for node in self.tree.iter_ordered() {
             if node.trashed || self.tree.is_within(&node.id, &id) {
@@ -1651,14 +1710,9 @@ impl App {
         let Some(choice) = dialogs::move_to(self.hwnd, &entries) else {
             return;
         };
-        match choice {
-            None => self.move_selected_to_root(),
-            Some(parent) => {
-                self.context_note = Some(id.clone());
-                // A refused move is reported in the status bar.
-                let _ = self.move_node_relative(id, parent, Position::Inside);
-            }
-        }
+        // The same checks as for several notes (locked notes and folders).
+        self.context_note = Some(id);
+        self.move_selection_into(choice);
     }
 
     pub fn expand(&mut self, id: Option<NoteId>) {
@@ -1728,26 +1782,10 @@ impl App {
 // ------------------------------------------------- settings, theme and tools
 
 impl App {
-    fn save_settings(&self) {
+    pub(crate) fn save_settings(&self) {
         if let Some(data) = &self.data {
             let _ = data.save_settings(&self.settings);
         }
-    }
-
-    /// View > Theme > Light / Dark.
-    pub fn set_theme(&mut self, theme: Theme) {
-        self.settings.theme = theme;
-        theme::apply(self);
-        self.save_settings();
-        menu::sync_settings(self);
-        status::set_message(
-            self,
-            match theme {
-                Theme::Light => "Light theme",
-                Theme::Dark => "Dark theme",
-                Theme::Custom => "Custom theme",
-            },
-        );
     }
 
     /// View > Spell Check.
@@ -2009,56 +2047,6 @@ pub fn show_outline(app: &mut App) {
     crate::wnd::outline::show(app);
 }
 
-/// View > Theme > Custom...
-pub fn choose_custom_theme(app: &mut App) {
-    let previous = app.settings.clone();
-    let frame = app.hwnd;
-    let chosen = dialogs::custom_theme(
-        app.hwnd,
-        app.settings.custom.clone(),
-        frame,
-        preview_custom_theme,
-    );
-    match chosen {
-        Some(custom) => {
-            app.settings.custom = custom;
-            app.settings.theme = Theme::Custom;
-            theme::apply(app);
-            app.save_settings();
-            menu::sync_settings(app);
-            status::set_message(app, "Custom theme applied");
-        }
-        None => {
-            // Undo every live preview.
-            app.settings = previous;
-            theme::apply(app);
-            menu::sync_settings(app);
-        }
-    }
-}
-
-/// Live preview from the custom-theme dialog (`COLORREF` values).
-extern "system" fn preview_custom_theme(frame: HWND, background: u32, text: u32, accent: u32) {
-    let from_colorref = |colour: u32| {
-        format_hex_color((
-            (colour & 0xFF) as u8,
-            ((colour >> 8) & 0xFF) as u8,
-            ((colour >> 16) & 0xFF) as u8,
-        ))
-    };
-    // SAFETY: the frame is alive for the whole modal dialog; this is the same
-    // re-entrancy every modal dialog in this app already allows.
-    if let Some(app) = unsafe { crate::wnd::app_mut(frame) } {
-        app.settings.theme = Theme::Custom;
-        app.settings.custom = CustomTheme {
-            background: from_colorref(background),
-            text: from_colorref(text),
-            accent: from_colorref(accent),
-        };
-        theme::apply(app);
-    }
-}
-
 fn snapshot_is_stale(path: &std::path::Path) -> bool {
     match std::fs::metadata(path).and_then(|meta| meta.modified()) {
         Ok(modified) => modified
@@ -2091,8 +2079,9 @@ pub fn sync_window_title(app: &App) {
 /// every control that currently exists.
 pub fn recreate_fonts(app: &mut App) {
     // SAFETY: both calls only read system metrics and create a GDI font.
-    let ui = unsafe { make_ui_font(app.dpi, false) };
-    let bold = unsafe { make_ui_font(app.dpi, true) };
+    let (face, size) = crate::wnd::theme::ui_font();
+    let ui = unsafe { make_ui_font(app.dpi, false, &face, size) };
+    let bold = unsafe { make_ui_font(app.dpi, true, &face, size) };
     let old_ui = std::mem::replace(&mut app.ui_font, ui);
     let old_bold = std::mem::replace(&mut app.bold_font, bold);
 
@@ -2156,7 +2145,7 @@ pub fn apply_fonts(app: &App) {
     }
 }
 
-unsafe fn make_ui_font(dpi: u32, bold: bool) -> HFONT {
+unsafe fn make_ui_font(dpi: u32, bold: bool, face: &str, size: u32) -> HFONT {
     let mut metrics: NONCLIENTMETRICSW = std::mem::zeroed();
     metrics.cbSize = size_of::<NONCLIENTMETRICSW>() as u32;
     let ok = SystemParametersInfoW(
@@ -2181,6 +2170,11 @@ unsafe fn make_ui_font(dpi: u32, bold: bool) -> HFONT {
     if logfont.lfHeight == 0 {
         logfont.lfHeight = -win::mul_div(12, dpi as i32, 96);
     }
+    // The theme's chrome font (Segoe UI 9 pt is the Windows default).
+    if !face.is_empty() && !(face == "Segoe UI" && size == 9) {
+        set_face(&mut logfont.lfFaceName, face);
+        logfont.lfHeight = -win::mul_div(size.clamp(7, 16) as i32, dpi as i32, 72);
+    }
     if bold {
         logfont.lfWeight = FW_BOLD as i32;
     }
@@ -2204,6 +2198,8 @@ pub fn on_editor_change(app: &mut App, editor: HWND) {
         return;
     }
     app.mark_dirty(editor);
+    crate::wnd::gutter::invalidate(editor);
+    crate::wnd::gutter::refresh(app);
     status::update_caret(app);
     status::schedule_counts(app);
     crate::wnd::format::maintain_heading(editor);
@@ -2246,6 +2242,11 @@ pub fn show_find_note(app: &mut App) {
 
 /// `Notes > Rename` / F2: starts inline label editing on the selected item.
 pub fn rename_selected(app: &mut App) {
+    if let Some(id) = app.context_note.clone().or_else(|| app.selected.clone()) {
+        if !app.check_unlocked(&id) {
+            return;
+        }
+    }
     tree::begin_rename(app);
 }
 
@@ -2277,6 +2278,9 @@ pub fn change_icon(app: &mut App) {
     let Some(id) = app.context_note.clone().or_else(|| app.selected.clone()) else {
         return;
     };
+    if !app.check_unlocked(&id) {
+        return;
+    }
     let current = app
         .tree
         .get(&id)
@@ -2336,6 +2340,7 @@ impl App {
                     nodi_core::TreeUndo::Rename { id, .. }
                     | nodi_core::TreeUndo::Move { id, .. } => Some(id.clone()),
                     nodi_core::TreeUndo::Trash { ids, .. } => ids.first().cloned(),
+                    nodi_core::TreeUndo::Batch { .. } => self.selected.clone(),
                 };
                 self.rebuild_tree();
                 self.refresh_titles();
@@ -2366,6 +2371,17 @@ impl App {
         let Some(id) = self.context_note.clone().or_else(|| self.selected.clone()) else {
             return;
         };
+        if self.tree.subtree_locked(&id) {
+            self.check_unlocked(&id);
+            return;
+        }
+        if self.settings.tree_sort != nodi_core::tree::SortOrder::Manual {
+            status::set_message(
+                self,
+                "The notes are sorted — View > Sort Notes > Manual to arrange them by hand",
+            );
+            return;
+        }
         let change = self.tree.move_undo(&id);
         if self.tree.move_among_siblings(&id, delta) {
             if let Some(change) = change {
@@ -2376,27 +2392,13 @@ impl App {
             self.rebuild_tree();
         }
     }
-
-    /// Notes > Move to Top Level.
-    pub fn move_selected_to_root(&mut self) {
-        let Some(id) = self.context_note.clone().or_else(|| self.selected.clone()) else {
-            return;
-        };
-        let change = self.tree.move_undo(&id);
-        if self.tree.move_node(&id, None, usize::MAX).is_ok() {
-            if let Some(change) = change {
-                self.remember_tree_change(change);
-            }
-            self.tree_save();
-            self.selected = Some(id);
-            self.rebuild_tree();
-            status::set_message(self, "Moved to the top level");
-        }
-    }
 }
 
 /// Insert > Image...: file picker, then the picture goes in at the caret.
 pub fn insert_image_file(app: &mut App) {
+    if crate::wnd::editor::refuse_if_locked(app) {
+        return;
+    }
     let Some(editor) = app.active_editor() else {
         status::set_message(app, "Open a note first");
         return;
@@ -2416,6 +2418,9 @@ pub fn insert_image_file(app: &mut App) {
 
 /// Insert > Table...
 pub fn insert_table(app: &mut App) {
+    if crate::wnd::editor::refuse_if_locked(app) {
+        return;
+    }
     let Some(editor) = app.active_editor() else {
         status::set_message(app, "Open a note first");
         return;
@@ -2541,6 +2546,9 @@ pub fn copy_link_for(app: &mut App, id: &NoteId) {
 
 /// Insert > Formula... (Alt+=).
 pub fn insert_formula(app: &mut App) {
+    if crate::wnd::editor::refuse_if_locked(app) {
+        return;
+    }
     crate::wnd::formula::insert_or_edit(app);
 }
 

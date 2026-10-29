@@ -113,6 +113,258 @@ fn run(app: &mut App, line: &str) -> String {
             })
             .unwrap_or_else(|| "not found".to_owned()),
         ("firstline", Some(window)) => editor::first_visible_line(window).to_string(),
+        // Batch 6: screen point a few pixels inside character `n`.
+        ("charscreen", Some(window)) => {
+            let index: i32 = rest.trim().parse().unwrap_or(0);
+            let (x, y) = editor::char_point(window, index);
+            let mut point = windows_sys::Win32::Foundation::POINT { x: x + 2, y: y + 6 };
+            // SAFETY: converting from our editor's client coordinates.
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::ClientToScreen(window, &mut point);
+            }
+            format!("{} {}", point.x, point.y)
+        }
+        ("visible", _) => crate::wnd::tree::visible_ids(app)
+            .iter()
+            .filter_map(|id| app.tree.get(id).map(|node| node.title.clone()))
+            .collect::<Vec<_>>()
+            .join("|"),
+        ("caretpart", _) => {
+            status::update_caret(app);
+            app.status_text
+                .get(status::PART_CARET)
+                .cloned()
+                .unwrap_or_default()
+        }
+        ("gutter", _) => crate::wnd::gutter::width(app).to_string(),
+        ("multi", _) => app
+            .multi
+            .iter()
+            .filter_map(|id| app.tree.get(id).map(|node| node.title.clone()))
+            .collect::<Vec<_>>()
+            .join("|"),
+        ("locked", _) => app
+            .tree
+            .iter_ordered()
+            .into_iter()
+            .find(|node| node.title == rest.trim())
+            .map(|node| format!("{} {}", node.locked, app.tree.is_locked(&node.id)))
+            .unwrap_or_else(|| "not found".to_owned()),
+        ("readonly", Some(window)) => {
+            // SAFETY: plain style query of our own window.
+            let style = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongW(
+                    window,
+                    windows_sys::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                )
+            };
+            ((style & 0x0800) != 0).to_string() // ES_READONLY
+        }
+        ("export-all", _) => {
+            // export-all <dir> <md,rtf,txt>: File > Export > All Notes
+            // without the dialogs.
+            let mut parts = rest.rsplitn(2, ' ');
+            let kinds = parts.next().unwrap_or("md");
+            let dir = parts.next().unwrap_or("").trim().to_owned();
+            app.flush_all();
+            if let Some(writer) = &app.writer {
+                writer.flush_blocking(std::time::Duration::from_secs(5));
+            }
+            let formats = nodi_core::mirror::Formats {
+                markdown: kinds.contains("md"),
+                rtf: kinds.contains("rtf"),
+                txt: kinds.contains("txt"),
+            };
+            match app.data.clone() {
+                Some(data) => match nodi_core::mirror::export_many(
+                    &data,
+                    &app.tree,
+                    None,
+                    std::path::Path::new(&dir),
+                    formats,
+                ) {
+                    Ok(count) => count.to_string(),
+                    Err(err) => format!("error {err}"),
+                },
+                None => "no data".to_owned(),
+            }
+        }
+        ("backup-copy", _) => {
+            app.flush_all();
+            if let Some(writer) = &app.writer {
+                writer.flush_blocking(std::time::Duration::from_secs(5));
+            }
+            match app.data.clone() {
+                Some(data) => {
+                    match nodi_core::backup::copy_to(&data, std::path::Path::new(rest.trim())) {
+                        Ok(dir) => dir.display().to_string(),
+                        Err(err) => format!("error {err}"),
+                    }
+                }
+                None => "no data".to_owned(),
+            }
+        }
+        ("restore-folder", _) => {
+            app.restore_snapshot(std::path::Path::new(rest.trim()));
+            "ok".to_owned()
+        }
+        ("import-into", _) => {
+            // import-into <title>|<path>|<path>...: right-click > Import Here.
+            let mut parts = rest.split('|');
+            let title = parts.next().unwrap_or("").trim().to_owned();
+            let parent = app
+                .tree
+                .iter_ordered()
+                .into_iter()
+                .find(|node| !node.trashed && node.title == title)
+                .map(|node| node.id.clone());
+            let paths: Vec<std::path::PathBuf> = parts
+                .filter(|part| !part.trim().is_empty())
+                .map(|part| std::path::PathBuf::from(part.trim()))
+                .collect();
+            crate::wnd::import::start_into(app, paths, crate::wnd::import::Target::Into(parent));
+            "ok".to_owned()
+        }
+        ("source", _) => app
+            .tree
+            .iter_ordered()
+            .into_iter()
+            .find(|node| node.title == rest.trim())
+            .and_then(|node| node.source.clone())
+            .unwrap_or_else(|| "none".to_owned()),
+        ("context", _) => {
+            // context <title>: as if that row had been right-clicked.
+            app.context_note = app
+                .tree
+                .iter_ordered()
+                .into_iter()
+                .find(|node| !node.trashed && node.title == rest.trim())
+                .map(|node| node.id.clone());
+            app.context_note.is_some().to_string()
+        }
+        ("multi-add", _) => {
+            let id = app
+                .tree
+                .iter_ordered()
+                .into_iter()
+                .find(|node| !node.trashed && node.title == rest.trim())
+                .map(|node| node.id.clone());
+            match id {
+                Some(id) => {
+                    app.toggle_multi(id);
+                    "ok".to_owned()
+                }
+                None => "not found".to_owned(),
+            }
+        }
+        ("settings", _) => app.settings.to_json(),
+        ("undo-tree", _) => {
+            app.undo_tree_change();
+            "ok".to_owned()
+        }
+        ("prefs-font", _) => {
+            // prefs-font <face> <size>
+            let mut parts = rest.rsplitn(2, ' ');
+            let size = parts
+                .next()
+                .and_then(|size| size.parse().ok())
+                .unwrap_or(11);
+            let face = parts.next().unwrap_or("Segoe UI").trim().to_owned();
+            app.settings.body_font = face;
+            app.settings.body_size = size;
+            app.apply_body_font();
+            "ok".to_owned()
+        }
+        ("fontcombo-type", _) => {
+            // Characters typed into the font combo's edit box.
+            // SAFETY: messages to our own combo's edit child.
+            unsafe {
+                let edit = windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(
+                    app.font_combo,
+                    windows_sys::Win32::UI::WindowsAndMessaging::GW_CHILD,
+                );
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(edit);
+                SendMessageW(edit, 0x00B1, 0, -1); // EM_SETSEL: select all
+                for ch in rest.encode_utf16() {
+                    SendMessageW(edit, WM_CHAR, ch as usize, 1);
+                }
+                let mut buffer = [0u16; 64];
+                let length = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                    edit,
+                    buffer.as_mut_ptr(),
+                    64,
+                );
+                String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+            }
+        }
+        ("fontcombo-enter", _) => {
+            // SAFETY: Enter on our own combo's edit child.
+            unsafe {
+                let edit = windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(
+                    app.font_combo,
+                    windows_sys::Win32::UI::WindowsAndMessaging::GW_CHILD,
+                );
+                SendMessageW(edit, 0x0100, 0x0D, 1); // WM_KEYDOWN VK_RETURN
+            }
+            "ok".to_owned()
+        }
+        ("list-restart", Some(window)) => {
+            format::set_numbering_restart(window, rest.trim() != "0");
+            "ok".to_owned()
+        }
+        ("numbers", Some(window)) => {
+            // The list numbers Rich Edit shows, from the RTF it writes.
+            let rtf = editor::stream_out_rtf(window).unwrap_or_default();
+            let rtf = String::from_utf8_lossy(&rtf).into_owned();
+            rtf.split("{\\pntext")
+                .skip(1)
+                .filter_map(|part| {
+                    let text = part.split('}').next()?;
+                    let number = text.split_whitespace().last()?.trim_end_matches("\\tab");
+                    Some(number.to_owned())
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        ("d2d-scan", Some(window)) => {
+            // Which EM_SETEDITSTYLEEX bit lets TO_DISPLAYFONTCOLOR stick?
+            let mut found = Vec::new();
+            for bit in 0..32 {
+                let flag = 1usize << bit;
+                // SAFETY: plain messages to our own Rich Edit.
+                unsafe {
+                    SendMessageW(window, 0x0400 + 275, flag, flag as isize);
+                    let ok = SendMessageW(window, 0x0400 + 202, 17, 17);
+                    let now = SendMessageW(window, 0x0400 + 203, 0, 0);
+                    if ok != 0 || now & 16 != 0 {
+                        found.push(format!("bit{bit}:{ok}/{now}"));
+                    }
+                    SendMessageW(window, 0x0400 + 275, 0, flag as isize);
+                }
+            }
+            if found.is_empty() {
+                "none".to_owned()
+            } else {
+                found.join(" ")
+            }
+        }
+        ("typo", Some(window)) => {
+            // typo <options> <mask>: EM_SETTYPOGRAPHYOPTIONS experiments.
+            let mut parts = rest
+                .split_whitespace()
+                .filter_map(|part| part.parse::<usize>().ok());
+            let options = parts.next().unwrap_or(1);
+            let mask = parts.next().unwrap_or(options);
+            // SAFETY: plain message to our own Rich Edit.
+            let result = unsafe { SendMessageW(window, 0x0400 + 202, options, mask as isize) };
+            // SAFETY: as above (EM_GETTYPOGRAPHYOPTIONS).
+            let now = unsafe { SendMessageW(window, 0x0400 + 203, 0, 0) };
+            format!("{result} {now}")
+        }
+        ("double-space", Some(_)) => {
+            editkeys::set_double_space_period(rest.trim() != "0");
+            "ok".to_owned()
+        }
         ("import", _) => {
             let paths: Vec<std::path::PathBuf> = rest
                 .split('|')

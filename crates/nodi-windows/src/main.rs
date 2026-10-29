@@ -1,7 +1,10 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod explorer;
+mod prefs;
 mod testhook;
+mod themes;
 mod win;
 mod wnd;
 

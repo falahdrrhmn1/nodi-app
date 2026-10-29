@@ -33,6 +33,17 @@ const BM_SETCHECK: u32 = 0x00F1;
 const BM_GETCHECK: u32 = 0x00F0;
 const BST_CHECKED: usize = 1;
 
+thread_local! {
+    /// Index of the field that last had the keyboard focus.
+    static LAST_FIELD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The field that had the focus before an extra button was pressed (e.g.
+/// which colour Pick Colour... changes).
+pub fn last_focused_field() -> Option<usize> {
+    LAST_FIELD.with(|last| last.get())
+}
+
 /// One labelled input.
 pub struct Field {
     pub label: String,
@@ -70,6 +81,11 @@ pub struct Form {
     /// Check boxes below the fields: (label, checked by default).
     pub checkboxes: Vec<(String, bool)>,
     pub extras: Vec<(String, ExtraAction)>,
+    /// Own buttons `(id, label)` instead of OK/Cancel (message boxes: Yes /
+    /// No / OK). The first is the default button.
+    pub buttons: Vec<(i32, String)>,
+    /// Width of the text area in 96-DPI pixels (0 = the usual width).
+    pub width: i32,
 }
 
 impl Form {
@@ -80,7 +96,26 @@ impl Form {
             fields: Vec::new(),
             checkboxes: Vec::new(),
             extras: Vec::new(),
+            buttons: Vec::new(),
+            width: 0,
         }
+    }
+
+    pub fn button(mut self, id: i32, label: &str) -> Self {
+        self.buttons.push((id, label.to_owned()));
+        self
+    }
+
+    pub fn wide(mut self, width: i32) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Shows the form modally and returns the id of the button pressed
+    /// (`None` for Esc / the close box).
+    pub fn show_choice(self, owner: HWND) -> Option<i32> {
+        // SAFETY: as in `show`.
+        unsafe { run(owner, self).1 }
     }
 
     pub fn note(mut self, note: &str) -> Self {
@@ -107,7 +142,7 @@ impl Form {
     pub fn show(self, owner: HWND) -> Option<Vec<String>> {
         // SAFETY: the window lives only inside this call; the state box is
         // reclaimed after the modal loop ends.
-        unsafe { run(owner, self) }
+        unsafe { run(owner, self).0 }
     }
 }
 
@@ -117,7 +152,10 @@ struct State {
     checks: Vec<HWND>,
     font: HFONT,
     result: Option<Vec<String>>,
+    answer: Option<i32>,
     dpi: i32,
+    /// Control that had the keyboard focus when the form was deactivated.
+    focus: HWND,
 }
 
 unsafe fn register() {
@@ -152,18 +190,39 @@ const LINE_H: i32 = 18;
 const BUTTON_W: i32 = 88;
 const BUTTON_H: i32 = 26;
 
-fn note_lines(note: &str) -> i32 {
+/// Width of an extra button, wide enough for its label.
+fn extra_width(label: &str) -> i32 {
+    BUTTON_W.max(label.chars().count() as i32 * 7 + 22)
+}
+
+/// True when the extra buttons and OK/Cancel do not fit on one row: OK and
+/// Cancel then get a row of their own below (they used to overlap).
+fn buttons_wrap(form: &Form) -> bool {
+    let extras: i32 = form
+        .extras
+        .iter()
+        .map(|(label, _)| extra_width(label) + 6)
+        .sum();
+    extras > 0 && extras + BUTTON_W * 2 + 12 > LABEL_W + EDIT_W
+}
+
+/// Text lines of `note` when about `per_line` characters fit on a line.
+fn note_lines_for(note: &str, per_line: i32) -> i32 {
     if note.is_empty() {
         0
     } else {
         note.lines()
-            .map(|line| 1 + line.len() as i32 / 70)
+            .map(|line| 1 + line.chars().count() as i32 / per_line.max(10))
             .sum::<i32>()
     }
 }
 
+fn form_note_lines(form: &Form) -> i32 {
+    note_lines_for(&form.note, inner_width(form) * 70 / (LABEL_W + EDIT_W))
+}
+
 fn content_height(form: &Form) -> i32 {
-    let note = note_lines(&form.note);
+    let note = form_note_lines(form);
     let mut height = MARGIN;
     if note > 0 {
         height += note * LINE_H + 8;
@@ -172,6 +231,9 @@ fn content_height(form: &Form) -> i32 {
         height += field_height(field) + 8;
     }
     height += form.checkboxes.len() as i32 * ROW_H;
+    if buttons_wrap(form) {
+        height += BUTTON_H + 8;
+    }
     height + BUTTON_H + MARGIN
 }
 
@@ -183,13 +245,13 @@ fn field_height(field: &Field) -> i32 {
     }
 }
 
-unsafe fn run(owner: HWND, form: Form) -> Option<Vec<String>> {
+unsafe fn run(owner: HWND, form: Form) -> (Option<Vec<String>>, Option<i32>) {
     register();
     let dpi = match GetDpiForWindow(owner) {
         0 => 96,
         value => value as i32,
     };
-    let width = scale(MARGIN * 2 + LABEL_W + EDIT_W, dpi) + scale(16, dpi);
+    let width = scale(MARGIN * 2 + inner_width(&form), dpi) + scale(16, dpi);
     let height = scale(content_height(&form), dpi) + scale(40, dpi);
     let mut owner_rect: RECT = std::mem::zeroed();
     GetWindowRect(owner, &mut owner_rect);
@@ -203,7 +265,9 @@ unsafe fn run(owner: HWND, form: Form) -> Option<Vec<String>> {
         checks: Vec::new(),
         font: ptr::null_mut(),
         result: None,
+        answer: None,
         dpi,
+        focus: ptr::null_mut(),
     }));
     let class = win::wide(CLASS);
     let dialog = CreateWindowExW(
@@ -222,7 +286,7 @@ unsafe fn run(owner: HWND, form: Form) -> Option<Vec<String>> {
     );
     if dialog.is_null() {
         drop(Box::from_raw(state));
-        return None;
+        return (None, None);
     }
 
     EnableWindow(owner, 0);
@@ -230,6 +294,9 @@ unsafe fn run(owner: HWND, form: Form) -> Option<Vec<String>> {
     while IsWindow(dialog) != 0 {
         if GetMessageW(&mut message, ptr::null_mut(), 0, 0) <= 0 {
             break;
+        }
+        if crate::wnd::editword::handle(&message) {
+            continue;
         }
         if IsDialogMessageW(dialog, &message) == 0 {
             TranslateMessage(&message);
@@ -243,7 +310,16 @@ unsafe fn run(owner: HWND, form: Form) -> Option<Vec<String>> {
     if !state.font.is_null() {
         DeleteObject(state.font);
     }
-    state.result
+    (state.result, state.answer)
+}
+
+/// Width of the label + field area (or of the note for a message box).
+fn inner_width(form: &Form) -> i32 {
+    if form.width > 0 {
+        form.width
+    } else {
+        LABEL_W + EDIT_W
+    }
 }
 
 unsafe fn make_font(dpi: i32) -> HFONT {
@@ -321,9 +397,9 @@ unsafe fn build(hwnd: HWND, state: &mut State) {
     state.font = make_font(dpi);
     let font = state.font;
     let mut y = MARGIN;
-    let inner_w = LABEL_W + EDIT_W;
+    let inner_w = inner_width(&state.form);
     if !state.form.note.is_empty() {
-        let lines = note_lines(&state.form.note);
+        let lines = form_note_lines(&state.form);
         control(
             hwnd,
             "Static",
@@ -389,7 +465,7 @@ unsafe fn build(hwnd: HWND, state: &mut State) {
     // Buttons: extras on the left, OK/Cancel on the right.
     let mut x = MARGIN;
     for (index, (label, _)) in state.form.extras.iter().enumerate() {
-        let width = BUTTON_W.max(label.chars().count() as i32 * 7 + 16);
+        let width = extra_width(label);
         control(
             hwnd,
             "Button",
@@ -403,6 +479,40 @@ unsafe fn build(hwnd: HWND, state: &mut State) {
         x += width + 6;
     }
     let right = MARGIN + inner_w;
+    if buttons_wrap(&state.form) {
+        y += BUTTON_H + 8;
+    }
+    if !state.form.buttons.is_empty() {
+        // Message-box buttons, right-aligned, the first one the default.
+        let count = state.form.buttons.len() as i32;
+        let mut x = right - count * BUTTON_W - (count - 1) * 6;
+        for (index, (id, label)) in state.form.buttons.iter().enumerate() {
+            let style = if index == 0 {
+                BS_DEFPUSHBUTTON
+            } else {
+                BS_PUSHBUTTON
+            };
+            let button = control(
+                hwnd,
+                "Button",
+                label,
+                style as u32 | WS_TABSTOP,
+                *id,
+                (x, y, BUTTON_W, BUTTON_H),
+                dpi,
+                font,
+            );
+            if index == 0 && state.edits.is_empty() {
+                SetFocus(button);
+                state.focus = button;
+            }
+            x += BUTTON_W + 6;
+        }
+        if let Some(first) = state.edits.first() {
+            SetFocus(*first);
+        }
+        return;
+    }
     control(
         hwnd,
         "Button",
@@ -445,7 +555,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         }
         WM_COMMAND => {
             let id = win::loword(wparam) as i32;
-            if id == IDOK {
+            const EN_SETFOCUS: u16 = 0x0100;
+            if win::hiword(wparam) == EN_SETFOCUS && (FIRST_FIELD_ID..FIRST_EXTRA_ID).contains(&id)
+            {
+                LAST_FIELD.with(|last| last.set(Some((id - FIRST_FIELD_ID) as usize)));
+            }
+            let custom = state(hwnd)
+                .is_some_and(|state| state.form.buttons.iter().any(|(button, _)| *button == id));
+            if custom {
+                if let Some(state) = state(hwnd) {
+                    state.answer = Some(id);
+                    state.result = Some(values(state));
+                }
+                DestroyWindow(hwnd);
+            } else if id == IDOK {
                 if let Some(state) = state(hwnd) {
                     state.result = Some(values(state));
                 }
@@ -469,6 +592,33 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 }
             }
             0
+        }
+        // A plain window gives itself the keyboard focus when activated, so
+        // typing went nowhere until a field was clicked: hand the focus to
+        // the field (or button) that had it, the first field at the start.
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
+            const WA_INACTIVE: usize = 0;
+            if let Some(state) = state(hwnd) {
+                if wparam & 0xFFFF == WA_INACTIVE {
+                    let focus = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+                    if !focus.is_null()
+                        && windows_sys::Win32::UI::WindowsAndMessaging::IsChild(hwnd, focus) != 0
+                    {
+                        state.focus = focus;
+                    }
+                } else {
+                    let target = if !state.focus.is_null() {
+                        state.focus
+                    } else {
+                        state.edits.first().copied().unwrap_or(ptr::null_mut())
+                    };
+                    if !target.is_null() {
+                        SetFocus(target);
+                        return 0;
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_CLOSE => {
             DestroyWindow(hwnd);

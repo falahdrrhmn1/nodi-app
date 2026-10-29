@@ -180,9 +180,48 @@ pub fn is_rule_picture(bytes: &[u8]) -> bool {
         .is_some_and(|info| info.height > 0 && info.height <= 8 && info.width >= info.height * 50)
 }
 
+/// Size of the page-break picture (`----` + Enter, Insert > Page Break).
+pub const PAGE_BREAK_SIZE: (u32, u32) = (600, 24);
+
+/// The page-break picture: the soft bottom edge of one page, a dashed line,
+/// and the top edge of the next — a grey + alpha PNG, recognised later by
+/// its exact size ([`is_page_picture`]).
+pub fn page_break_png() -> Vec<u8> {
+    let (width, height) = PAGE_BREAK_SIZE;
+    let mut pixels = Vec::with_capacity((width * height * 2) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let (grey, alpha) = match y {
+                // Shadow under the page above, fading out.
+                0..=4 => (0x60, [70u8, 48, 30, 16, 6][y as usize]),
+                // The dashed cut between the pages.
+                11 | 12 if (x / 8) % 2 == 0 => (0x90, 0xFF),
+                // Shadow over the top of the next page.
+                19..=23 => (0x60, [6u8, 16, 30, 48, 70][(y - 19) as usize]),
+                _ => (0xFF, 0),
+            };
+            pixels.push(grey);
+            pixels.push(alpha);
+        }
+    }
+    crate::math::encode_png(width, height, &pixels, "")
+}
+
+/// True for the page-break picture (exactly [`PAGE_BREAK_SIZE`]).
+pub fn is_page_picture(bytes: &[u8]) -> bool {
+    sniff(bytes).is_some_and(|info| (info.width, info.height) == PAGE_BREAK_SIZE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_break_picture_is_recognised_and_is_no_rule() {
+        let png = page_break_png();
+        assert!(is_page_picture(&png));
+        assert!(!is_rule_picture(&png));
+    }
 
     fn png_header(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();

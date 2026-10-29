@@ -270,6 +270,16 @@ impl Parser {
                     }
                 }
             }
+            "input" if !closing => {
+                let lower = attrs.to_ascii_lowercase();
+                if lower.contains("checkbox") {
+                    self.emit(if lower.contains("checked") {
+                        "[x] "
+                    } else {
+                        "[ ] "
+                    });
+                }
+            }
             "img" => {
                 let src = attr(attrs, "src").unwrap_or_default();
                 if !src.trim().is_empty() {
@@ -279,7 +289,10 @@ impl Parser {
                     } else {
                         alt
                     };
-                    self.emit(&format!("[{}]({})", text.trim(), src.trim()));
+                    // A picture: pasted into the note when Nodi can read it
+                    // (embedded, local or downloadable), otherwise a link.
+                    let text = text.trim().replace(['[', ']'], "");
+                    self.emit(&format!("![{text}]({})", src.trim()));
                 }
             }
             "ul" | "ol" => {

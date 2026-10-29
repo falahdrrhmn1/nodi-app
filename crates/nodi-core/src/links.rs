@@ -219,6 +219,64 @@ pub fn file_url_path(target: &str) -> Option<String> {
     })
 }
 
+/// The picture inside a `data:image/...;base64,...` address (pasted web
+/// content often embeds pictures that way).
+pub fn data_uri_bytes(target: &str) -> Option<Vec<u8>> {
+    let rest = target.trim();
+    let head = rest.get(..11)?;
+    if !head.eq_ignore_ascii_case("data:image/") {
+        return None;
+    }
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.to_ascii_lowercase().ends_with(";base64") {
+        return None;
+    }
+    base64_decode(payload)
+}
+
+/// Standard or URL-safe Base64, ignoring whitespace; `None` on bad input.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0;
+    for byte in text.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b' ' | b'\r' | b'\n' | b'\t' => continue,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// A local file on a drive named by `target` (a `file:` URL or an absolute
+/// drive path, e.g. a web page saved on disk). Network (UNC) paths are
+/// refused: opening `\\host\share` from pasted content would make Windows
+/// send the user's credentials to that host.
+pub fn local_path(target: &str) -> Option<String> {
+    let path = match file_url_path(target) {
+        Some(path) => path,
+        None => percent_decode(target.trim()),
+    };
+    let bytes = path.as_bytes();
+    let drive = bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    drive.then_some(path)
+}
+
 /// Percent-decodes a `%XX` escaped target (the Markdown writer escapes spaces
 /// and parentheses in link targets).
 pub fn percent_decode_text(text: &str) -> String {
@@ -262,6 +320,35 @@ pub fn parse_math_link(target: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+mod picture_address_tests {
+    use super::*;
+
+    #[test]
+    fn data_uris_and_local_paths() {
+        assert_eq!(base64_decode("aGVsbG8="), Some(b"hello".to_vec()));
+        assert_eq!(base64_decode("aGVs\r\nbG8"), Some(b"hello".to_vec()));
+        assert_eq!(
+            data_uri_bytes("data:image/png;base64,iVBORw0KGgo="),
+            Some(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        );
+        assert_eq!(data_uri_bytes("data:text/html;base64,aGk="), None);
+        assert_eq!(
+            local_path("C:/x/a%20b.png").as_deref(),
+            Some("C:/x/a b.png")
+        );
+        assert_eq!(
+            local_path("file:///C:/x/a.png").as_deref(),
+            Some("C:\\x\\a.png")
+        );
+        assert_eq!(local_path("images/a.png"), None);
+        // Network paths would leak the user's credentials to the host.
+        assert_eq!(local_path("\\\\evil\\share\\a.png"), None);
+        assert_eq!(local_path("file://evil/share/a.png"), None);
+        assert_eq!(local_path("//evil/share/a.png"), None);
+    }
 }
 
 #[cfg(test)]

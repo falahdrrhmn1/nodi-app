@@ -155,7 +155,9 @@ public static class NodiHook {
             if (pid != processId || !IsWindowVisible(hwnd)) return true;
             StringBuilder name = new StringBuilder(64);
             GetClassNameW(hwnd, name, 64);
-            if (name.ToString() == "#32770") { found = hwnd; return false; }
+            // #32770: Windows message boxes and dialogs; NodiForm: Nodi's own
+            // forms and silent message boxes (Preferences > Sounds off).
+            if (name.ToString() == "#32770" || name.ToString() == "NodiForm") { found = hwnd; return false; }
             return true;
         }, IntPtr.Zero);
         return found;
@@ -1373,6 +1375,22 @@ public static class NodiMouse {
     }
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
     const uint LEFTDOWN = 0x0002, LEFTUP = 0x0004;
+    /// A click with Ctrl held (adds a tree row to the selection).
+    public static void CtrlClick(int x, int y) {
+        keybd_event(0x11, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(40);
+        Click(x, y);
+        System.Threading.Thread.Sleep(40);
+        keybd_event(0x11, 0, 2, UIntPtr.Zero);
+    }
+    /// A click with Shift held (extends a selection).
+    public static void ShiftClick(int x, int y) {
+        keybd_event(0x10, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(40);
+        Click(x, y);
+        System.Threading.Thread.Sleep(40);
+        keybd_event(0x10, 0, 2, UIntPtr.Zero);
+    }
     public static void Click(int x, int y) {
         IntPtr previous = Match();
         SetCursorPos(x, y);
@@ -1673,6 +1691,539 @@ Test-Case 'AW' 'status bar shows lines, words, chars and the selection' {
     Stop-Nodi $nodi
     Assert ($note -eq 'Lines 2 · Words 3 · Chars 12') "note: $note"
     Assert ($sel -match 'Sel: 1 lines, 2 words, 8 chars') "selection: $sel"
+    ''
+}
+
+# --------------------------------------------------------------- batch 6 (BA-BS)
+Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class NodiDialog {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetDlgItemTextW(IntPtr dialog, int id, StringBuilder text, int max);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetClassNameW(IntPtr hwnd, StringBuilder name, int max);
+    public static string Text(IntPtr dialog, int id) {
+        StringBuilder text = new StringBuilder(512);
+        GetDlgItemTextW(dialog, id, text, 512);
+        return text.ToString();
+    }
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential)] struct GUITHREADINFO {
+        public int cbSize; public int flags;
+        public IntPtr active, focus, capture, menuOwner, moveSize, caret; public RECT rc;
+    }
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SendMessageW(IntPtr hwnd, int msg, IntPtr wparam, StringBuilder lparam);
+    /// Text of the control that has the keyboard focus in `window`'s thread.
+    public static string FocusText(IntPtr window) {
+        uint pid;
+        uint thread = GetWindowThreadProcessId(window, out pid);
+        GUITHREADINFO info = new GUITHREADINFO();
+        info.cbSize = Marshal.SizeOf(info);
+        if (!GetGUIThreadInfo(thread, ref info) || info.focus == IntPtr.Zero) return "<no focus>";
+        StringBuilder text = new StringBuilder(512);
+        SendMessageW(info.focus, 0x000D, (IntPtr)512, text);
+        return text.ToString();
+    }
+    public static string ClassOf(IntPtr hwnd) {
+        StringBuilder name = new StringBuilder(64);
+        GetClassNameW(hwnd, name, 64);
+        return name.ToString();
+    }
+}
+'@
+
+function Wait-Dialog($nodi, [int]$timeoutMs = 3000) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.ElapsedMilliseconds -lt $timeoutMs) {
+        $dialog = [NodiHook]::FindDialog($nodi.Process.Id)
+        if ($dialog -ne 0) { return $dialog }
+        Start-Sleep -Milliseconds 40
+    }
+    return [IntPtr]::Zero
+}
+
+Test-Case 'BA' 'lists: any depth, Backspace on deeper bullets, outline numbering kept on reload' {
+    $data = New-DataDir 'BA'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys - satu' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    foreach ($level in 2..6) {
+        Invoke-Nodi $nodi 'tab' | Out-Null
+        Invoke-Nodi $nodi "keys level$level" | Out-Null
+        Invoke-Nodi $nodi 'enter' | Out-Null
+    }
+    $deep = Invoke-Nodi $nodi 'para'
+    Invoke-Nodi $nodi 'keys x' | Out-Null
+    $caret = [int](((Invoke-Nodi $nodi 'sel') -split ' ')[0])
+    Invoke-Nodi $nodi "select $($caret - 1) $caret" | Out-Null
+    Invoke-Nodi $nodi 'backspace' | Out-Null          # delete the "x"
+    Invoke-Nodi $nodi 'backspace' | Out-Null          # at the text start: remove the marker
+    $after = Invoke-Nodi $nodi 'para'
+    $line = (Invoke-Nodi $nodi 'text') -split "`r" | Select-Object -Last 1
+    Assert ($deep -match 'start=1800') "the 6th level is not deeper: $deep"
+    Assert ($line -notmatch '[•◦▪]') "Backspace kept the bullet: '$line'"
+    Assert ($after -match 'start=2160') "Backspace lost the indent: $after"
+
+    # Outline numbering: nested lists start at 1, Shift+Tab continues.
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    foreach ($command in @('keys 1. a', 'enter', 'keys b', 'enter', 'tab', 'keys x', 'enter',
+            'keys y', 'enter', 'shift-tab', 'keys c', 'enter', 'keys d')) {
+        Invoke-Nodi $nodi $command | Out-Null
+    }
+    $numbers = Invoke-Nodi $nodi 'numbers'
+    # Restart numbering on "d" (stays after reload).
+    Invoke-Nodi $nodi 'list-restart 1' | Out-Null
+    $restarted = Invoke-Nodi $nodi 'numbers'
+    Invoke-Nodi $nodi 'cmd 101' | Out-Null
+    Wait-State $nodi 'Saved' | Out-Null
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $reloaded = Invoke-Nodi $nodi 'numbers'
+    Stop-Nodi $nodi
+    Assert ($numbers -eq '1. 2. 1. 2. 3. 4.') "numbers: $numbers"
+    Assert ($restarted -eq '1. 2. 1. 2. 3. 1.') "restart: $restarted"
+    Assert ($reloaded -eq '1. 2. 1. 2. 3. 1.') "after reload: $reloaded"
+    "($numbers / $restarted)"
+}
+
+Test-Case 'BB' 'checklist: [ ] and [x], Ctrl+Enter ticks, Markdown task list' {
+    $data = New-DataDir 'BB'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys [ ] beli kopi' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys kirim laporan' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys [x] sudah' | Out-Null
+    $text = Invoke-Nodi $nodi 'text'
+    Assert ($text -match '☐\tbeli kopi') "first item: $text"
+    Assert ($text -match '☐\tkirim laporan') "Enter did not continue the checklist: $text"
+    Assert ($text -match '☑\tsudah') "[x] did not tick: $text"
+    if (Real-Keys $nodi) {
+        Invoke-Nodi $nodi 'select 3 3' | Out-Null
+        [System.Windows.Forms.SendKeys]::SendWait('^{ENTER}')
+        Start-Sleep -Milliseconds 200
+        $text = Invoke-Nodi $nodi 'text'
+        Assert ($text -match '☑\tbeli kopi') "Ctrl+Enter did not tick: $text"
+    }
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($markdown -match '- \[x\] beli kopi') "markdown: $markdown"
+    Assert ($markdown -match '- \[ \] kirim laporan') "markdown: $markdown"
+    ''
+}
+
+Test-Case 'BC' 'two quick spaces type a period, a pause does not' {
+    $data = New-DataDir 'BC'
+    $nodi = Start-Nodi $data
+    if (-not (Real-Keys $nodi)) { throw 'no foreground' }
+    [System.Windows.Forms.SendKeys]::SendWait('halo  dunia')
+    Start-Sleep -Milliseconds 200
+    $quick = Invoke-Nodi $nodi 'text'
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}pelan ')
+    Start-Sleep -Milliseconds 700
+    [System.Windows.Forms.SendKeys]::SendWait(' sekali')
+    Start-Sleep -Milliseconds 200
+    $slow = Invoke-Nodi $nodi 'text'
+    Stop-Nodi $nodi
+    Assert ($quick -match '^halo\. dunia') "quick: '$quick'"
+    Assert ($slow -match 'pelan  sekali') "slow: '$slow'"
+    ''
+}
+
+Test-Case 'BD' 'Ctrl+Backspace deletes a word in the Link dialog (real keys)' {
+    $data = New-DataDir 'BD'
+    $nodi = Start-Nodi $data
+    if (-not (Real-Keys $nodi)) { throw 'no foreground' }
+    [NodiMouse]::CtrlKey(0x4B)                         # Ctrl+K
+    $dialog = Wait-Dialog $nodi
+    Assert ($dialog -ne 0) 'the Link dialog did not open'
+    Start-Sleep -Milliseconds 200
+    [System.Windows.Forms.SendKeys]::SendWait('halo dunia')
+    [System.Windows.Forms.SendKeys]::SendWait('^{BACKSPACE}')
+    Start-Sleep -Milliseconds 150
+    $field = [NodiDialog]::FocusText($dialog)
+    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    Start-Sleep -Milliseconds 200
+    Stop-Nodi $nodi
+    Assert ($field -eq 'halo ') "field after Ctrl+Backspace: '$field'"
+    ''
+}
+
+Test-Case 'BE' 'Notes Explorer: Ctrl+click several notes, trash all, Ctrl+Z restores all' {
+    $data = New-DataDir 'BE'
+    $nodi = Start-Nodi $data
+    foreach ($title in 'Satu', 'Dua', 'Tiga') {
+        Invoke-Nodi $nodi 'cmd 170' | Out-Null
+        Invoke-Nodi $nodi "rename-selected $title" | Out-Null
+    }
+    if (-not (Real-Keys $nodi)) { throw 'no foreground' }
+    Invoke-Nodi $nodi 'select-title Satu' | Out-Null
+    $dua = (Invoke-Nodi $nodi 'treerect Dua') -split ' ' | ForEach-Object { [int]$_ }
+    $tiga = (Invoke-Nodi $nodi 'treerect Tiga') -split ' ' | ForEach-Object { [int]$_ }
+    [NodiMouse]::CtrlClick($dua[0] + 50, [int](($dua[1] + $dua[3]) / 2))
+    Start-Sleep -Milliseconds 200
+    [NodiMouse]::CtrlClick($tiga[0] + 50, [int](($tiga[1] + $tiga[3]) / 2))
+    Start-Sleep -Milliseconds 200
+    $multi = Invoke-Nodi $nodi 'multi'
+    [NodiHook]::SendAsync($nodi.Hwnd, 'cmd 178') | Out-Null
+    Assert (Close-Dialog $nodi 6) 'no confirmation for several notes'
+    Start-Sleep -Milliseconds 300
+    $titles = Invoke-Nodi $nodi 'titles'
+    [NodiHook]::SendAsync($nodi.Hwnd, 'undo-tree') | Out-Null
+    Close-Dialog $nodi 6 | Out-Null
+    Start-Sleep -Milliseconds 300
+    $restored = Invoke-Nodi $nodi 'titles'
+    Stop-Nodi $nodi
+    Assert ($multi -eq 'Satu|Dua|Tiga') "multi-selection: $multi"
+    Assert ($titles -notmatch 'Satu|Dua|Tiga') "left after trashing: '$titles'"
+    Assert ($restored -match 'Satu\|Dua\|Tiga$') "after Ctrl+Z: '$restored'"
+    ''
+}
+
+Test-Case 'BF' 'lock: read-only, no rename / trash / move until unlocked' {
+    $data = New-DataDir 'BF'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 174' | Out-Null            # folder
+    Invoke-Nodi $nodi 'cancel-rename' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Arsip' | Out-Null
+    Invoke-Nodi $nodi 'cmd 172' | Out-Null            # note inside
+    Invoke-Nodi $nodi 'rename-selected Rahasia' | Out-Null
+    Invoke-Nodi $nodi 'type isi asli' | Out-Null
+    Invoke-Nodi $nodi 'context Arsip' | Out-Null
+    Invoke-Nodi $nodi 'cmd 260' | Out-Null            # Lock
+    $locked = Invoke-Nodi $nodi 'locked Rahasia'
+    $readonly = Invoke-Nodi $nodi 'readonly'
+    # Typing, list keys, Bold and pasting must not change the locked note.
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    Invoke-Nodi $nodi 'keys - ketik' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'select 0 3' | Out-Null
+    Invoke-Nodi $nodi 'cmd 120' | Out-Null            # Bold
+    Set-Clipboard -Value 'tempel'
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null            # Paste
+    $lockedText = Invoke-Nodi $nodi 'text'
+    $lockedBold = Invoke-Nodi $nodi 'fmt 0 3'
+    Invoke-Nodi $nodi 'select-title Rahasia' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Diganti' | Out-Null
+    Invoke-Nodi $nodi 'cmd 178' | Out-Null            # Move to Trash: refused, no dialog
+    $titles = Invoke-Nodi $nodi 'titles'
+    Invoke-Nodi $nodi 'context Arsip' | Out-Null
+    Invoke-Nodi $nodi 'cmd 261' | Out-Null            # Unlock
+    $unlocked = Invoke-Nodi $nodi 'readonly'
+    Stop-Nodi $nodi
+    $tree = Get-Content -Raw (Join-Path $data 'tree.json')
+    Assert ($locked -eq 'False True') "inherited lock: $locked"
+    Assert ($readonly -eq 'True') 'the locked note is editable'
+    Assert ($lockedText -eq 'isi asli') "the locked note changed: '$lockedText'"
+    Assert ($lockedBold -notmatch 'bold=1') "Bold changed the locked note: $lockedBold"
+    Assert ($titles -match 'Arsip\|Rahasia$') "locked note renamed or trashed: $titles"
+    Assert ($unlocked -eq 'False') 'still read-only after Unlock'
+    Assert ($tree -notmatch '"locked": true') 'the lock stayed in tree.json after Unlock'
+    ''
+}
+
+Test-Case 'BG' 'sort by name (numbers as numbers), Trash stays last' {
+    $data = New-DataDir 'BG'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'rename-selected 10-sepuluh' | Out-Null
+    foreach ($title in '2-dua', '01-satu', 'b-huruf') {
+        Invoke-Nodi $nodi 'cmd 170' | Out-Null
+        Invoke-Nodi $nodi "rename-selected $title" | Out-Null
+    }
+    $manual = Invoke-Nodi $nodi 'visible'
+    Invoke-Nodi $nodi 'cmd 271' | Out-Null            # Sort by name
+    $byName = Invoke-Nodi $nodi 'visible'
+    Invoke-Nodi $nodi 'cmd 271' | Out-Null            # again: descending
+    $descending = Invoke-Nodi $nodi 'visible'
+    Invoke-Nodi $nodi 'cmd 270' | Out-Null            # manual
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null            # a new top-level note
+    $trash = Invoke-Nodi $nodi 'trashitem'
+    $last = Invoke-Nodi $nodi 'visible'
+    Stop-Nodi $nodi
+    Assert ($byName -eq '01-satu|2-dua|10-sepuluh|b-huruf') "by name: $byName"
+    Assert ($descending -eq 'b-huruf|10-sepuluh|2-dua|01-satu') "descending: $descending"
+    Assert ($manual -eq '10-sepuluh|2-dua|01-satu|b-huruf') "manual: $manual"
+    Assert ($trash -match 'Trash') 'no Trash row'
+    Assert ($last -match 'New Note$' -or $last -match '\|[^|]+$') "new note: $last"
+    ''
+}
+
+Test-Case 'BH' 'page break: ---- + Enter, Ctrl+Enter, survives restart, Markdown' {
+    $data = New-DataDir 'BH'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys halaman satu' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys ----' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys halaman dua' | Out-Null
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Invoke-Nodi $nodi 'cmd 101' | Out-Null
+    Wait-State $nodi 'Saved' | Out-Null
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $pictures = Invoke-Nodi $nodi 'pictures'
+    $again = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($markdown -match 'page-break-after') "markdown: $markdown"
+    Assert ($markdown -notmatch '(?m)^---$') "the page break exported as a rule: $markdown"
+    Assert ($pictures -eq '1') "pictures after restart: $pictures"
+    Assert ($again -match 'page-break-after') "after restart: $again"
+    ''
+}
+
+Test-Case 'BI' 'paste: a terminal table (pm2 ls) becomes a table' {
+    $data = New-DataDir 'BI'
+    $nodi = Start-Nodi $data
+    $table = "user@host:~$ pm2 ls`r`n┌────┬─────────┬────────┐`r`n│ id │ name    │ status │`r`n├────┼─────────┼────────┤`r`n│ 14 │ event   │ online │`r`n│ 13 │ runner  │ online │`r`n└────┴─────────┴────────┘"
+    Set-Clipboard -Value $table
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null            # Paste
+    Start-Sleep -Milliseconds 200
+    $units = Invoke-Nodi $nodi 'units'
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    Assert ($units -match 'FFF9') 'no table was created'
+    Assert ($markdown -match '\| *14 *\| *event *\| *online *\|') "markdown: $markdown"
+    Assert ($markdown -match 'pm2 ls') "the command line was lost: $markdown"
+    ''
+}
+
+Test-Case 'BJ' 'export everything as md/rtf/txt, complete backup copy and restore from it' {
+    $data = New-DataDir 'BJ'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 174' | Out-Null
+    Invoke-Nodi $nodi 'cancel-rename' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Kuliah' | Out-Null
+    Invoke-Nodi $nodi 'cmd 172' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Catatan A' | Out-Null
+    Invoke-Nodi $nodi 'type isi penting' | Out-Null
+    $out = Join-Path $data 'export'
+    $count = Invoke-Nodi $nodi "export-all $out md,rtf,txt"
+    $backup = Invoke-Nodi $nodi "backup-copy $(Join-Path $data 'copies')"
+    Invoke-Nodi $nodi 'select-title Catatan A' | Out-Null
+    Invoke-Nodi $nodi 'select 0 100' | Out-Null
+    Invoke-Nodi $nodi 'type diganti' | Out-Null
+    Invoke-Nodi $nodi 'cmd 101' | Out-Null
+    Wait-State $nodi 'Saved' | Out-Null
+    Invoke-Nodi $nodi "restore-folder $backup" | Out-Null
+    Invoke-Nodi $nodi 'select-title Catatan A' | Out-Null
+    Invoke-Nodi $nodi 'cmd 171' | Out-Null
+    $text = Invoke-Nodi $nodi 'text'
+    Stop-Nodi $nodi
+    Assert ($count -eq '2') "exported: $count"
+    foreach ($ext in 'md', 'rtf', 'txt') {
+        Assert (Test-Path (Join-Path $out "Kuliah\Catatan A.$ext")) "missing Catatan A.$ext"
+    }
+    Assert ((Get-Content -Raw (Join-Path $out 'Kuliah\Catatan A.txt')) -match 'isi penting') 'txt content'
+    Assert (Test-Path (Join-Path $backup 'tree.json')) "backup copy: $backup"
+    Assert ($text -match 'isi penting') "restore from the copy: '$text'"
+    ''
+}
+
+Test-Case 'BK' 'import into a folder keeps the source; Save Back writes it after a backup' {
+    $data = New-DataDir 'BK'
+    $src = Join-Path $data 'src'
+    New-Item -ItemType Directory -Force $src | Out-Null
+    $file = Join-Path $src 'resep.md'
+    Set-Content -Path $file -Value "# Resep`n`nGula 2 sdm" -Encoding UTF8
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 174' | Out-Null
+    Invoke-Nodi $nodi 'cancel-rename' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Dapur' | Out-Null
+    Invoke-Nodi $nodi "import-into Dapur|$file" | Out-Null
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.ElapsedMilliseconds -lt 5000 -and (Invoke-Nodi $nodi 'parent resep') -ne 'Dapur') {
+        Start-Sleep -Milliseconds 50
+    }
+    $parent = Invoke-Nodi $nodi 'parent resep'
+    $source = Invoke-Nodi $nodi 'source resep'
+    $unchanged = Get-Content -Raw $file
+    Invoke-Nodi $nodi 'select-title resep' | Out-Null
+    Invoke-Nodi $nodi 'cmd 171' | Out-Null
+    Invoke-Nodi $nodi 'select 1000 1000' | Out-Null
+    Invoke-Nodi $nodi 'type \nGaram sedikit' | Out-Null
+    Invoke-Nodi $nodi 'cmd 101' | Out-Null
+    Wait-State $nodi 'Saved' | Out-Null
+    Invoke-Nodi $nodi 'context resep' | Out-Null
+    [NodiHook]::SendAsync($nodi.Hwnd, 'cmd 266') | Out-Null   # Save Back to Original
+    Assert (Close-Dialog $nodi 6) 'no confirmation before writing the original'
+    Start-Sleep -Milliseconds 400
+    Stop-Nodi $nodi
+    $written = Get-Content -Raw $file
+    $kept = Get-ChildItem -Recurse (Join-Path $data 'recovery\originals') -Filter 'resep.md'
+    Assert ($parent -eq 'Dapur') "parent: $parent"
+    Assert ($source -eq $file) "source: $source"
+    Assert ($unchanged -match 'Gula 2 sdm' -and $unchanged -notmatch 'Garam') 'import changed the original'
+    Assert ($written -match 'Garam sedikit') "save back: $written"
+    Assert ($kept.Count -ge 1) 'the old file was not kept in recovery\originals'
+    ''
+}
+
+Test-Case 'BL' 'themes: presets, copy a theme as text, paste it back as my theme' {
+    $data = New-DataDir 'BL'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 326' | Out-Null            # Monokai
+    $theme = Invoke-Nodi $nodi 'theme'
+    Invoke-Nodi $nodi 'cmd 304' | Out-Null            # Copy Theme as Text
+    $json = Get-Clipboard -Raw
+    Set-Clipboard -Value ($json -replace '"name": "Monokai"', '"name": "Punyaku"' -replace '#272822', '#101010')
+    Invoke-Nodi $nodi 'cmd 305' | Out-Null            # Paste Theme from Text
+    $settings = Invoke-Nodi $nodi 'settings'
+    Stop-Nodi $nodi
+    $saved = Get-Content -Raw (Join-Path $data 'settings.json') | ConvertFrom-Json
+    Assert ($json -match '"editor_bg": "#272822"') "copied theme: $json"
+    Assert ($saved.theme_name -eq 'Punyaku') "active theme: $($saved.theme_name)"
+    Assert (@($saved.my_themes | Where-Object name -eq 'Punyaku').Count -eq 1) 'my theme not saved'
+    Assert ((@($saved.my_themes | Where-Object name -eq 'Punyaku')[0]).editor_bg -eq '#101010') 'pasted colour lost'
+    "($theme)"
+}
+
+Test-Case 'BM' 'sounds off: questions use the silent Nodi dialog' {
+    $data = New-DataDir 'BM'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    Invoke-Nodi $nodi 'rename-selected Hapus' | Out-Null
+    [NodiHook]::SendAsync($nodi.Hwnd, 'cmd 178') | Out-Null
+    $dialog = Wait-Dialog $nodi
+    $class = if ($dialog -ne 0) { [NodiDialog]::ClassOf($dialog) } else { '' }
+    Close-Dialog $nodi 7 | Out-Null                   # No
+    Start-Sleep -Milliseconds 200
+    $titles = Invoke-Nodi $nodi 'titles'
+    Stop-Nodi $nodi
+    Assert ($class -eq 'NodiForm') "dialog class: '$class'"
+    Assert ($titles -match 'Hapus') "No still trashed the note: $titles"
+    ''
+}
+
+Test-Case 'BN' 'line numbers: one number per paragraph, Ln counts paragraphs' {
+    $data = New-DataDir 'BN'
+    $nodi = Start-Nodi $data
+    $long = ('kata ' * 120).Trim()
+    Invoke-Nodi $nodi "type satu\n$long\ntiga" | Out-Null
+    $gutter = [int](Invoke-Nodi $nodi 'gutter')
+    $caret = Invoke-Nodi $nodi 'caretpart'
+    Invoke-Nodi $nodi 'cmd 146' | Out-Null            # View > Line Numbers off
+    $off = [int](Invoke-Nodi $nodi 'gutter')
+    Stop-Nodi $nodi
+    Assert ($gutter -gt 0) 'no line-number strip'
+    Assert ($caret -match '^Ln 3,') "caret line (wrapped paragraph counts once): $caret"
+    Assert ($off -eq 0) 'the strip stays after switching it off'
+    "($caret)"
+}
+
+Test-Case 'BO' 'default font from Preferences, font combo applies on Enter only' {
+    $data = New-DataDir 'BO'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'prefs-font Consolas 12' | Out-Null
+    Invoke-Nodi $nodi 'cmd 170' | Out-Null
+    Invoke-Nodi $nodi 'type baru' | Out-Null
+    Invoke-Nodi $nodi 'select 0 4' | Out-Null
+    $font = Invoke-Nodi $nodi 'fontname'
+    $size = Invoke-Nodi $nodi 'fontsize'
+    $typed = Invoke-Nodi $nodi 'fontcombo-type Cour'
+    Invoke-Nodi $nodi 'select 0 4' | Out-Null
+    $before = Invoke-Nodi $nodi 'fontname'
+    Invoke-Nodi $nodi 'fontcombo-type Courier New'
+    Invoke-Nodi $nodi 'fontcombo-enter' | Out-Null
+    Start-Sleep -Milliseconds 200
+    Invoke-Nodi $nodi 'select 0 4' | Out-Null
+    $after = Invoke-Nodi $nodi 'fontname'
+    Stop-Nodi $nodi
+    Assert ($font -eq 'Consolas') "default font: $font"
+    Assert ($size -match '12') "default size: $size"
+    Assert ($typed -like 'Cour*' -and $typed.Length -gt 4) "autocomplete: '$typed'"
+    Assert ($before -eq 'Consolas') "typing applied the font already: $before"
+    Assert ($after -eq 'Courier New') "Enter did not apply: $after"
+    ''
+}
+
+Test-Case 'BP' 'Shift+click extends the selection (real mouse)' {
+    $data = New-DataDir 'BP'
+    $nodi = Start-Nodi $data
+    $lines = (1..20 | ForEach-Object { "baris nomor $_ dengan isi" }) -join '\n'
+    Invoke-Nodi $nodi "type $lines" | Out-Null
+    Invoke-Nodi $nodi 'select 0 0' | Out-Null
+    if (-not (Real-Keys $nodi)) { throw 'no foreground' }
+    $a = Point-Of (Invoke-Nodi $nodi 'charscreen 2')
+    $b = Point-Of (Invoke-Nodi $nodi 'charscreen 200')
+    [NodiMouse]::Click($a[0], $a[1]); Start-Sleep -Milliseconds 250
+    [NodiMouse]::ShiftClick($b[0], $b[1]); Start-Sleep -Milliseconds 250
+    $sel = Invoke-Nodi $nodi 'sel'
+    Stop-Nodi $nodi
+    Assert ($sel -match '^2 200 ') "selection: $sel"
+    ''
+}
+
+Test-Case 'BQ' 'background pattern and dark title/menu: settings persist' {
+    $data = New-DataDir 'BQ'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 324' | Out-Null            # Dark
+    Invoke-Nodi $nodi 'cmd 312' | Out-Null            # Grid
+    Stop-Nodi $nodi
+    $nodi = Start-Nodi $data
+    $settings = Invoke-Nodi $nodi 'settings' | ConvertFrom-Json
+    $theme = Invoke-Nodi $nodi 'theme'
+    Stop-Nodi $nodi
+    Assert ($settings.background -eq 'grid') "background: $($settings.background)"
+    Assert ($settings.theme_name -eq 'Dark') "theme: $($settings.theme_name)"
+    "($theme)"
+}
+
+Test-Case 'BR' 'pasted HTML: task list, picture embedded from a data URI' {
+    $data = New-DataDir 'BR'
+    $nodi = Start-Nodi $data
+    . "$PSScriptRoot\probe-lib.ps1"
+    $file = New-TestPng (Join-Path $Root 'e2e-br.png') 60 40
+    $png = [Convert]::ToBase64String([IO.File]::ReadAllBytes($file))
+    Set-ClipboardHtml "<ul><li><input type=""checkbox"" checked> selesai</li><li><input type=""checkbox""> belum</li></ul><p>Gambar:</p><p><img src=""data:image/png;base64,$png"" alt=""logo""></p>"
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null
+    Start-Sleep -Milliseconds 300
+    $text = Invoke-Nodi $nodi 'text'
+    $pictures = Invoke-Nodi $nodi 'pictures'
+    Stop-Nodi $nodi
+    Assert ($text -match '☑\tselesai') "ticked task: $text"
+    Assert ($text -match '☐\tbelum') "open task: $text"
+    Assert ($pictures -eq '1') "embedded picture: $pictures"
+    ''
+}
+
+Test-Case 'BS' 'mass content survives close / reopen: text, list, checklist, table, picture, page break' {
+    $data = New-DataDir 'BS'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys ## Laporan' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys 1. pertama' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'tab' | Out-Null
+    Invoke-Nodi $nodi 'keys anak' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys [ ] tugas' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys ----' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    . "$PSScriptRoot\probe-lib.ps1"
+    $png = New-TestPng (Join-Path $Root 'e2e-bs.png') 120 60
+    Invoke-Nodi $nodi "insert-image $png" | Out-Null
+    Invoke-Nodi $nodi 'type \n' | Out-Null
+    Invoke-Nodi $nodi 'table 2 2' | Out-Null
+    $before = Invoke-Nodi $nodi 'markdown'
+    $units = Invoke-Nodi $nodi 'units'
+    Stop-Nodi $nodi                                   # close without Ctrl+S
+    $nodi = Start-Nodi $data
+    $after = Invoke-Nodi $nodi 'markdown'
+    $unitsAfter = Invoke-Nodi $nodi 'units'
+    Stop-Nodi $nodi
+    Assert ($before -eq $after) "Markdown changed across restart:`n$before`n---`n$after"
+    Assert ($units -eq $unitsAfter) 'the note text changed across restart'
+    Assert ($after -match '1\. pertama' -and $after -match '- \[ \] tugas' -and $after -match 'page-break-after') "content: $after"
     ''
 }
 

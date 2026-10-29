@@ -25,10 +25,15 @@ use crate::wnd::editor::{
 };
 use crate::wnd::image;
 
-pub const BODY_FONT: &str = "Segoe UI";
+/// Default body font (Preferences); see `nodi_core::markdown_in::body_font`.
+pub fn body_font() -> String {
+    nodi_core::markdown_in::body_font()
+}
 pub const CODE_FONT: &str = "Consolas";
 /// Twips (1/20 pt).
-pub const BODY_SIZE: i32 = 220;
+pub fn body_size() -> i32 {
+    nodi_core::markdown_in::body_size() * 10
+}
 const CODE_SIZE: i32 = 200;
 /// Heading sizes in twips for levels 1..=4.
 pub const HEADING_SIZES: [i32; 4] = [400, 320, 280, 250];
@@ -197,20 +202,6 @@ fn heading_marker_len(text: &str) -> usize {
     heading_prefix(text).map_or(0, |(_, len)| len)
 }
 
-/// `(level, marker)` of a literal deeper bullet (`◦` + tab). The marker slice
-/// is what is stored in the text, so callers can measure it in bytes or UTF-16
-/// units as needed.
-fn literal_bullet(text: &str) -> Option<(usize, &str)> {
-    for (index, glyph) in BULLET_GLYPHS.iter().enumerate() {
-        if let Some(rest) = text.strip_prefix(glyph) {
-            if rest.starts_with('\t') {
-                return Some((index + 1, &text[..glyph.len() + 1]));
-            }
-        }
-    }
-    None
-}
-
 /// Heading level (1..=4) of the text at the caret, 0 for body text.
 pub fn heading_level_at(editor: HWND) -> usize {
     let format = editor::selection_format(editor);
@@ -227,7 +218,7 @@ pub fn heading_level_at(editor: HWND) -> usize {
 fn format_heading_body(editor: HWND, start: i32, end: i32, level: usize) {
     let (size, bold) = match level {
         1..=4 => (HEADING_SIZES[level - 1], CFE_BOLD),
-        _ => (BODY_SIZE, 0),
+        _ => (body_size(), 0),
     };
     let mut format = CharFormat2W {
         dw_mask: CFM_SIZE | CFM_BOLD | CFM_FACE | CFM_COLOR,
@@ -235,7 +226,7 @@ fn format_heading_body(editor: HWND, start: i32, end: i32, level: usize) {
         y_height: size,
         ..CharFormat2W::default()
     };
-    face(&mut format, BODY_FONT);
+    face(&mut format, &body_font());
     editor::set_selection(editor, start, end.max(start));
     editor::set_selection_format(editor, &format);
     let spacing = ParaFormat2 {
@@ -260,13 +251,13 @@ fn set_marker_format(editor: HWND, start: i32, len: i32, level: usize, visible: 
         y_height: HEADING_SIZES
             .get(level.saturating_sub(1))
             .copied()
-            .unwrap_or(BODY_SIZE),
+            .unwrap_or(body_size()),
         ..CharFormat2W::default()
     };
     if level > 0 {
         format.dw_effects |= CFE_BOLD;
     }
-    face(&mut format, BODY_FONT);
+    face(&mut format, &body_font());
     editor::set_selection(editor, start, start + len);
     // Called on every keystroke in a heading: only format when something
     // differs, so the undo stack does not fill up with formatting steps.
@@ -276,7 +267,7 @@ fn set_marker_format(editor: HWND, start: i32, len: i32, level: usize, visible: 
             == format.dw_effects & (CFE_HIDDEN | CFE_BOLD)
         && current.cr_text_color == format.cr_text_color
         && current.y_height == format.y_height
-        && face_name(&current) == BODY_FONT;
+        && face_name(&current) == body_font();
     if !same {
         editor::set_selection_format(editor, &format);
     }
@@ -556,14 +547,69 @@ pub fn hidden_at(editor: HWND, from: i32, to: i32) -> bool {
 
 // ------------------------------------------------------------------- lists
 
-/// Geometry shared by the three bullet levels.
-const LIST_MAX_LEVEL: usize = 3;
+/// Deepest list level Tab can reach: 30 steps of a quarter inch, more than a
+/// page is wide, so in practice there is no limit.
+const LIST_MAX_LEVEL: usize = 30;
+/// `PARAFORMAT2::wNumberingStyle` flag: start a new run at `wNumberingStart`.
+const PFNS_NEWNUMBER: u16 = 0x8000;
+/// Number-to-text distance of an item the user restarted at 1. Rich Edit
+/// does not keep `PFNS_NEWNUMBER` for a start of 1 in RTF (it writes the same
+/// `\pnstart1` as for a continuing item), but it keeps this distance
+/// (`\pnindent`), one twip more than usual and invisible.
+const RESTART_TAB: u16 = INDENT_STEP_TWIPS as u16 + 1;
+/// Checklist markers: an open and a ticked box, each followed by a tab.
+pub const CHECK_OPEN: &str = "☐";
+pub const CHECK_DONE: &str = "☑";
+
+/// What kind of list a paragraph belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListKind {
+    Bullet,
+    Numbered,
+    Check,
+}
+
+/// `(kind, marker)` of a literal list marker at the start of `text`: a deeper
+/// bullet glyph or a checkbox, followed by a tab. The marker slice is what is
+/// stored in the text, so callers can measure it in bytes or UTF-16 units.
+fn literal_marker(text: &str) -> Option<(ListKind, &str)> {
+    let glyphs = BULLET_GLYPHS.iter().map(|glyph| (ListKind::Bullet, *glyph));
+    let checks = [CHECK_OPEN, CHECK_DONE].map(|glyph| (ListKind::Check, glyph));
+    for (kind, glyph) in glyphs.chain(checks) {
+        if text
+            .strip_prefix(glyph)
+            .is_some_and(|rest| rest.starts_with('\t'))
+        {
+            return Some((kind, &text[..glyph.len() + 1]));
+        }
+    }
+    None
+}
+
+fn units(text: &str) -> i32 {
+    text.encode_utf16().count() as i32
+}
+
+/// The literal marker a new item of `kind` at `level` starts with (none for
+/// native items: numbers and the first bullet level).
+fn marker_for(kind: ListKind, level: usize) -> Option<String> {
+    match kind {
+        ListKind::Numbered => None,
+        ListKind::Bullet if level <= 1 => None,
+        ListKind::Bullet => Some(format!(
+            "{}\t",
+            BULLET_GLYPHS[(level - 1) % BULLET_GLYPHS.len()]
+        )),
+        ListKind::Check => Some(format!("{CHECK_OPEN}\t")),
+    }
+}
 
 /// Increase the start indent of every selected paragraph by `delta` twips.
 pub fn change_indent(editor: HWND, delta: i32) {
     let Some(_busy) = Busy::enter() else {
         return;
     };
+    let _quiet = editor::QuietSelection::new(editor);
     if delta == 0 {
         return;
     }
@@ -593,38 +639,42 @@ pub fn paragraph_indent(editor: HWND) -> i32 {
     editor::para_format(editor).dx_start_indent.max(0)
 }
 
-/// True when the caret paragraph is a list item, and whether it is numbered.
-pub fn list_kind(editor: HWND) -> Option<bool> {
+/// The list the caret paragraph belongs to, if any.
+pub fn list_kind(editor: HWND) -> Option<ListKind> {
     let format = editor::para_format(editor);
     if format.w_numbering != 0 {
-        return Some(format.w_numbering == PFN_ARABIC);
+        return Some(if format.w_numbering == PFN_ARABIC {
+            ListKind::Numbered
+        } else {
+            ListKind::Bullet
+        });
     }
     let (from, _) = editor::selection(editor);
     let start = editor::paragraph_start(editor, from);
     let end = editor::paragraph_end(editor, from);
     let text = editor::text_range(editor, start, end);
-    literal_bullet(&text).map(|_| false)
+    literal_marker(&text).map(|(kind, _)| kind)
 }
 
-/// Level (1..=3) of the caret's list item; 0 for ordinary text.
+/// Level (1, 2, ...) of the caret's list item, from its indent; 0 for
+/// ordinary text.
 pub fn list_level(editor: HWND) -> usize {
-    let format = editor::para_format(editor);
-    if format.w_numbering != 0 {
-        return ((format.dx_start_indent.max(0) / INDENT_STEP_TWIPS) as usize + 1)
-            .min(LIST_MAX_LEVEL);
+    if list_kind(editor).is_none() {
+        return 0;
     }
-    let (from, _) = editor::selection(editor);
-    let start = editor::paragraph_start(editor, from);
-    let end = editor::paragraph_end(editor, from);
-    let text = editor::text_range(editor, start, end);
-    literal_bullet(&text).map_or(0, |(level, _)| level)
+    level_for_indent(paragraph_indent(editor))
 }
 
-fn list_para_format(numbered: bool, level: usize) -> ParaFormat2 {
+/// The list level whose marker sits at `indent` twips.
+fn level_for_indent(indent: i32) -> usize {
+    ((indent.max(0) / INDENT_STEP_TWIPS) as usize + 1).min(LIST_MAX_LEVEL)
+}
+
+fn list_para_format(kind: ListKind, level: usize) -> ParaFormat2 {
     let indent = (level.saturating_sub(1) as i32) * INDENT_STEP_TWIPS;
-    // Rich Edit has one native bullet glyph, so deeper bullet levels are a
-    // literal glyph + tab with a hanging indent instead.
-    let native = numbered || level == 1;
+    // Rich Edit has one native bullet glyph, so deeper bullet levels and
+    // checkboxes are a literal glyph + tab with a hanging indent instead.
+    let native = marker_for(kind, level).is_none();
     ParaFormat2 {
         dw_mask: PFM_NUMBERING
             | PFM_NUMBERINGSTYLE
@@ -632,14 +682,16 @@ fn list_para_format(numbered: bool, level: usize) -> ParaFormat2 {
             | PFM_NUMBERINGTAB
             | PFM_STARTINDENT
             | PFM_OFFSET,
-        w_numbering: if !native {
-            0
-        } else if numbered {
-            PFN_ARABIC
-        } else {
-            PFN_BULLET
+        w_numbering: match (native, kind) {
+            (false, _) => 0,
+            (true, ListKind::Numbered) => PFN_ARABIC,
+            (true, _) => PFN_BULLET,
         },
-        w_numbering_style: if native && numbered { PFNS_PERIOD } else { 0 },
+        w_numbering_style: if native && kind == ListKind::Numbered {
+            PFNS_PERIOD
+        } else {
+            0
+        },
         w_numbering_start: if native { 1 } else { 0 },
         w_numbering_tab: if native { INDENT_STEP_TWIPS as u16 } else { 0 },
         dx_start_indent: indent,
@@ -648,11 +700,19 @@ fn list_para_format(numbered: bool, level: usize) -> ParaFormat2 {
     }
 }
 
-/// Applies a bulleted/numbered list at `level` to every selected paragraph.
-pub fn apply_list_level(editor: HWND, numbered: bool, level: usize) {
-    let Some(_busy) = Busy::enter() else {
-        return;
-    };
+/// Applies a list of `kind` at `level` to every selected paragraph.
+pub fn apply_list_level(editor: HWND, kind: ListKind, level: usize) {
+    {
+        let Some(_busy) = Busy::enter() else {
+            return;
+        };
+        apply_list_level_impl(editor, kind, level);
+    }
+    renumber_near(editor);
+}
+
+fn apply_list_level_impl(editor: HWND, kind: ListKind, level: usize) {
+    let _quiet = editor::QuietSelection::new(editor);
     let level = level.clamp(1, LIST_MAX_LEVEL);
     let (from, to) = editor::selection(editor);
     let raw = editor::raw_text(editor);
@@ -662,8 +722,8 @@ pub fn apply_list_level(editor: HWND, numbered: bool, level: usize) {
     for &start in starts.iter().rev() {
         let end = paragraph_end_in(&raw, start);
         let text = text_in(&raw, start, end);
-        let old_len =
-            literal_bullet(&text).map_or(0, |(_, marker)| marker.encode_utf16().count() as i32);
+        let old = literal_marker(&text);
+        let old_len = old.map_or(0, |(_, marker)| units(marker));
         if old_len > 0 {
             editor::set_selection(editor, start, start + old_len);
             editor::replace_selection(editor, "", true);
@@ -672,11 +732,15 @@ pub fn apply_list_level(editor: HWND, numbered: bool, level: usize) {
         // native list item, a typed/inserted tab changes the level instead of
         // inserting a character.
         editor::set_selection(editor, start, end - old_len);
-        editor::set_para_format(editor, &list_para_format(numbered, level));
+        editor::set_para_format(editor, &list_para_format(kind, level));
         let mut new_len = 0;
-        if !numbered && level > 1 {
-            let marker = format!("{}\t", BULLET_GLYPHS[level - 1]);
-            new_len = marker.encode_utf16().count() as i32;
+        // A ticked box stays ticked when it moves to another level.
+        let marker = match old {
+            Some((ListKind::Check, marker)) if kind == ListKind::Check => Some(marker.to_owned()),
+            _ => marker_for(kind, level),
+        };
+        if let Some(marker) = marker {
+            new_len = units(&marker);
             editor::set_selection(editor, start, start);
             editor::replace_selection(editor, &marker, true);
         }
@@ -686,58 +750,35 @@ pub fn apply_list_level(editor: HWND, numbered: bool, level: usize) {
     editor::set_selection(editor, new_from, new_to);
 }
 
-/// Turns the typed `- ` (already removed) into a level-1 list item.
-pub fn start_list(editor: HWND, numbered: bool) {
-    apply_list_level(editor, numbered, 1);
+/// Turns the typed `- ` / `1. ` / `[ ] ` (already removed) into a list item
+/// whose marker sits where the text was: an indented paragraph becomes a
+/// deeper item instead of jumping back to the left margin.
+pub fn start_list(editor: HWND, kind: ListKind) {
+    let level = level_for_indent(paragraph_indent(editor));
+    apply_list_level(editor, kind, level);
 }
 
 /// Enter on an empty item: removes the bullet/number and keeps the text at the
 /// column where it was, as a plain indented paragraph. Returns false when the
 /// paragraph is not an empty list item.
 pub fn end_list(editor: HWND) -> bool {
-    let Some(_busy) = Busy::enter() else {
-        return false;
-    };
-    let format = editor::para_format(editor);
     let (from, _) = editor::selection(editor);
     let start = editor::paragraph_start(editor, from);
     let end = editor::paragraph_end(editor, from);
     let text = editor::text_range(editor, start, end);
-    let literal = literal_bullet(&text);
-    if format.w_numbering == 0 && literal.is_none() {
-        return false;
-    }
-    let content = match literal {
+    let content = match literal_marker(&text) {
         Some((_, marker)) => &text[marker.len()..],
         None => &text[..],
     };
     if !content.trim().is_empty() {
         return false;
     }
-    let mut indent = format.dx_start_indent.max(0) + INDENT_STEP_TWIPS;
-    if let Some((_, marker)) = literal {
-        editor::set_selection(editor, start, start + marker.encode_utf16().count() as i32);
-        editor::replace_selection(editor, "", true);
-        indent = format.dx_start_indent.max(0) + INDENT_STEP_TWIPS;
-    }
-    let para = ParaFormat2 {
-        dw_mask: PFM_NUMBERING
-            | PFM_NUMBERINGSTYLE
-            | PFM_NUMBERINGSTART
-            | PFM_NUMBERINGTAB
-            | PFM_STARTINDENT
-            | PFM_OFFSET,
-        dx_start_indent: indent,
-        ..ParaFormat2::default()
-    };
-    editor::set_selection(editor, start, editor::paragraph_end(editor, start));
-    editor::set_para_format(editor, &para);
-    editor::set_selection(editor, start, start);
-    true
+    remove_list_marker(editor)
 }
 
-/// Enter inside a deeper (literal) bullet item: starts the next item with the
-/// same glyph and indent. Returns false for native lists (Rich Edit does it).
+/// Enter inside a literal item (deeper bullet, checkbox): starts the next item
+/// with the same kind of marker and indent. Returns false for native lists
+/// (Rich Edit does it).
 pub fn new_literal_item(editor: HWND) -> bool {
     let Some(_busy) = Busy::enter() else {
         return false;
@@ -746,54 +787,289 @@ pub fn new_literal_item(editor: HWND) -> bool {
     let start = editor::paragraph_start(editor, from);
     let end = editor::paragraph_end(editor, from);
     let text = editor::text_range(editor, start, end);
-    let Some((level, _)) = literal_bullet(&text) else {
+    let Some((kind, _)) = literal_marker(&text) else {
+        return false;
+    };
+    let level = level_for_indent(paragraph_indent(editor));
+    let Some(marker) = marker_for(kind, level) else {
         return false;
     };
     editor::replace_selection(editor, "\r", true);
     let new_start = editor::paragraph_start(editor, from + 1);
-    let marker = format!("{}\t", BULLET_GLYPHS[level - 1]);
     editor::set_selection(editor, new_start, new_start);
     editor::replace_selection(editor, &marker, true);
-    let caret = new_start + marker.encode_utf16().count() as i32;
+    let caret = new_start + units(&marker);
     editor::set_selection(editor, caret, caret);
     true
 }
 
-/// Backspace at the start of a list item: removes the bullet/number but keeps
-/// the indentation, so the text stays where it was.
-pub fn remove_list_marker(editor: HWND) -> bool {
-    let Some(_busy) = Busy::enter() else {
-        return false;
-    };
-    let format = editor::para_format(editor);
+/// End of the caret paragraph's literal marker (where its text starts), when
+/// it has one.
+pub fn literal_marker_end(editor: HWND) -> Option<i32> {
     let (from, _) = editor::selection(editor);
     let start = editor::paragraph_start(editor, from);
     let end = editor::paragraph_end(editor, from);
     let text = editor::text_range(editor, start, end);
-    let literal = literal_bullet(&text);
-    if format.w_numbering == 0 && literal.is_none() {
-        return false;
+    literal_marker(&text).map(|(_, marker)| start + units(marker))
+}
+
+/// Backspace at the start of a list item's text: removes the bullet, number or
+/// checkbox but keeps the indentation, so the text stays where it was.
+pub fn remove_list_marker(editor: HWND) -> bool {
+    {
+        let Some(_busy) = Busy::enter() else {
+            return false;
+        };
+        let format = editor::para_format(editor);
+        let (from, _) = editor::selection(editor);
+        let start = editor::paragraph_start(editor, from);
+        let end = editor::paragraph_end(editor, from);
+        let text = editor::text_range(editor, start, end);
+        let literal = literal_marker(&text);
+        if format.w_numbering == 0 && literal.is_none() {
+            return false;
+        }
+        if let Some((_, marker)) = literal {
+            editor::set_selection(editor, start, start + units(marker));
+            editor::replace_selection(editor, "", true);
+        }
+        let para = ParaFormat2 {
+            dw_mask: PFM_NUMBERING
+                | PFM_NUMBERINGSTYLE
+                | PFM_NUMBERINGSTART
+                | PFM_NUMBERINGTAB
+                | PFM_STARTINDENT
+                | PFM_OFFSET,
+            dx_start_indent: format.dx_start_indent.max(0) + INDENT_STEP_TWIPS,
+            ..ParaFormat2::default()
+        };
+        editor::set_selection(editor, start, editor::paragraph_end(editor, start));
+        editor::set_para_format(editor, &para);
+        editor::set_selection(editor, start, start);
     }
-    let mut indent = format.dx_start_indent.max(0) + INDENT_STEP_TWIPS;
-    if let Some((_, marker)) = literal {
-        editor::set_selection(editor, start, start + marker.encode_utf16().count() as i32);
-        editor::replace_selection(editor, "", true);
-        indent = format.dx_start_indent.max(0) + INDENT_STEP_TWIPS;
-    }
-    let para = ParaFormat2 {
-        dw_mask: PFM_NUMBERING
-            | PFM_NUMBERINGSTYLE
-            | PFM_NUMBERINGSTART
-            | PFM_NUMBERINGTAB
-            | PFM_STARTINDENT
-            | PFM_OFFSET,
-        dx_start_indent: indent,
-        ..ParaFormat2::default()
-    };
-    editor::set_selection(editor, start, editor::paragraph_end(editor, start));
-    editor::set_para_format(editor, &para);
-    editor::set_selection(editor, start, start);
+    renumber_near(editor);
     true
+}
+
+/// Ticks or clears the checkbox of the paragraph containing `pos`. Returns
+/// false when that paragraph is not a checklist item.
+pub fn toggle_check_at(editor: HWND, pos: i32) -> bool {
+    let Some(_busy) = Busy::enter() else {
+        return false;
+    };
+    let start = editor::paragraph_start(editor, pos);
+    let end = editor::paragraph_end(editor, pos);
+    let text = editor::text_range(editor, start, end);
+    let Some((ListKind::Check, marker)) = literal_marker(&text) else {
+        return false;
+    };
+    let next = if marker.starts_with(CHECK_OPEN) {
+        CHECK_DONE
+    } else {
+        CHECK_OPEN
+    };
+    let (from, to) = editor::selection(editor);
+    let glyph = units(&marker[..marker.len() - 1]);
+    editor::set_selection(editor, start, start + glyph);
+    editor::replace_selection(editor, next, true);
+    editor::set_selection(editor, from, to);
+    true
+}
+
+/// The checkbox under a click at `pos` (a character position): the paragraph
+/// start when that character is a checklist box.
+pub fn checkbox_at(editor: HWND, pos: i32) -> Option<i32> {
+    let start = editor::paragraph_start(editor, pos);
+    if pos != start {
+        return None;
+    }
+    let end = editor::paragraph_end(editor, pos);
+    let text = editor::text_range(editor, start, end);
+    match literal_marker(&text) {
+        Some((ListKind::Check, _)) => Some(start),
+        _ => None,
+    }
+}
+
+/// Recomputes the numbers of numbered items, the way an outline reads: a
+/// list continues at its own indent across deeper items and indented
+/// continuation paragraphs, a deeper list starts at 1, and plain text, a
+/// bullet or a table at the same indent ends it. An item the user restarted
+/// (Restart Numbering) keeps 1.
+///
+/// Rich Edit itself numbers every run of consecutive numbered paragraphs
+/// 1, 2, 3... whatever their indent, so items that do not simply follow the
+/// paragraph before them get an explicit start.
+pub fn renumber(editor: HWND) {
+    renumber_impl(editor, true);
+}
+
+/// [`renumber`] after an edit: only the stretch of the note around the
+/// selection that a list can reach — from the last paragraph before it that
+/// ends every list (plain text or a bullet at the left margin, a table) to
+/// the first such paragraph after it. A big note with a short list then
+/// stays fast while typing.
+pub fn renumber_near(editor: HWND) {
+    renumber_impl(editor, false);
+}
+
+/// True when this paragraph ends every open list (and the numbering state is
+/// empty after it).
+fn ends_all_lists(format: &ParaFormat2) -> bool {
+    format.w_effects & editor::PFE_TABLE != 0
+        || (format.w_numbering != PFN_ARABIC && format.dx_start_indent <= 0)
+}
+
+fn renumber_impl(editor: HWND, whole: bool) {
+    let Some(_busy) = Busy::enter() else {
+        return;
+    };
+    let raw = editor::raw_text(editor);
+    let (from, to) = editor::selection(editor);
+    let _frozen = editor::Frozen::new(editor);
+    // Every selection move below would reach the frame as EN_SELCHANGE
+    // (status bar, toolbar, heading upkeep): switch that off meanwhile.
+    let _quiet = editor::QuietSelection::new(editor);
+    let mut starts = vec![0usize];
+    for (index, unit) in raw.iter().enumerate() {
+        if is_paragraph_break(*unit) {
+            starts.push(index + 1);
+        }
+    }
+    let paragraph_of = |pos: i32| {
+        let pos = pos.max(0) as usize;
+        match starts.binary_search(&pos) {
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        }
+    };
+    let first_edit = paragraph_of(from);
+    let last_edit = paragraph_of(to);
+    let format_at = |index: usize| {
+        editor::set_selection(editor, starts[index] as i32, starts[index] as i32);
+        editor::para_format(editor)
+    };
+    let mut first = 0;
+    if !whole {
+        let mut index = first_edit;
+        while index > 0 {
+            index -= 1;
+            if ends_all_lists(&format_at(index)) {
+                first = index + 1;
+                break;
+            }
+        }
+    }
+
+    let mut open: Vec<(i32, u16)> = Vec::new();
+    let mut previous: Option<u16> = None;
+    for index in first..starts.len() {
+        let start = starts[index];
+        if start > raw.len() {
+            break;
+        }
+        let end = starts.get(index + 1).map_or(raw.len(), |next| next - 1);
+        let format = format_at(index);
+        let indent = format.dx_start_indent.max(0);
+        if format.w_effects & editor::PFE_TABLE != 0 {
+            open.clear();
+            previous = None;
+        } else if format.w_numbering == PFN_ARABIC {
+            open.retain(|(level, _)| *level <= indent);
+            let restarted = format.w_numbering_tab == RESTART_TAB;
+            let number = match open.last_mut() {
+                Some((level, count)) if *level == indent => {
+                    *count = if restarted { 1 } else { *count + 1 };
+                    *count
+                }
+                _ => {
+                    open.push((indent, 1));
+                    1
+                }
+            };
+            let follows = previous == Some(number.wrapping_sub(1));
+            let want_new = !follows && (previous.is_some() || number > 1);
+            let has_new = format.w_numbering_style & PFNS_NEWNUMBER != 0;
+            let start_wrong = !follows && format.w_numbering_start != number;
+            if has_new != want_new || start_wrong {
+                let style = (format.w_numbering_style & !PFNS_NEWNUMBER)
+                    | if want_new { PFNS_NEWNUMBER } else { 0 };
+                editor::set_selection(editor, start as i32, end as i32);
+                editor::set_para_format(
+                    editor,
+                    &ParaFormat2 {
+                        dw_mask: PFM_NUMBERINGSTYLE | PFM_NUMBERINGSTART,
+                        w_numbering_style: style,
+                        w_numbering_start: if follows {
+                            format.w_numbering_start
+                        } else {
+                            number
+                        },
+                        ..ParaFormat2::default()
+                    },
+                );
+            }
+            previous = Some(number);
+        } else {
+            open.retain(|(level, _)| *level < indent);
+            previous = None;
+        }
+        if !whole && index > last_edit && ends_all_lists(&format) {
+            break;
+        }
+    }
+    editor::set_selection(editor, from, to);
+}
+
+/// Format > Restart Numbering (`restart`) / Continue Numbering for the caret
+/// item of a numbered list.
+pub fn set_numbering_restart(editor: HWND, restart: bool) {
+    if list_kind(editor) != Some(ListKind::Numbered) {
+        return;
+    }
+    let (from, to) = editor::selection(editor);
+    let start = editor::paragraph_start(editor, from);
+    editor::set_selection(editor, start, editor::paragraph_end(editor, start));
+    editor::set_para_format(
+        editor,
+        &ParaFormat2 {
+            dw_mask: PFM_NUMBERINGTAB,
+            w_numbering_tab: if restart {
+                RESTART_TAB
+            } else {
+                INDENT_STEP_TWIPS as u16
+            },
+            ..ParaFormat2::default()
+        },
+    );
+    editor::set_selection(editor, from, to);
+    renumber_near(editor);
+}
+
+/// True when the caret item was restarted at 1 by the user.
+pub fn numbering_restarted(editor: HWND) -> bool {
+    let format = editor::para_format(editor);
+    format.w_numbering == PFN_ARABIC && format.w_numbering_tab == RESTART_TAB
+}
+
+/// Enter in a numbered list: the new item copied the old one's paragraph
+/// format, including a user restart; only the first item keeps that.
+pub fn after_new_numbered_item(editor: HWND) {
+    if numbering_restarted(editor) {
+        let (from, to) = editor::selection(editor);
+        let start = editor::paragraph_start(editor, from);
+        editor::set_selection(editor, start, editor::paragraph_end(editor, start));
+        editor::set_para_format(
+            editor,
+            &ParaFormat2 {
+                dw_mask: PFM_NUMBERINGTAB,
+                w_numbering_tab: INDENT_STEP_TWIPS as u16,
+                ..ParaFormat2::default()
+            },
+        );
+        editor::set_selection(editor, from, to);
+    }
+    renumber_near(editor);
 }
 
 // --------------------------------------------------------------- separators
@@ -838,6 +1114,27 @@ fn plain_paragraph(editor: HWND) {
 /// picture, recognised by its shape (`nodi_core::image::is_rule_picture`): a
 /// `nodi-hr:` link around it would be underlined by Rich Edit.
 fn insert_separator_impl(editor: HWND) {
+    // 60 twips = 4 px at 96 DPI: a visibly "thick" rule (>= 3 px at 100 %).
+    insert_flat_picture(editor, &separator_png(), 60, "separator");
+}
+
+/// Insert > Page Break (Ctrl+Enter, or `----` + Enter): the end of one page
+/// and the start of the next, drawn across the note.
+pub fn insert_page_break(editor: HWND) {
+    let Some(_busy) = Busy::enter() else {
+        return;
+    };
+    insert_flat_picture(
+        editor,
+        &nodi_core::image::page_break_png(),
+        360,
+        "page break",
+    );
+}
+
+/// A full-width picture `height_twips` high in a paragraph of its own; the
+/// caret ends at the start of a new paragraph after it.
+fn insert_flat_picture(editor: HWND, png: &[u8], height_twips: i64, label: &str) {
     let (mut from, to) = editor::selection(editor);
     if to > from {
         editor::set_selection(editor, from, from);
@@ -851,9 +1148,8 @@ fn insert_separator_impl(editor: HWND) {
     // `EM_INSERTIMAGE` takes HIMETRIC (0.01 mm); the editor width is in twips.
     let width_twips = full_width_twips(editor);
     let width = (width_twips as i64 * 2540 / 1440) as i32;
-    // 60 twips = 4 px at 96 DPI: a visibly "thick" rule (>= 3 px at 100 %).
-    let height = (60i64 * 2540 / 1440) as i32;
-    if image::insert_sized(editor, &separator_png(), width, height, height, "separator").is_err() {
+    let height = (height_twips * 2540 / 1440) as i32;
+    if image::insert_sized(editor, png, width, height, height, label).is_err() {
         return;
     }
     editor::set_selection(editor, from + 1, from + 1);
@@ -878,7 +1174,10 @@ pub fn separator_from_marker(editor: HWND) -> bool {
     let start = editor::paragraph_start(editor, from);
     let end = editor::paragraph_end(editor, from);
     let text = editor::text_range(editor, start, end);
-    if text.trim() != "---" || from < start {
+    let marker = text.trim();
+    // `---` is a separator, `----` (or longer) a page break.
+    let page = marker.len() >= 4 && marker.chars().all(|ch| ch == '-');
+    if (marker != "---" && !page) || from < start {
         return false;
     }
     // Remove the marker first, then insert at a collapsed caret: replacing a
@@ -886,53 +1185,82 @@ pub fn separator_from_marker(editor: HWND) -> bool {
     editor::set_selection(editor, start, end);
     editor::replace_selection(editor, "", true);
     editor::set_selection(editor, start, start);
-    insert_separator_impl(editor);
+    if page {
+        insert_flat_picture(
+            editor,
+            &nodi_core::image::page_break_png(),
+            360,
+            "page break",
+        );
+    } else {
+        insert_separator_impl(editor);
+    }
     true
 }
 
-/// Toggles a bulleted (`numbered == false`) or numbered list.
-pub fn toggle_list(editor: HWND, numbered: bool) {
+/// Toggles a list of `kind` (toolbar, Format menu): off when the caret item
+/// already is one, otherwise every selected paragraph becomes one, keeping
+/// the level of an existing item or the indent of plain text.
+pub fn toggle_list(editor: HWND, kind: ListKind) {
     if editor::in_table(editor) {
         return;
     }
-    if editor::para_format(editor).w_numbering != 0 {
-        remove_lists(editor);
-    } else {
-        apply_list_level(editor, numbered, 1);
+    match list_kind(editor) {
+        Some(current) if current == kind => remove_lists(editor),
+        Some(_) => apply_list_level(editor, kind, list_level(editor)),
+        None => start_list(editor, kind),
     }
 }
 
-/// Turns lists off for every selected paragraph (Format > Normal / toolbar).
+/// Turns lists off for every selected paragraph (Format > Normal / toolbar);
+/// the text keeps its column.
 fn remove_lists(editor: HWND) {
-    let Some(_busy) = Busy::enter() else {
-        return;
-    };
-    let (from, _) = editor::selection(editor);
-    let raw = editor::raw_text(editor);
-    let starts = selected_paragraphs(&raw, from, from);
-    let start = starts[0];
-    let end = paragraph_end_in(&raw, start);
-    let text = text_in(&raw, start, end);
-    let literal =
-        literal_bullet(&text).map_or(0, |(_, marker)| marker.encode_utf16().count() as i32);
-    if literal > 0 {
-        editor::set_selection(editor, start, start + literal);
-        editor::replace_selection(editor, "", true);
+    {
+        let Some(_busy) = Busy::enter() else {
+            return;
+        };
+        let _quiet = editor::QuietSelection::new(editor);
+        let (from, to) = editor::selection(editor);
+        let raw = editor::raw_text(editor);
+        let mut removed_before = 0;
+        for &start in selected_paragraphs(&raw, from, to).iter().rev() {
+            let end = paragraph_end_in(&raw, start);
+            let text = text_in(&raw, start, end);
+            let literal = literal_marker(&text).map_or(0, |(_, marker)| units(marker));
+            editor::set_selection(editor, start, start);
+            let format = editor::para_format(editor);
+            let listed = literal > 0 || format.w_numbering != 0;
+            if literal > 0 {
+                editor::set_selection(editor, start, start + literal);
+                editor::replace_selection(editor, "", true);
+                if start <= from {
+                    removed_before = literal.min(from - start);
+                }
+            }
+            if !listed {
+                continue;
+            }
+            editor::set_selection(editor, start, editor::paragraph_end(editor, start));
+            editor::set_para_format(
+                editor,
+                &ParaFormat2 {
+                    dw_mask: PFM_NUMBERING
+                        | PFM_NUMBERINGSTYLE
+                        | PFM_NUMBERINGSTART
+                        | PFM_NUMBERINGTAB
+                        | PFM_STARTINDENT
+                        | PFM_OFFSET,
+                    dx_start_indent: format.dx_start_indent.max(0),
+                    ..ParaFormat2::default()
+                },
+            );
+        }
+        // Only the first paragraph's marker can sit before the caret.
+        let first = editor::paragraph_start(editor, from);
+        let caret = (from - removed_before).max(first);
+        editor::set_selection(editor, caret, caret);
     }
-    editor::set_selection(editor, start, editor::paragraph_end(editor, start));
-    editor::set_para_format(
-        editor,
-        &ParaFormat2 {
-            dw_mask: PFM_NUMBERING
-                | PFM_NUMBERINGSTYLE
-                | PFM_NUMBERINGSTART
-                | PFM_NUMBERINGTAB
-                | PFM_STARTINDENT
-                | PFM_OFFSET,
-            ..ParaFormat2::default()
-        },
-    );
-    editor::set_selection(editor, from, from);
+    renumber_near(editor);
 }
 
 pub fn align(editor: HWND, alignment: u16) {
@@ -957,8 +1285,8 @@ pub fn toggle_inline_code(editor: HWND) {
         format.y_height = CODE_SIZE;
         format.cr_back_color = INLINE_CODE_BACK;
     } else {
-        face(&mut format, BODY_FONT);
-        format.y_height = BODY_SIZE;
+        face(&mut format, &body_font());
+        format.y_height = body_size();
         format.dw_effects = CFE_AUTOBACKCOLOR;
     }
     editor::set_selection_format(editor, &format);
@@ -1025,10 +1353,10 @@ pub fn clear_formatting(editor: HWND) {
             | CFM_COLOR
             | CFM_BACKCOLOR,
         dw_effects: CFE_AUTOCOLOR | CFE_AUTOBACKCOLOR,
-        y_height: BODY_SIZE,
+        y_height: body_size(),
         ..CharFormat2W::default()
     };
-    face(&mut format, BODY_FONT);
+    face(&mut format, &body_font());
     editor::set_selection_format(editor, &format);
 }
 
@@ -1041,7 +1369,7 @@ pub fn step_font_size(editor: HWND, larger: bool) {
     let size = if current.dw_mask & CFM_SIZE != 0 {
         current.y_height
     } else {
-        BODY_SIZE
+        body_size()
     };
     let next = if larger {
         LADDER
@@ -1074,7 +1402,7 @@ pub fn choose_text_color(editor: HWND, owner: HWND) {
 }
 
 /// The standard colour dialog. Returns the picked `COLORREF`.
-fn choose_color(owner: HWND, initial: u32) -> Option<u32> {
+pub(crate) fn choose_color(owner: HWND, initial: u32) -> Option<u32> {
     static mut CUSTOM: [u32; 16] = [0x00FF_FFFF; 16];
     let mut dialog: CHOOSECOLORW = unsafe { std::mem::zeroed() };
     dialog.lStructSize = size_of::<CHOOSECOLORW>() as u32;
@@ -1102,7 +1430,7 @@ pub fn choose_font(editor: HWND, owner: HWND) {
     let size = if current.dw_mask & CFM_SIZE != 0 {
         current.y_height
     } else {
-        BODY_SIZE
+        body_size()
     };
     logfont.lfHeight = -win::mul_div(size, dpi, 1440);
     logfont.lfWeight = if current.dw_effects & CFE_BOLD != 0 {
@@ -1382,7 +1710,8 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
     let border = format!("\\brdrs\\brdrw10\\brdrcf{edge}");
     let mut rtf = String::from("{\\rtf1\\ansi\\uc1\\deff0");
     rtf.push_str(&format!(
-        "{{\\fonttbl{{\\f0\\fnil {BODY_FONT};}}{{\\f1\\fmodern {CODE_FONT};}}}}"
+        "{{\\fonttbl{{\\f0\\fnil {};}}{{\\f1\\fmodern {CODE_FONT};}}}}",
+        body_font()
     ));
     rtf.push_str(&code_colours());
 

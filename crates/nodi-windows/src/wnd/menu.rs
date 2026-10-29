@@ -5,7 +5,8 @@
 use std::ptr;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use nodi_core::storage::Theme;
+use nodi_core::storage::Background;
+use nodi_core::tree::SortOrder;
 use nodi_core::NodeKind;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_DOWN, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_NEXT, VK_OEM_3, VK_OEM_4, VK_OEM_6,
@@ -165,6 +166,43 @@ pub const IDM_INSERT_CODE_BLOCK: u16 = 205;
 pub const IDM_INSERT_FORMULA: u16 = 206;
 pub const IDM_INSERT_SEPARATOR: u16 = 207;
 pub const IDM_INSERT_OUTPUT_BLOCK: u16 = 208;
+pub const IDM_INSERT_PAGE_BREAK: u16 = 209;
+// Batch 6.
+pub const IDM_FORMAT_CHECKLIST: u16 = 226;
+pub const IDM_FORMAT_RESTART_NUM: u16 = 227;
+pub const IDM_FORMAT_CONTINUE_NUM: u16 = 228;
+pub const IDM_VIEW_REFRESH: u16 = 145;
+pub const IDM_VIEW_LINE_NUMBERS: u16 = 146;
+pub const IDM_TOOLS_RESTORE_FOLDER: u16 = 187;
+pub const IDM_TOOLS_PREFERENCES: u16 = 188;
+pub const IDM_NOTES_LOCK: u16 = 260;
+pub const IDM_NOTES_UNLOCK: u16 = 261;
+pub const IDM_NOTES_EXPORT: u16 = 262;
+pub const IDM_NOTES_IMPORT_HERE: u16 = 263;
+pub const IDM_NOTES_IMPORT_FOLDER_HERE: u16 = 264;
+pub const IDM_NOTES_SHOW_ORIGINAL: u16 = 265;
+pub const IDM_NOTES_SAVE_BACK: u16 = 266;
+pub const IDM_FILE_EXPORT_ALL: u16 = 267;
+pub const IDM_FILE_EXPORT_BACKUP: u16 = 268;
+pub const IDM_SORT_MANUAL: u16 = 270;
+pub const IDM_SORT_NAME: u16 = 271;
+pub const IDM_SORT_CREATED: u16 = 272;
+pub const IDM_SORT_MODIFIED: u16 = 273;
+pub const IDM_SORT_FOLDERS_FIRST: u16 = 274;
+pub const IDM_THEME_EDITOR: u16 = 303;
+pub const IDM_THEME_COPY: u16 = 304;
+pub const IDM_THEME_PASTE: u16 = 305;
+pub const IDM_THEME_DELETE: u16 = 306;
+pub const IDM_BG_PLAIN: u16 = 310;
+pub const IDM_BG_LINES: u16 = 311;
+pub const IDM_BG_GRID: u16 = 312;
+pub const IDM_BG_DOTS: u16 = 313;
+/// View > Theme presets (one id each, in `theme::presets` order).
+pub const IDM_THEME_PRESET_FIRST: u16 = 320;
+pub const IDM_THEME_PRESET_LAST: u16 = 344;
+/// View > Theme > the user's saved themes.
+pub const IDM_THEME_MINE_FIRST: u16 = 350;
+pub const IDM_THEME_MINE_LAST: u16 = 379;
 
 /// Every documented shortcut: (keys, action). Shown by Help > Keyboard
 /// Shortcuts and mirrored in docs/SHORTCUTS.md.
@@ -216,6 +254,23 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("- / * / 1. + Space", "Start a bulleted / numbered list"),
     ("# + Space", "Heading 1–4 (## … #### for deeper levels)"),
     ("--- + Enter", "Horizontal separator"),
+    (
+        "---- + Enter / Ctrl+Enter",
+        "Page break (a new page starts)",
+    ),
+    (
+        "[ ] + Space / [x] + Space",
+        "Checklist item (click the box or Ctrl+Enter ticks it)",
+    ),
+    ("Two quick spaces", "\". \" (Tools > Preferences)"),
+    ("Ctrl+Click / Shift+Click (tree)", "Select several notes"),
+    ("F5 (in the tree)", "Refresh the Notes Explorer from disk"),
+    ("Ctrl+Shift+9", "Checklist"),
+    ("Ctrl+Shift+S", "Save this note as... (.md, .rtf, .txt)"),
+    (
+        "Ctrl+Backspace / Ctrl+Delete",
+        "Delete a word (also in dialogs)",
+    ),
     ("Enter on an empty list item", "End the list"),
     ("F5", "Insert date and time"),
     ("Ctrl+F", "Find in note"),
@@ -249,6 +304,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
 /// The File > Recent submenu, so `refresh_recent` can rebuild its items after
 /// every note is opened (menus are created before `App` exists).
 static RECENT_MENU: AtomicIsize = AtomicIsize::new(0);
+static THEME_MENU: AtomicIsize = AtomicIsize::new(0);
 
 /// Builds the menu bar. Only commands that work are listed.
 pub fn create_menu() -> HMENU {
@@ -270,11 +326,30 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_FILE_CLOSE_TAB, "&Close Tab\tCtrl+W"),
             Item::Sep,
             Item::Popup(recent, "Recent &Notes"),
-            Item::Cmd(IDM_FILE_IMPORT_FILES, "&Import Files..."),
-            Item::Cmd(IDM_FILE_IMPORT_FOLDER, "Import &Folder..."),
-            Item::Cmd(IDM_FILE_EXPORT_AS, "&Export Note As... (.md, .rtf, .txt)"),
-            Item::Cmd(IDM_FILE_EXPORT_MD, "Export Note as &Markdown..."),
-            Item::Cmd(IDM_FILE_EXPORT_FOLDER, "Export F&older (Markdown)..."),
+            Item::Sep,
+            Item::Popup(
+                popup(&[
+                    Item::Cmd(IDM_FILE_IMPORT_FILES, "&Files (.md, .txt, .rtf)..."),
+                    Item::Cmd(IDM_FILE_IMPORT_FOLDER, "F&older..."),
+                ]),
+                "&Import (copies, originals stay unchanged)",
+            ),
+            Item::Popup(
+                popup(&[
+                    Item::Cmd(
+                        IDM_FILE_EXPORT_AS,
+                        "This &Note As... (.md, .rtf, .txt)\tCtrl+Shift+S",
+                    ),
+                    Item::Cmd(IDM_NOTES_EXPORT, "&Selected Notes / Folders..."),
+                    Item::Cmd(IDM_FILE_EXPORT_ALL, "&All Notes..."),
+                    Item::Sep,
+                    Item::Cmd(
+                        IDM_FILE_EXPORT_BACKUP,
+                        "&Complete Backup Copy (restorable)...",
+                    ),
+                ]),
+                "&Export / Save As",
+            ),
             Item::Sep,
             Item::Cmd(IDM_FILE_EXIT, "E&xit"),
         ]);
@@ -304,7 +379,7 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_SEARCH_GOTO_NOTE, "&Go to Note...\tCtrl+O"),
             Item::Cmd(
                 IDM_SEARCH_ALL_NOTES,
-                "Search in &All Notes...\tCtrl+Shift+F",
+                "Find &Notes (titles, folders and text)...\tCtrl+Shift+F",
             ),
         ]);
         attach(bar, search, "&Search");
@@ -327,9 +402,21 @@ pub fn create_menu() -> HMENU {
             Item::Checked(IDM_VIEW_CTRL_SCROLL, "Ctrl+Up/Down &Scrolls the View"),
             Item::Sep,
             Item::Popup(theme_menu(), "T&heme"),
+            Item::Popup(
+                popup(&[
+                    Item::Cmd(IDM_BG_PLAIN, "&Plain"),
+                    Item::Cmd(IDM_BG_LINES, "&Lines (ruled paper)"),
+                    Item::Cmd(IDM_BG_GRID, "&Grid"),
+                    Item::Cmd(IDM_BG_DOTS, "&Dots"),
+                ]),
+                "&Background",
+            ),
+            Item::Checked(IDM_VIEW_LINE_NUMBERS, "&Line Numbers"),
             Item::Sep,
+            Item::Popup(sort_menu(), "S&ort Notes"),
             Item::Cmd(IDM_VIEW_EXPAND_ALL, "&Expand All Notes"),
             Item::Cmd(IDM_VIEW_COLLAPSE_ALL, "&Collapse All Notes"),
+            Item::Cmd(IDM_VIEW_REFRESH, "&Refresh Notes\tF5 in the tree"),
         ]);
         attach(bar, view, "&View");
 
@@ -341,6 +428,7 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_INSERT_OUTPUT_BLOCK, "&Output Block\tCtrl+Shift+O"),
             Item::Cmd(IDM_INSERT_FORMULA, "&Formula...\tAlt+="),
             Item::Cmd(IDM_INSERT_SEPARATOR, "&Separator\tCtrl+Shift+-"),
+            Item::Cmd(IDM_INSERT_PAGE_BREAK, "&Page Break (new page)\tCtrl+Enter"),
             Item::Sep,
             Item::Cmd(IDM_INSERT_DATETIME, "&Date and Time\tF5"),
         ]);
@@ -387,6 +475,9 @@ pub fn create_menu() -> HMENU {
             Item::Sep,
             Item::Cmd(IDM_FORMAT_BULLETS, "Bulleted &List\tCtrl+Shift+8"),
             Item::Cmd(IDM_FORMAT_NUMBERS, "Numbered Lis&t\tCtrl+Shift+7"),
+            Item::Cmd(IDM_FORMAT_CHECKLIST, "Chec&klist\tCtrl+Shift+9"),
+            Item::Cmd(IDM_FORMAT_RESTART_NUM, "Restart Numbering at 1"),
+            Item::Cmd(IDM_FORMAT_CONTINUE_NUM, "Continue Numbering"),
             Item::Cmd(IDM_FORMAT_INDENT, "Indent\tTab"),
             Item::Cmd(IDM_FORMAT_OUTDENT, "Outdent\tShift+Tab"),
             Item::Sep,
@@ -415,6 +506,10 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_NOTES_MOVE_ROOT, "Move to &Top Level"),
             Item::Cmd(IDM_NOTES_COPY_LINK, "Copy Internal &Link"),
             Item::Sep,
+            Item::Cmd(IDM_NOTES_LOCK, "&Lock"),
+            Item::Cmd(IDM_NOTES_UNLOCK, "U&nlock"),
+            Item::Cmd(IDM_NOTES_EXPORT, "&Export..."),
+            Item::Sep,
             Item::Cmd(IDM_NOTES_TRASH, "Move to &Trash\tDel"),
             Item::Cmd(IDM_NOTES_TRASH_VIEW, "Tr&ash..."),
             Item::Cmd(IDM_NOTES_TRASH_EMPTY, "&Empty Trash..."),
@@ -425,6 +520,7 @@ pub fn create_menu() -> HMENU {
         let tools = popup(&[
             Item::Cmd(IDM_TOOLS_BACKUP, "&Backup Now"),
             Item::Cmd(IDM_TOOLS_RESTORE_BACKUP, "&Restore Backup..."),
+            Item::Cmd(IDM_TOOLS_RESTORE_FOLDER, "Restore From Backup &Folder..."),
             Item::Sep,
             Item::Cmd(IDM_TOOLS_REBUILD_MIRROR, "Rebuild AI Markdown &Mirror"),
             Item::Cmd(
@@ -437,6 +533,8 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_TOOLS_OPEN_AI_FOLDER, "Open AI &Folder"),
             Item::Sep,
             Item::Cmd(IDM_TOOLS_OPEN_DATA, "&Open Data Folder"),
+            Item::Sep,
+            Item::Cmd(IDM_TOOLS_PREFERENCES, "&Preferences..."),
         ]);
         attach(bar, tools, "&Tools");
 
@@ -458,13 +556,90 @@ pub enum Item {
     Sep,
 }
 
-/// View > Theme: Light / Dark / Custom...
-fn theme_menu() -> HMENU {
+/// View > Sort Notes.
+fn sort_menu() -> HMENU {
     popup(&[
-        Item::Cmd(IDM_THEME_LIGHT, "&Light"),
-        Item::Cmd(IDM_THEME_DARK, "&Dark"),
-        Item::Cmd(IDM_THEME_CUSTOM, "&Custom..."),
+        Item::Cmd(IDM_SORT_MANUAL, "&Manual (drag && drop order)"),
+        Item::Cmd(IDM_SORT_NAME, "By &Name (00-, 01-, 2 before 10)"),
+        Item::Cmd(IDM_SORT_CREATED, "By Date &Created"),
+        Item::Cmd(IDM_SORT_MODIFIED, "By Date &Modified"),
+        Item::Sep,
+        Item::Cmd(IDM_SORT_FOLDERS_FIRST, "&Folders First"),
     ])
+}
+
+/// View > Theme (filled by `refresh_theme_menu`).
+fn theme_menu() -> HMENU {
+    let menu = popup(&[Item::Cmd(IDM_THEME_EDITOR, "Theme &Editor...")]);
+    THEME_MENU.store(menu as isize, Ordering::Relaxed);
+    menu
+}
+
+/// Rebuilds View > Theme: the presets (light, then dark), the user's own
+/// themes, and the editor / copy / paste commands; the active one is checked.
+pub fn refresh_theme_menu(app: &App) {
+    let menu = THEME_MENU.load(Ordering::Relaxed) as HMENU;
+    if menu.is_null() {
+        return;
+    }
+    let active = crate::wnd::theme::active_spec(&app.settings).name;
+    // SAFETY: `menu` is the popup created in `theme_menu` and lives as long as
+    // the menu bar; texts are temporaries that live for each call.
+    unsafe {
+        while GetMenuItemCount(menu) > 0 {
+            DeleteMenu(menu, 0, MF_BYPOSITION);
+        }
+        let add = |id: u16, label: &str, checked: bool| {
+            let flags = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
+            AppendMenuW(menu, flags, id as usize, win::wide(label).as_ptr());
+        };
+        let presets = crate::wnd::theme::presets();
+        let mut was_dark = false;
+        for (index, preset) in presets.iter().enumerate() {
+            if index as u16 > IDM_THEME_PRESET_LAST - IDM_THEME_PRESET_FIRST {
+                break;
+            }
+            let dark = crate::wnd::theme::Palette::from_spec(preset).dark;
+            if dark && !was_dark {
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            }
+            was_dark = dark;
+            add(
+                IDM_THEME_PRESET_FIRST + index as u16,
+                &preset.name,
+                preset.name == active,
+            );
+        }
+        let mine: Vec<&String> = app
+            .settings
+            .my_themes
+            .iter()
+            .map(|theme| &theme.name)
+            .filter(|name| name.as_str() != "(preview)")
+            .collect();
+        if !mine.is_empty() {
+            AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            for (index, name) in mine.iter().enumerate() {
+                if index as u16 > IDM_THEME_MINE_LAST - IDM_THEME_MINE_FIRST {
+                    break;
+                }
+                add(
+                    IDM_THEME_MINE_FIRST + index as u16,
+                    &format!("{name}  (mine)"),
+                    **name == active,
+                );
+            }
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        add(
+            IDM_THEME_EDITOR,
+            "Theme &Editor (all colours, font)...",
+            false,
+        );
+        add(IDM_THEME_COPY, "&Copy Theme as Text", false);
+        add(IDM_THEME_PASTE, "&Paste Theme from Text", false);
+        add(IDM_THEME_DELETE, "&Delete My Theme...", false);
+    }
 }
 
 /// Rebuilds File > Recent from `app.recent` (newest first, max 10).
@@ -518,10 +693,22 @@ pub fn sync_settings(app: &App) {
     check_item(app, IDM_VIEW_SPELL, app.settings.spell_check);
     check_item(app, IDM_VIEW_CTRL_SCROLL, app.settings.ctrl_arrow_scroll);
     crate::wnd::editkeys::set_ctrl_arrow_scroll(app.settings.ctrl_arrow_scroll);
-    check_item(app, IDM_THEME_LIGHT, app.settings.theme == Theme::Light);
-    check_item(app, IDM_THEME_DARK, app.settings.theme == Theme::Dark);
-    check_item(app, IDM_THEME_CUSTOM, app.settings.theme == Theme::Custom);
+    let background = app.settings.background;
+    check_item(app, IDM_BG_PLAIN, background == Background::Plain);
+    check_item(app, IDM_BG_LINES, background == Background::Lines);
+    check_item(app, IDM_BG_GRID, background == Background::Grid);
+    check_item(app, IDM_BG_DOTS, background == Background::Dots);
     check_item(app, IDM_TOOLS_MIRROR_TOGGLE, app.settings.markdown_mirror);
+    let sort = app.settings.tree_sort;
+    check_item(app, IDM_SORT_MANUAL, sort == SortOrder::Manual);
+    check_item(app, IDM_SORT_NAME, sort == SortOrder::Name);
+    check_item(app, IDM_SORT_CREATED, sort == SortOrder::Created);
+    check_item(app, IDM_SORT_MODIFIED, sort == SortOrder::Modified);
+    check_item(app, IDM_SORT_FOLDERS_FIRST, app.settings.folders_first);
+    crate::wnd::editkeys::set_double_space_period(app.settings.double_space_period);
+    crate::wnd::dialogs::set_sounds(app.settings.sounds);
+    check_item(app, IDM_VIEW_LINE_NUMBERS, app.settings.line_numbers);
+    refresh_theme_menu(app);
 }
 
 /// Creates a popup menu from `items`.
@@ -607,6 +794,8 @@ pub fn create_accel() -> HACCEL {
         accel(FALT, VK_OEM_PLUS, IDM_INSERT_FORMULA),
         accel(ctrl_shift, VK_OEM_MINUS, IDM_INSERT_SEPARATOR),
         accel(0, VK_F5, IDM_INSERT_DATETIME),
+        accel(ctrl_shift, key(b'S'), IDM_FILE_EXPORT_AS),
+        accel(ctrl_shift, key(b'9'), IDM_FORMAT_CHECKLIST),
         accel(ctrl, key(b'F'), IDM_SEARCH_FIND),
         accel(0, VK_F3, IDM_SEARCH_FIND_NEXT),
         accel(FSHIFT, VK_F3, IDM_SEARCH_FIND_PREV),
@@ -659,6 +848,34 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_FILE_EXPORT_MD => app::export_markdown(app),
         IDM_FILE_EXPORT_AS => crate::wnd::import::export_note(app),
         IDM_FILE_EXPORT_FOLDER => crate::wnd::import::export_folder(app),
+        IDM_FILE_EXPORT_ALL => crate::wnd::import::export_all(app),
+        IDM_FILE_EXPORT_BACKUP => crate::wnd::import::export_backup(app),
+        IDM_NOTES_EXPORT => crate::wnd::import::export_selection(app),
+        IDM_NOTES_IMPORT_HERE => crate::wnd::import::import_here(app, false),
+        IDM_NOTES_IMPORT_FOLDER_HERE => crate::wnd::import::import_here(app, true),
+        IDM_NOTES_SHOW_ORIGINAL => crate::wnd::import::show_original(app),
+        IDM_NOTES_SAVE_BACK => crate::wnd::import::save_back(app),
+        IDM_NOTES_LOCK => app.set_selection_locked(true),
+        IDM_NOTES_UNLOCK => app.set_selection_locked(false),
+        IDM_SORT_MANUAL => app.set_sort(SortOrder::Manual),
+        IDM_SORT_NAME => app.set_sort(SortOrder::Name),
+        IDM_SORT_CREATED => app.set_sort(SortOrder::Created),
+        IDM_SORT_MODIFIED => app.set_sort(SortOrder::Modified),
+        IDM_SORT_FOLDERS_FIRST => app.toggle_folders_first(),
+        IDM_VIEW_REFRESH => app.refresh_from_disk(),
+        // F5 refreshes the Notes Explorer while it has the focus.
+        IDM_INSERT_DATETIME if app.tree_has_focus() => app.refresh_from_disk(),
+        IDM_TOOLS_RESTORE_FOLDER => app.restore_from_folder_ui(),
+        IDM_TOOLS_PREFERENCES => app.show_preferences(),
+        IDM_FORMAT_CHECKLIST => with_editor(app, |editor| {
+            format::toggle_list(editor, format::ListKind::Check);
+        }),
+        IDM_FORMAT_RESTART_NUM => with_editor(app, |editor| {
+            format::set_numbering_restart(editor, true);
+        }),
+        IDM_FORMAT_CONTINUE_NUM => with_editor(app, |editor| {
+            format::set_numbering_restart(editor, false);
+        }),
         IDM_FILE_IMPORT_FILES => crate::wnd::import::import_files(app),
         IDM_FILE_IMPORT_FOLDER => crate::wnd::import::import_folder(app),
         IDM_FILE_EXIT => {
@@ -697,8 +914,12 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_FORMAT_NORMAL => with_editor(app, |editor| format::heading(editor, 0)),
         IDM_TOOLBAR_COLOR => toolbar::show_palette(app, false),
         IDM_TOOLBAR_HIGHLIGHT => toolbar::show_palette(app, true),
-        IDM_FORMAT_BULLETS => with_editor(app, |editor| format::toggle_list(editor, false)),
-        IDM_FORMAT_NUMBERS => with_editor(app, |editor| format::toggle_list(editor, true)),
+        IDM_FORMAT_BULLETS => with_editor(app, |editor| {
+            format::toggle_list(editor, format::ListKind::Bullet)
+        }),
+        IDM_FORMAT_NUMBERS => with_editor(app, |editor| {
+            format::toggle_list(editor, format::ListKind::Numbered)
+        }),
         IDM_FORMAT_INDENT => with_editor(app, |editor| {
             if !crate::wnd::editkeys::tab_key(editor, false) {
                 editor::replace_selection(editor, "\t", true);
@@ -748,6 +969,7 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_INSERT_OUTPUT_BLOCK => with_editor(app, format::insert_output_block),
         IDM_INSERT_FORMULA => app::insert_formula(app),
         IDM_INSERT_SEPARATOR => with_editor(app, format::insert_separator),
+        IDM_INSERT_PAGE_BREAK => with_editor(app, format::insert_page_break),
         IDM_INSERT_DATETIME => with_editor(app, |editor| {
             editor::replace_selection(editor, &app::local_date_time(), true);
         }),
@@ -784,9 +1006,41 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_VIEW_OUTLINE => app::show_outline(app),
         IDM_VIEW_SPELL => app.toggle_spell_check(),
         IDM_VIEW_CTRL_SCROLL => app.toggle_ctrl_arrow_scroll(),
-        IDM_THEME_LIGHT => app.set_theme(Theme::Light),
-        IDM_THEME_DARK => app.set_theme(Theme::Dark),
-        IDM_THEME_CUSTOM => app::choose_custom_theme(app),
+        IDM_THEME_LIGHT => app.set_theme_name("Light"),
+        IDM_THEME_DARK => app.set_theme_name("Dark"),
+        IDM_THEME_CUSTOM | IDM_THEME_EDITOR => app.edit_theme(),
+        IDM_THEME_COPY => app.copy_theme(),
+        IDM_THEME_PASTE => app.paste_theme(),
+        IDM_THEME_DELETE => app.delete_my_theme(),
+        id if (IDM_THEME_PRESET_FIRST..=IDM_THEME_PRESET_LAST).contains(&id) => {
+            let index = (id - IDM_THEME_PRESET_FIRST) as usize;
+            if let Some(preset) = crate::wnd::theme::presets().get(index) {
+                app.set_theme_name(&preset.name.clone());
+            }
+        }
+        id if (IDM_THEME_MINE_FIRST..=IDM_THEME_MINE_LAST).contains(&id) => {
+            let index = (id - IDM_THEME_MINE_FIRST) as usize;
+            let name = app
+                .settings
+                .my_themes
+                .iter()
+                .filter(|theme| theme.name != "(preview)")
+                .nth(index)
+                .map(|theme| theme.name.clone());
+            if let Some(name) = name {
+                app.set_theme_name(&name);
+            }
+        }
+        IDM_BG_PLAIN => app.set_background(Background::Plain),
+        IDM_BG_LINES => app.set_background(Background::Lines),
+        IDM_BG_GRID => app.set_background(Background::Grid),
+        IDM_BG_DOTS => app.set_background(Background::Dots),
+        IDM_VIEW_LINE_NUMBERS => {
+            app.settings.line_numbers = !app.settings.line_numbers;
+            app.save_settings();
+            check_item(app, id, app.settings.line_numbers);
+            crate::wnd::layout(app);
+        }
         IDM_VIEW_EXPAND_ALL => app.expand_all(),
         IDM_VIEW_COLLAPSE_ALL => app.collapse_all(),
 
@@ -816,13 +1070,9 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_NOTES_MOVE_UP => app.move_selected(-1),
         IDM_NOTES_MOVE_DOWN => app.move_selected(1),
         IDM_NOTES_MOVE_TO => app.move_selected_to_picker(),
-        IDM_NOTES_MOVE_ROOT => app.move_selected_to_root(),
+        IDM_NOTES_MOVE_ROOT => app.move_selection_into(None),
         IDM_NOTES_COPY_LINK => app::copy_internal_link(app),
-        IDM_NOTES_TRASH => {
-            if let Some(note) = app.context_note.clone().or_else(|| app.selected.clone()) {
-                app.trash_node(note);
-            }
-        }
+        IDM_NOTES_TRASH => app.trash_selection(),
         IDM_NOTES_TRASH_VIEW => app::show_trash(app),
         IDM_NOTES_TRASH_EMPTY => app.empty_trash(),
         IDM_NOTES_PROPERTIES => app::show_properties(app),
@@ -864,6 +1114,9 @@ pub(crate) fn with_editor(
         status::set_message(app, "No note open");
         return;
     };
+    if editor::refuse_if_locked(app) {
+        return;
+    }
     command(editor);
     app.mark_dirty(editor);
     // SAFETY: focusing our own editor.
@@ -881,6 +1134,9 @@ fn editor_result(
         status::set_message(app, "No note open");
         return;
     };
+    if editor::refuse_if_locked(app) {
+        return;
+    }
     match command(editor) {
         Ok(()) => app.mark_dirty(editor),
         Err(message) => report(app, Err(message)),

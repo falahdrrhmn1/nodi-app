@@ -50,14 +50,18 @@ that heading).
 
 | Type | Result |
 |---|---|
-| `- ` or `* ` at the start of a paragraph | Bulleted list item |
+| `- ` or `* ` at the start of a paragraph | Bulleted list item (at the paragraph's own indent) |
 | `1. ` or `1) ` at the start of a paragraph | Numbered list item |
+| `[ ] ` / `[x] ` at the start of a paragraph | Checklist item, open / ticked (click the box or Ctrl+Enter ticks it) |
 | `# ` … `#### ` at the start of a paragraph | Heading 1–4 |
 | `---` alone on a line, then Enter | Horizontal separator |
+| `----` alone on a line, then Enter (or Ctrl+Enter) | Page break: a new page starts |
+| Two spaces typed quickly after a word | `. ` (a pause keeps two spaces; Tools > Preferences) |
 | Enter in a list item | Next item (same level) |
 | Enter on an empty list item | Ends the list, normal paragraph at the same indent |
-| Tab / Shift+Tab in a list item | One bullet level deeper / shallower (• ◦ ▪) |
-| Backspace at the start of a list item | Removes the bullet, keeps the indent |
+| Tab / Shift+Tab in a list item | One level deeper / shallower, any depth (• ◦ ▪ …); a deeper numbered list starts at 1, Shift+Tab continues the outer numbers |
+| Backspace at the start of a list item's text | Removes the bullet, number or box, keeps the indent |
+| Format > Restart Numbering at 1 / Continue Numbering | For the numbered item at the caret |
 | Ctrl+Z right after `- ` / `1. ` | Restores the typed marker as plain text |
 
 ## Formatting
@@ -138,3 +142,18 @@ the insert commands.
   link and formula commands when the click lands on one.
 - A selected picture shows resize handles (Rich Edit's own); **Image > Size...**
   sets an exact size in pixels or percent and **Image > Crop...** trims it.
+
+## Batch 6 additions
+
+| Keys | Action |
+|---|---|
+| Ctrl+Click / Shift+Click in the Notes Explorer | Select several notes and folders (Delete, right-click, drag act on all) |
+| Esc in the Notes Explorer | Clear that selection |
+| F5 in the Notes Explorer | Refresh the tree from disk (F5 in a note still inserts the date) |
+| Ctrl+Shift+F | Find notes: titles of notes and folders and the text inside every note |
+| Ctrl+Shift+S | Save this note as… (.md, .rtf, .txt) |
+| Ctrl+Shift+9 | Checklist |
+| Ctrl+Enter | Tick a checklist item, otherwise insert a page break |
+| Ctrl+Backspace / Ctrl+Delete | Delete a word — also in Find, Link and every dialog |
+| Font box: type a name, Enter | Applies the font (the name is completed from the list; nothing changes while typing) |
+| Click a line number | Selects that line |

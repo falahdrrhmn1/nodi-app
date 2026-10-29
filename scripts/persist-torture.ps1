@@ -40,6 +40,8 @@ $IDM_FORMAT_BULLETS = 214
 $IDM_INSERT_CODE_BLOCK = 205
 $IDM_INSERT_SEPARATOR = 207
 $IDM_TABLE_COL_RIGHT = 233
+. "$PSScriptRoot\probe-lib.ps1"
+$script:TorturePng = New-TestPng (Join-Path $Root 'torture.png') 160 80
 
 # Trimmed one-line excerpt for the diff output.
 function Short-Text([string]$text, [int]$max = 120) {
@@ -106,7 +108,7 @@ function Invoke-CycleEdits($nodi, [int]$cycle) {
     # A fresh note with a structure that rotates over the cycles.
     Invoke-Nodi $nodi "cmd $IDM_NOTES_NEW" | Out-Null
     Invoke-Nodi $nodi "rename-selected C$cycle" | Out-Null
-    switch (($cycle - 1) % 5) {
+    switch (($cycle - 1) % 8) {
         0 {
             Invoke-Nodi $nodi "cmd $IDM_FORMAT_H1" | Out-Null
             Invoke-Nodi $nodi "type Heading $cycle" | Out-Null
@@ -148,6 +150,31 @@ function Invoke-CycleEdits($nodi, [int]$cycle) {
             Invoke-Nodi $nodi "cmd $IDM_INSERT_SEPARATOR" | Out-Null
             Select-End $nodi | Out-Null
             Invoke-Nodi $nodi "type bawah $cycle" | Out-Null
+            Invoke-Nodi $nodi 'enter' | Out-Null
+        }
+        5 {
+            # Batch 6: an outline-numbered list (nested list restarts at 1).
+            foreach ($command in @("keys 1. a$cycle", 'enter', 'tab', "keys x$cycle", 'enter',
+                    "keys y$cycle", 'enter', 'shift-tab', "keys b$cycle", 'enter', 'enter')) {
+                Invoke-Nodi $nodi $command | Out-Null
+            }
+        }
+        6 {
+            # Batch 6: checklist, a ticked item, then a page break.
+            foreach ($command in @("keys [ ] tugas $cycle", 'enter', "keys [x] selesai $cycle",
+                    'enter', 'enter', 'keys ----', 'enter', "keys halaman $cycle")) {
+                Invoke-Nodi $nodi $command | Out-Null
+            }
+            Invoke-Nodi $nodi 'enter' | Out-Null
+        }
+        7 {
+            # Batch 6: a picture and a pasted terminal table.
+            Invoke-Nodi $nodi "insert-image $script:TorturePng" | Out-Null
+            Invoke-Nodi $nodi 'type \n' | Out-Null
+            Set-Clipboard -Value "+----+------+`r`n| id | name |`r`n+----+------+`r`n| $cycle  | n$cycle   |`r`n+----+------+"
+            Invoke-Nodi $nodi 'cmd 114' | Out-Null
+            Select-End $nodi | Out-Null
+            Invoke-Nodi $nodi "type sesudah $cycle" | Out-Null
             Invoke-Nodi $nodi 'enter' | Out-Null
         }
     }
@@ -235,6 +262,10 @@ function Compare-State($nodi, [string]$data, $expected) {
     $problems = @()
     foreach ($note in $expected.notes) {
         $now = Get-NoteState $nodi $note.title
+        if ($note.alt -and $now.text -ceq $note.alt.text -and $now.markdown -ceq $note.alt.markdown) {
+            # Killed while saving: the last edit may be lost, nothing else.
+            continue
+        }
         if ($now.text -cne $note.text) {
             $problems += Format-Diff "note '$($note.title)' text" $note.text $now.text
         }
@@ -305,6 +336,16 @@ function Close-Cycle($nodi, [int]$mode) {
             }
             return 'WM_QUERYENDSESSION + WM_ENDSESSION (exited)'
         }
+        5 {
+            # Ctrl+S, then killed while the save may still be running: the
+            # note must be either the old or the new version, never damaged.
+            Invoke-Nodi $nodi "cmd $IDM_FILE_SAVE" | Out-Null
+            Start-Sleep -Milliseconds (Get-Random -Minimum 0 -Maximum 25)
+            $before = Invoke-Nodi $nodi 'state'
+            $nodi.Process.Kill()
+            $nodi.Process.WaitForExit(5000) | Out-Null
+            return "Ctrl+S then Stop-Process -Force at once (state '$before')"
+        }
         4 {
             $ms = Wait-State $nodi 'Saved' 8000
             $state = if ($ms -ge 0) { "Saved after $ms ms" } else { "never Saved: '$(Invoke-Nodi $nodi 'state')'" }
@@ -329,7 +370,7 @@ for ($run = 1; $run -le $Runs; $run++) {
     $nodi = $null
 
     for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
-        $mode = (($cycle - 1) % 4) + 1
+        $mode = (($cycle - 1) % 5) + 1
         $problems = @()
         $line = "cycle $cycle/$Cycles mode $mode"
         try {
@@ -356,8 +397,17 @@ for ($run = 1; $run -le $Runs; $run++) {
             }
             $fresh = @((Get-NoteState $nodi "C$cycle-x"))
             $tree = Get-TreeState $data
+            $alt = $null
+            if ($mode -eq 5) {
+                # Everything but the last edit must be on disk before the kill.
+                Wait-State $nodi 'Saved' 8000 | Out-Null
+                $alt = Get-NoteState $nodi 'Torture'
+                Wait-State $nodi 'Saved' 8000 | Out-Null
+            }
             Invoke-LastEdit $nodi $cycle
-            $fresh += @(Get-NoteState $nodi 'Torture')
+            $last = Get-NoteState $nodi 'Torture'
+            $last | Add-Member -NotePropertyName alt -NotePropertyValue $alt
+            $fresh += @($last)
             $notes = @($notes | Where-Object { $fresh.title -notcontains $_.title }) + $fresh
 
             # 4. close in rotation

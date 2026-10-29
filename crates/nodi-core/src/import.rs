@@ -247,8 +247,9 @@ pub fn decode_text(bytes: &[u8]) -> String {
 /// Plain text as an RTF document in the body font, one paragraph per line.
 pub fn text_to_rtf(text: &str) -> String {
     let mut out = format!(
-        "{{\\rtf1\\ansi\\ansicpg1252\\deff0\\uc1{{\\fonttbl{{\\f0\\fnil\\fcharset0 {};}}}}\\viewkind4\\pard\\f0\\fs22 ",
-        markdown_in::BODY_FONT
+        "{{\\rtf1\\ansi\\ansicpg1252\\deff0\\uc1{{\\fonttbl{{\\f0\\fnil\\fcharset0 {};}}}}\\viewkind4\\pard\\f0\\fs{} ",
+        markdown_in::body_font(),
+        markdown_in::body_size()
     );
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     for (index, line) in normalized.split('\n').enumerate() {

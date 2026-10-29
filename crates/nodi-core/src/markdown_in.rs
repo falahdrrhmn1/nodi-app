@@ -19,11 +19,35 @@ pub const FORMULA_START: char = '\u{E000}';
 /// See [`FORMULA_START`].
 pub const FORMULA_END: char = '\u{E001}';
 
-/// Body font, mirroring `wnd::format::BODY_FONT`.
-pub const BODY_FONT: &str = "Segoe UI";
 /// Code font, mirroring `wnd::format::CODE_FONT`.
 pub const CODE_FONT: &str = "Consolas";
-const BODY_SIZE: i32 = 22;
+
+/// Default body font for new and pasted text (Preferences > Default font);
+/// the Windows editor reads the same value.
+static BODY: std::sync::RwLock<Option<(String, i32)>> = std::sync::RwLock::new(None);
+
+/// Sets the default body font and size (half-points, `22` = 11 pt).
+pub fn set_body(font: &str, half_points: i32) {
+    if let Ok(mut body) = BODY.write() {
+        *body = Some((font.to_owned(), half_points.clamp(8, 400)));
+    }
+}
+
+/// The default body font (`Segoe UI` unless changed in Preferences).
+pub fn body_font() -> String {
+    BODY.read()
+        .ok()
+        .and_then(|body| body.as_ref().map(|(font, _)| font.clone()))
+        .unwrap_or_else(|| "Segoe UI".to_owned())
+}
+
+/// The default body size in half-points (`22` = 11 pt).
+pub fn body_size() -> i32 {
+    BODY.read()
+        .ok()
+        .and_then(|body| body.as_ref().map(|(_, size)| *size))
+        .unwrap_or(22)
+}
 const CODE_SIZE: i32 = 20;
 /// RTF half-point size per heading level; 400/320/280/250 twips.
 const HEADING_SIZES: [i32; 4] = [40, 32, 28, 25];
@@ -57,6 +81,8 @@ enum Block {
         numbered: bool,
         level: usize,
         runs: Vec<Run>,
+        /// A task-list item (`- [ ]` / `- [x]`): a checklist box, ticked or not.
+        check: Option<bool>,
     },
     Quote(Vec<Run>),
     Code {
@@ -65,6 +91,7 @@ enum Block {
     },
     Table(Vec<Vec<Vec<Run>>>),
     Rule,
+    PageBreak,
 }
 
 /// Converts Markdown to an RTF document. `width_twips` is the editor's text
@@ -78,6 +105,143 @@ pub fn markdown_to_rtf(markdown: &str, width_twips: i32) -> String {
     }
     out.push('}');
     out
+}
+
+/// Characters that only draw a table's frame (box drawing, ASCII borders).
+fn is_border_char(ch: char) -> bool {
+    matches!(ch, '-' | '=' | '+' | '|' | ':' | ' ' | '\t' | '\\')
+        || ('\u{2500}'..='\u{257F}').contains(&ch)
+}
+
+/// A line that is only a table border (`+----+`, `├────┼────┤`, `|---|`).
+fn is_border_line(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty()
+        && line.chars().all(is_border_char)
+        && line
+            .chars()
+            .filter(|ch| matches!(ch, '-' | '=' | '─' | '━' | '═'))
+            .count()
+            >= 3
+}
+
+/// The cells of a table row separated by `|` or `│`, without the frame's
+/// empty first/last cells; `None` when the line has no separators.
+fn text_table_cells(line: &str) -> Option<Vec<String>> {
+    // Terminal copies often end every row with a wrap marker.
+    let line = line.trim_end().trim_end_matches('\\').trim_end();
+    let separators = line
+        .chars()
+        .filter(|ch| matches!(ch, '|' | '│' | '┃' | '║'))
+        .count();
+    if separators < 2 {
+        return None;
+    }
+    let mut cells: Vec<String> = line
+        .split(['|', '│', '┃', '║'])
+        .map(|cell| cell.trim().to_owned())
+        .collect();
+    if cells.first().is_some_and(String::is_empty) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(String::is_empty) {
+        cells.pop();
+    }
+    (cells.len() >= 2).then_some(cells)
+}
+
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(
+            ch,
+            '\\' | '*' | '_' | '[' | ']' | '#' | '>' | '`' | '|' | '~' | '$'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Plain text with a table drawn in characters — terminal output such as
+/// `pm2 ls`, `docker ps` or MySQL, with `|`/`│` columns and `+---+`/`├──┤`
+/// borders — as Markdown with a real table, so it pastes as a Nodi table.
+/// The lines before and after the table stay ordinary paragraphs. `None`
+/// when the text is not such a table (Markdown tables are handled by the
+/// Markdown paste already).
+pub fn text_table_markdown(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let is_row = |line: &str| text_table_cells(line).is_some() && !is_border_line(line);
+    // The longest run of rows and borders.
+    let mut best: Option<(usize, usize)> = None;
+    let mut start = None;
+    for index in 0..=lines.len() {
+        let inside = index < lines.len() && (is_row(lines[index]) || is_border_line(lines[index]));
+        match (inside, start) {
+            (true, None) => start = Some(index),
+            (false, Some(first)) => {
+                let rows = lines[first..index]
+                    .iter()
+                    .filter(|line| is_row(line))
+                    .count();
+                if rows >= 2 && best.is_none_or(|(a, b)| index - first > b - a) {
+                    best = Some((first, index));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    let (first, last) = best?;
+    let block = &lines[first..last];
+    // A Markdown table (`|---|` right after the header) needs no help.
+    let markdown_table = block.len() >= 2
+        && block[0].trim_start().starts_with('|')
+        && block[1].trim().starts_with('|')
+        && block[1].contains("--")
+        && !block
+            .iter()
+            .any(|line| line.contains('│') || line.trim().starts_with('+'));
+    if markdown_table {
+        return None;
+    }
+    let rows: Vec<Vec<String>> = block
+        .iter()
+        .filter(|line| is_row(line))
+        .filter_map(|line| text_table_cells(line))
+        .collect();
+    let columns = rows.iter().map(Vec::len).max()?;
+    let mut out = String::new();
+    for line in &lines[..first] {
+        if !line.trim().is_empty() {
+            out.push_str(&escape_markdown(line.trim_end()));
+        }
+        out.push_str("\n\n");
+    }
+    for (index, row) in rows.iter().enumerate() {
+        out.push('|');
+        for column in 0..columns {
+            let cell = row.get(column).map(String::as_str).unwrap_or("");
+            out.push(' ');
+            out.push_str(&escape_markdown(cell));
+            out.push_str(" |");
+        }
+        out.push('\n');
+        if index == 0 {
+            out.push('|');
+            out.push_str(&"---|".repeat(columns));
+            out.push('\n');
+        }
+    }
+    for line in &lines[last..] {
+        out.push('\n');
+        if !line.trim().is_empty() {
+            out.push_str(&escape_markdown(line.trim_end()));
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 /// Plain text that carries at least two Markdown signals (or a code fence) is
@@ -186,6 +350,11 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
             index += 1;
             continue;
         }
+        if is_page_break(trimmed) {
+            blocks.push(Block::PageBreak);
+            index += 1;
+            continue;
+        }
         if is_rule(trimmed) {
             blocks.push(Block::Rule);
             index += 1;
@@ -238,10 +407,17 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
                 }
                 break;
             }
+            let content = content.trim();
+            let (check, content) = match content.get(..4) {
+                Some("[ ] ") if !numbered => (Some(false), &content[4..]),
+                Some("[x] " | "[X] ") if !numbered => (Some(true), &content[4..]),
+                _ => (None, content),
+            };
             blocks.push(Block::List {
                 numbered,
                 level,
-                runs: parse_inline(content.trim()),
+                runs: parse_inline(content),
+                check,
             });
             continue;
         }
@@ -307,6 +483,19 @@ fn heading(line: &str) -> Option<usize> {
     }
 }
 
+/// A page break: the HTML `markdown::PAGE_BREAK` writes (any spacing or
+/// case), or LaTeX's `\pagebreak` / `\newpage`.
+fn is_page_break(line: &str) -> bool {
+    let compact: String = line
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    compact.starts_with("<divstyle=\"page-break-after:always")
+        || compact == "\\pagebreak"
+        || compact == "\\newpage"
+}
+
 fn is_rule(line: &str) -> bool {
     if line.len() < 3 {
         return false;
@@ -326,7 +515,7 @@ fn is_rule(line: &str) -> bool {
 fn list_marker(line: &str) -> Option<(bool, usize, &str)> {
     let indent = line.len() - line.trim_start().len();
     let rest = &line[indent..];
-    let level = (indent / 2 + 1).min(3);
+    let level = (indent / 2 + 1).min(9);
     let (numbered, after) = if let Some(after) = rest
         .strip_prefix("- ")
         .or_else(|| rest.strip_prefix("* "))
@@ -599,6 +788,7 @@ fn link_at(chars: &[char], start: usize) -> Option<(usize, String, String)> {
 // ------------------------------------------------------------------- RTF output
 
 fn header() -> String {
+    let body_font = body_font();
     let mut colours = String::from("{\\colortbl ;");
     // 1..=5: light block, 6..=11: output block (same as format.rs).
     for (red, green, blue) in [
@@ -620,33 +810,51 @@ fn header() -> String {
     colours.push('}');
     format!(
         "{{\\rtf1\\ansi\\ansicpg1252\\deff0\\uc1\
-         {{\\fonttbl{{\\f0\\fnil\\fcharset0 {BODY_FONT};}}{{\\f1\\fmodern\\fcharset0 {CODE_FONT};}}\
+         {{\\fonttbl{{\\f0\\fnil\\fcharset0 {body_font};}}{{\\f1\\fmodern\\fcharset0 {CODE_FONT};}}\
          {{\\f2\\fnil\\fcharset2 Symbol;}}}}{colours}\\viewkind4"
     )
 }
 
 fn push_block(out: &mut String, block: &Block, width: i32) {
+    let body_size = body_size();
     match block {
         Block::Heading(level, runs) => {
             let size = HEADING_SIZES[level.saturating_sub(1).min(3)];
             out.push_str(&format!("\\pard\\sa120\\sb120\\f0\\fs{size}\\b "));
             push_runs(out, runs, true, size);
-            out.push_str(&format!("\\b0\\fs{BODY_SIZE}\\par\n"));
+            out.push_str(&format!("\\b0\\fs{body_size}\\par\n"));
         }
         Block::Paragraph(runs) => {
-            out.push_str(&format!("\\pard\\sa0\\sb0\\f0\\fs{BODY_SIZE} "));
-            push_runs(out, runs, false, BODY_SIZE);
+            out.push_str(&format!("\\pard\\sa0\\sb0\\f0\\fs{body_size} "));
+            push_runs(out, runs, false, body_size);
             out.push_str("\\par\n");
         }
         Block::Quote(runs) => {
             out.push_str("\\pard\\sa0\\sb0\\li360\\ri360\\i ");
-            push_runs(out, runs, false, BODY_SIZE);
+            push_runs(out, runs, false, body_size);
             out.push_str("\\i0\\par\n");
+        }
+        Block::List {
+            level,
+            runs,
+            check: Some(ticked),
+            ..
+        } => {
+            // A checklist item: the box is a literal glyph + tab with a
+            // hanging indent, as Nodi's editor writes it.
+            let indent = level.saturating_sub(1) as i32 * INDENT + INDENT;
+            let glyph = if *ticked { 9745 } else { 9744 };
+            out.push_str(&format!(
+                "\\pard\\fi-{INDENT}\\li{indent}\\f0\\fs{body_size} \\u{glyph}?\\tab "
+            ));
+            push_runs(out, runs, false, body_size);
+            out.push_str("\\par\n");
         }
         Block::List {
             numbered,
             level,
             runs,
+            check: None,
         } => {
             let indent = level.saturating_sub(1) as i32 * INDENT + INDENT;
             // Shape Rich Edit itself writes: a `\pntext` marker plus a
@@ -664,14 +872,15 @@ fn push_block(out: &mut String, block: &Block, width: i32) {
                 )
             };
             out.push_str(&format!(
-                "\\pard{marker}{definition}\\fi-{INDENT}\\li{indent}\\f0\\fs{BODY_SIZE} "
+                "\\pard{marker}{definition}\\fi-{INDENT}\\li{indent}\\f0\\fs{body_size} "
             ));
-            push_runs(out, runs, false, BODY_SIZE);
+            push_runs(out, runs, false, body_size);
             out.push_str("\\par\n");
         }
         Block::Code { language, text } => push_code(out, language, text, width),
         Block::Table(rows) => push_table(out, rows, width),
         Block::Rule => push_rule(out, width),
+        Block::PageBreak => push_page_break(out, width),
     }
 }
 
@@ -733,6 +942,7 @@ fn push_runs(out: &mut String, runs: &[Run], bold: bool, base_size: i32) {
 }
 
 fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
+    let body_size = body_size();
     let label = match language.trim() {
         "" => "code",
         other => other,
@@ -770,11 +980,12 @@ fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
         "\\trowd\\trgaph108\\trleft0\\clcbpat1\\clbrdrt{border}\\clbrdrl{border}\
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}\
          \\pard\\intbl\\f1\\fs20\\cf12{tabs} {cell}\\cell\\row\n\
-         \\pard\\f0\\fs{BODY_SIZE}\\cf0\\par\n"
+         \\pard\\f0\\fs{body_size}\\cf0\\par\n"
     ));
 }
 
 fn push_table(out: &mut String, rows: &[Vec<Vec<Run>>], width: i32) {
+    let body_size = body_size();
     let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
     let column = width / columns as i32;
     let empty: Vec<Run> = Vec::new();
@@ -791,14 +1002,25 @@ fn push_table(out: &mut String, rows: &[Vec<Vec<Run>>], width: i32) {
                 column * index as i32
             ));
         }
-        out.push_str(&format!("\\pard\\intbl\\f0\\fs{BODY_SIZE}\\cf0 "));
+        out.push_str(&format!("\\pard\\intbl\\f0\\fs{body_size}\\cf0 "));
         for cell in cells.iter() {
-            push_runs(out, cell, false, BODY_SIZE);
+            push_runs(out, cell, false, body_size);
             out.push_str("\\cell ");
         }
         out.push_str("\\row\n");
     }
-    out.push_str(&format!("\\pard\\f0\\fs{BODY_SIZE}\\cf0\\par\n"));
+    out.push_str(&format!("\\pard\\f0\\fs{body_size}\\cf0\\par\n"));
+}
+
+fn push_page_break(out: &mut String, width: i32) {
+    let (picture_width, picture_height) = crate::image::PAGE_BREAK_SIZE;
+    out.push_str(&format!(
+        "\\pard\\sa0\\sb0{{\\pict\\pngblip\\picw{picture_width}\\pich{picture_height}\\picwgoal{width}\\pichgoal360 "
+    ));
+    for byte in crate::image::page_break_png() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out.push_str("}\\par\n");
 }
 
 fn push_rule(out: &mut String, width: i32) {
@@ -843,6 +1065,44 @@ fn escape(out: &mut String, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_tables_become_markdown_tables() {
+        let pm2 = "performa@host:~$ pm2 ls\n\
+            ┌────┬──────────┬────────┐\\\n\
+            │ id │ name     │ status │\\\n\
+            ├────┼──────────┼────────┤\\\n\
+            │ 14 │ event    │ online │\\\n\
+            │ 13 │ runner   │ online │\\\n\
+            └────┴──────────┴────────┘\\\n\
+            performa@host:~$";
+        let markdown = text_table_markdown(pm2).expect("a table");
+        // Escaped for Markdown; the paste shows `performa@host:~$ pm2 ls`.
+        assert!(
+            markdown.starts_with(r"performa@host:\~\$ pm2 ls"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("| id | name | status |\n|---|---|---|\n"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("| 13 | runner | online |"), "{markdown}");
+        assert!(
+            markdown.trim_end().ends_with(r"performa@host:\~\$"),
+            "{markdown}"
+        );
+        let rtf = markdown_to_rtf(&markdown, 9000);
+        assert!(rtf.contains("performa@host:~$ pm2 ls"), "{rtf}");
+        assert!(rtf.contains(r"\cell"), "{rtf}");
+
+        let mysql = "+----+-------+\n| id | title |\n+----+-------+\n|  1 | a_b   |\n|  2 | c     |\n+----+-------+";
+        let markdown = text_table_markdown(mysql).expect("a table");
+        assert!(markdown.contains("| 1 | a\\_b |"), "{markdown}");
+
+        // Markdown tables and prose are left to the other paste paths.
+        assert!(text_table_markdown("| a | b |\n|---|---|\n| 1 | 2 |").is_none());
+        assert!(text_table_markdown("just a line | with a pipe\nand more").is_none());
+    }
     use crate::markdown::rtf_to_markdown;
 
     fn convert(markdown: &str) -> String {

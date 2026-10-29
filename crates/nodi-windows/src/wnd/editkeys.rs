@@ -1,11 +1,15 @@
 //! Keyboard behaviour of the note editor, layered over Rich Edit with a window
 //! subclass:
 //!
-//! * Typing `- `, `* `, `1. ` or `1) ` at the start of a paragraph turns it
-//!   into a list item; Ctrl+Z right after restores the typed text.
+//! * Typing `- `, `* `, `1. `, `1) `, `[ ] ` or `[x] ` at the start of a
+//!   paragraph turns it into a list item or checklist item, at the
+//!   paragraph's own indent; Ctrl+Z right after restores the typed text.
 //! * In a list item Enter starts the next item, Enter on an empty item ends the
-//!   list, Tab/Shift+Tab nest/unnest and Backspace at the start removes the
-//!   bullet but keeps the indentation.
+//!   list, Tab/Shift+Tab nest/unnest (any depth) and Backspace at the start of
+//!   the text removes the bullet, number or box but keeps the indentation.
+//! * Clicking a checklist box, or Ctrl+Enter in its item, ticks it.
+//! * Two spaces typed quickly after a word become ". " (like a phone
+//!   keyboard); a pause between them keeps two spaces.
 //! * Tab at the start of an ordinary paragraph (or on a multi-line selection)
 //!   changes the paragraph start indent, so wrapped lines stay aligned.
 //! * Typing `# ` … `#### ` at the start of a paragraph makes a heading, and
@@ -21,8 +25,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_BACK, VK_CONTROL, VK_DOWN, VK_INSERT, VK_MENU, VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_PASTE,
+    PostMessageW, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_PASTE,
 };
 
 use crate::wnd::{editor, format, image, link};
@@ -44,6 +49,18 @@ thread_local! {
     static MARKER_UNDO: RefCell<Option<MarkerUndo>> = const { RefCell::new(None) };
     /// View > "Ctrl+Up/Down Scrolls the View" (mirrors `Settings`).
     static CTRL_ARROW_SCROLL: Cell<bool> = const { Cell::new(true) };
+    /// Preferences > "Two quick spaces type a period" (mirrors `Settings`).
+    static DOUBLE_SPACE_PERIOD: Cell<bool> = const { Cell::new(true) };
+    /// Message time and caret after the last plain space typed, for the
+    /// double-space period.
+    static LAST_SPACE: Cell<Option<(u32, i32)>> = const { Cell::new(None) };
+}
+
+/// Longest pause between the two spaces that still makes a period.
+const DOUBLE_SPACE_MS: u32 = 400;
+
+pub fn set_double_space_period(enabled: bool) {
+    DOUBLE_SPACE_PERIOD.with(|flag| flag.set(enabled));
 }
 
 /// Ctrl+Up/Down scroll the view by one line without moving the caret
@@ -123,6 +140,17 @@ unsafe extern "system" fn subclass(
     let ctrl = key_down(VK_CONTROL);
     let shift = key_down(VK_SHIFT);
     let alt = key_down(VK_MENU);
+    // A locked note: Rich Edit itself refuses typing; Nodi's own editing
+    // (list Enter/Backspace, markers, paste conversions, checkbox clicks)
+    // must not change it either. Scrolling and selecting still work.
+    if editor::is_read_only(hwnd) {
+        let editing_key = msg == WM_KEYDOWN
+            && matches!(wparam as u16, VK_RETURN | VK_BACK | VK_INSERT)
+            || (msg == WM_KEYDOWN && ctrl && wparam as u16 == u16::from(b'V'));
+        if msg == WM_CHAR || msg == WM_PASTE || msg == WM_LBUTTONDOWN || editing_key {
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
+    }
     match msg {
         WM_CHAR => {
             let ch = wparam as u32;
@@ -133,6 +161,10 @@ unsafe extern "system" fn subclass(
             // marker; it is converted before Rich Edit inserts the space.
             if ch == 0x20 && !ctrl && !alt {
                 if space_marker(hwnd, shift) {
+                    LAST_SPACE.with(|last| last.set(None));
+                    return 0;
+                }
+                if double_space_period(hwnd) {
                     return 0;
                 }
                 // A full local path just typed becomes a link; the space is
@@ -157,6 +189,9 @@ unsafe extern "system" fn subclass(
             } else if ch >= 0x20 {
                 clear_marker_undo();
             }
+            if ch != 0x20 {
+                LAST_SPACE.with(|last| last.set(None));
+            }
         }
         WM_KEYDOWN => {
             let key = wparam as u16;
@@ -172,12 +207,28 @@ unsafe extern "system" fn subclass(
             if ctrl || alt {
                 if key == VK_RETURN {
                     clear_marker_undo();
+                    let (from, _) = editor::selection(hwnd);
+                    if ctrl && !alt && !shift {
+                        // Ctrl+Enter ticks a checklist item; anywhere else
+                        // outside tables it starts a new page (as in Word).
+                        if !format::toggle_check_at(hwnd, from) && !editor::in_table(hwnd) {
+                            format::insert_page_break(hwnd);
+                        }
+                        return 0;
+                    }
                 }
             } else if key == VK_RETURN && !shift {
                 // Finish a typed path before the paragraph break splits it.
                 link::auto_link_before_caret(hwnd);
                 if newline_keep_indent(hwnd) {
                     return 0;
+                }
+                if format::list_kind(hwnd) == Some(format::ListKind::Numbered) {
+                    // The new item copies the old one's paragraph format,
+                    // including an explicit start number: count again.
+                    let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                    format::after_new_numbered_item(hwnd);
+                    return result;
                 }
             } else if key == VK_BACK && !shift && backspace_key(hwnd) {
                 return 0;
@@ -196,6 +247,24 @@ unsafe extern "system" fn subclass(
             clear_marker_undo();
             if paste_special(hwnd, frame as HWND, false) {
                 return 0;
+            }
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_PAINT if crate::wnd::pattern::active() => {
+            if crate::wnd::pattern::paint(hwnd, format::editor_dpi(hwnd)) {
+                return 0;
+            }
+        }
+        WM_LBUTTONDOWN if !ctrl && !shift => {
+            // A click on a checklist box ticks it and leaves the caret alone.
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            if let Some(start) =
+                editor::char_at_point(hwnd, x, y).and_then(|pos| format::checkbox_at(hwnd, pos))
+            {
+                if editor::point_on_char(hwnd, start, x, y) {
+                    format::toggle_check_at(hwnd, start);
+                    return 0;
+                }
             }
         }
         WM_LBUTTONDBLCLK => {
@@ -234,13 +303,20 @@ fn space_marker(editor: HWND, _shift: bool) -> bool {
         return false;
     }
     let start = editor::paragraph_start(editor, from);
-    let head = editor::text_range(editor, start, from);
+    // Inside a deeper bullet or checklist item the typed marker follows the
+    // item's own marker; it then changes that item's kind.
+    let content = format::literal_marker_end(editor)
+        .filter(|end| *end <= from)
+        .unwrap_or(start);
+    let head = editor::text_range(editor, content, from);
     if head.is_empty() {
         return false;
     }
-    let (numbered, marker) = match head.as_str() {
-        "-" | "*" => (false, format!("{head} ")),
-        "1." | "1)" => (true, format!("{head} ")),
+    let (kind, ticked) = match head.as_str() {
+        "-" | "*" => (format::ListKind::Bullet, false),
+        "1." | "1)" => (format::ListKind::Numbered, false),
+        "[]" | "[ ]" => (format::ListKind::Check, false),
+        "[x]" | "[X]" => (format::ListKind::Check, true),
         _ => {
             let hashes = head.bytes().take_while(|byte| *byte == b'#').count();
             if hashes == head.len() && (1..=4).contains(&hashes) {
@@ -254,11 +330,54 @@ fn space_marker(editor: HWND, _shift: bool) -> bool {
             return false;
         }
     };
-    editor::set_selection(editor, start, from);
+    let marker = format!("{head} ");
+    let level = format::list_level(editor);
+    editor::set_selection(editor, content, from);
     editor::replace_selection(editor, "", true);
-    format::start_list(editor, numbered);
-    remember_marker(editor, start, marker);
-    editor::set_selection(editor, start, start);
+    if level > 0 {
+        format::apply_list_level(editor, kind, level);
+    } else {
+        format::start_list(editor, kind);
+    }
+    if ticked {
+        format::toggle_check_at(editor, start);
+    }
+    if level == 0 {
+        remember_marker(editor, start, marker);
+    }
+    let caret = format::literal_marker_end(editor).unwrap_or(start);
+    editor::set_selection(editor, caret, caret);
+    true
+}
+
+/// The second of two quickly typed spaces after a word replaces the first
+/// with ". ". Returns true when it did.
+fn double_space_period(editor: HWND) -> bool {
+    // SAFETY: plain query of the current message's time stamp.
+    let now = unsafe { GetMessageTime() } as u32;
+    let (from, to) = editor::selection(editor);
+    let last = LAST_SPACE.with(|last| last.replace(Some((now, from + 1))));
+    if !DOUBLE_SPACE_PERIOD.with(|flag| flag.get()) || from != to || from < 2 {
+        return false;
+    }
+    let Some((time, caret)) = last else {
+        return false;
+    };
+    if caret != from || now.wrapping_sub(time) > DOUBLE_SPACE_MS || format::in_code(editor) {
+        return false;
+    }
+    // Only right after a word: "word␣" becomes "word. ", never ".␣" or "␣␣".
+    let before = editor::text_range(editor, from - 2, from);
+    let mut chars = before.chars();
+    let (Some(word), Some(' ')) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    if !word.is_alphanumeric() {
+        return false;
+    }
+    editor::set_selection(editor, from - 1, from);
+    editor::replace_selection(editor, ". ", true);
+    LAST_SPACE.with(|last| last.set(None));
     true
 }
 
@@ -334,6 +453,12 @@ fn backspace_key(editor: HWND) -> bool {
     }
     let start = editor::paragraph_start(editor, from);
     if from != start {
+        // Right after a literal marker (deeper bullet, checkbox) the text
+        // starts here: remove the marker like a native bullet or number.
+        if format::literal_marker_end(editor) == Some(from) {
+            clear_marker_undo();
+            return format::remove_list_marker(editor);
+        }
         return false;
     }
     clear_marker_undo();
@@ -361,16 +486,16 @@ pub fn tab_key(editor: HWND, outdent: bool) -> bool {
         return code_tab_key(editor, outdent);
     }
 
-    if let Some(numbered) = format::list_kind(editor) {
+    if let Some(kind) = format::list_kind(editor) {
         let level = format::list_level(editor).max(1);
         if outdent {
             if level <= 1 {
                 format::remove_list_marker(editor);
             } else {
-                format::apply_list_level(editor, numbered, level - 1);
+                format::apply_list_level(editor, kind, level - 1);
             }
         } else {
-            format::apply_list_level(editor, numbered, (level + 1).min(3));
+            format::apply_list_level(editor, kind, level + 1);
         }
         return true;
     }
@@ -545,6 +670,17 @@ fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
         }
         return true;
     }
+    // Terminal output with a drawn table (pm2, docker, MySQL...) becomes a
+    // real table, whatever other formats the terminal put on the clipboard.
+    if !format::in_code(editor) && !editor::in_table(editor) {
+        if let Some(markdown) = image::clipboard_text(frame)
+            .and_then(|text| nodi_core::markdown_in::text_table_markdown(&text))
+        {
+            if paste_markdown(editor, frame, &markdown) {
+                return true;
+            }
+        }
+    }
     if !image::clipboard_is_image_only() {
         // Rich Text Format wins: Rich Edit pastes it natively, unchanged.
         if !image::clipboard_has_rtf() {
@@ -578,15 +714,116 @@ fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
     }
 }
 
+/// Pictures `![alt](target)` in pasted Markdown: embedded `data:` pictures,
+/// local files and web addresses (downloaded through WinHTTP). Each one that
+/// could be read becomes a placeholder `U+E002 n U+E003`; the rest stay
+/// links. At most a dozen pictures of 15 MB each.
+fn take_pictures(markdown: &str) -> (String, Vec<Vec<u8>>) {
+    const MAX_PICTURES: usize = 12;
+    const MAX_BYTES: usize = 15 * 1024 * 1024;
+    let mut pictures = Vec::new();
+    let mut text = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(at) = rest.find("![") {
+        text.push_str(&rest[..at]);
+        let candidate = &rest[at..];
+        let parsed = candidate.find("](").and_then(|middle| {
+            let close = candidate[middle + 2..].find(')')? + middle + 2;
+            let target = candidate[middle + 2..close]
+                .split_whitespace()
+                .next()?
+                .trim_matches(['<', '>'])
+                .to_owned();
+            Some((close, target))
+        });
+        let bytes = parsed.as_ref().and_then(|(_, target)| {
+            if pictures.len() >= MAX_PICTURES {
+                return None;
+            }
+            let bytes = if let Some(bytes) = nodi_core::links::data_uri_bytes(target) {
+                Some(bytes)
+            } else if target.starts_with("http://") || target.starts_with("https://") {
+                crate::wnd::net::get(target, MAX_BYTES)
+            } else {
+                nodi_core::links::local_path(target)
+                    .and_then(|path| std::fs::read(path).ok())
+                    .filter(|bytes| bytes.len() <= MAX_BYTES)
+            };
+            bytes.filter(|bytes| nodi_core::image::sniff(bytes).is_some())
+        });
+        match (parsed, bytes) {
+            (Some((close, _)), Some(bytes)) => {
+                text.push('\u{E002}');
+                text.push_str(&pictures.len().to_string());
+                text.push('\u{E003}');
+                pictures.push(bytes);
+                rest = &candidate[close + 1..];
+            }
+            _ => {
+                text.push_str("![");
+                rest = &candidate[2..];
+            }
+        }
+    }
+    text.push_str(rest);
+    (text, pictures)
+}
+
+/// Replaces the picture placeholders [`take_pictures`] left in the note with
+/// the pictures themselves. Returns how many went in.
+fn insert_pictures(editor: HWND, pictures: &[Vec<u8>]) -> usize {
+    let mut inserted = 0;
+    let mut caret = editor::selection(editor).1;
+    for _ in 0..pictures.len() {
+        let raw = editor::raw_text(editor);
+        let Some(start) = raw.iter().position(|unit| *unit == 0xE002) else {
+            break;
+        };
+        let Some(length) = raw[start..].iter().position(|unit| *unit == 0xE003) else {
+            break;
+        };
+        let end = start + length;
+        let index: usize = String::from_utf16_lossy(&raw[start + 1..end])
+            .parse()
+            .unwrap_or(usize::MAX);
+        let before = editor::text_length(editor);
+        editor::set_selection(editor, start as i32, end as i32 + 1);
+        editor::replace_selection(editor, "", true);
+        if let Some(bytes) = pictures.get(index) {
+            if image::insert_bytes(editor, bytes).is_ok() {
+                inserted += 1;
+            }
+        }
+        caret += editor::text_length(editor) - before;
+    }
+    editor::set_selection(editor, caret, caret);
+    inserted
+}
+
 /// Converts Markdown to the RTF Nodi uses and inserts it at the caret, then
-/// renders the formulas it carried.
+/// renders the formulas and pictures it carried.
 fn paste_markdown(editor: HWND, frame: HWND, markdown: &str) -> bool {
     if markdown.trim().is_empty() {
         return false;
     }
-    let rtf = nodi_core::markdown_in::markdown_to_rtf(markdown, format::full_width_twips(editor));
+    let (markdown, pictures) = if markdown.contains("![") {
+        take_pictures(markdown)
+    } else {
+        (markdown.to_owned(), Vec::new())
+    };
+    let rtf = nodi_core::markdown_in::markdown_to_rtf(&markdown, format::full_width_twips(editor));
     if !editor::insert_rtf(editor, rtf.as_bytes()) {
         return false;
+    }
+    let pictures = if pictures.is_empty() {
+        0
+    } else {
+        insert_pictures(editor, &pictures)
+    };
+    if pictures > 0 {
+        if let Some(app) = unsafe { crate::wnd::app_mut(frame) } {
+            crate::wnd::status::set_message(app, &format!("Pasted with {pictures} picture(s)"));
+        }
     }
     let (rendered, kept) = crate::wnd::formula::render_pasted(editor);
     if rendered > 0 || !kept.is_empty() {

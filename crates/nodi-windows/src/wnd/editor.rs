@@ -7,7 +7,7 @@
 use std::mem::size_of;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{HWND, POINTL};
 use windows_sys::Win32::UI::Controls::EM_SETMARGINS;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -278,6 +278,7 @@ pub fn create(app: &App) -> Option<HWND> {
     set_background(window, app.palette.editor_bg);
     apply_default_colour(window);
     set_spell_check(window, app.settings.spell_check);
+    set_beeps(window, app.settings.sounds);
     if app.zoom != 100 {
         set_zoom_percent(window, app.zoom);
     }
@@ -289,11 +290,11 @@ fn apply_default_format(window: HWND) {
     let mut format = CharFormat2W {
         cb_size: size_of::<CharFormat2W>() as u32,
         dw_mask: CFM_FACE | CFM_SIZE | CFM_CHARSET,
-        y_height: 220, // 11 pt, in twips
-        b_char_set: 1, // DEFAULT_CHARSET
+        y_height: crate::wnd::format::body_size(), // twips
+        b_char_set: 1,                             // DEFAULT_CHARSET
         ..CharFormat2W::default()
     };
-    let face: Vec<u16> = "Segoe UI".encode_utf16().collect();
+    let face: Vec<u16> = crate::wnd::format::body_font().encode_utf16().collect();
     for (slot, unit) in format.sz_face_name.iter_mut().zip(face) {
         *slot = unit;
     }
@@ -327,6 +328,7 @@ pub fn set_change_events(editor: HWND, enabled: bool) {
 
 /// Sets the editor background (`EM_SETBKGNDCOLOR`).
 pub fn set_background(editor: HWND, colour: u32) {
+    let colour = crate::wnd::pattern::key_colour(colour);
     // SAFETY: `editor` is a live Rich Edit control.
     unsafe {
         SendMessageW(editor, EM_SETBKGNDCOLOR, 0, colour as isize);
@@ -382,6 +384,11 @@ pub fn load_rtf(editor: HWND, bytes: &[u8]) -> bool {
     }
     let ok = stream_in(editor, bytes, SF_RTF);
     apply_default_colour(editor);
+    // RTF does not keep where a nested numbered list starts again at 1
+    // (every load: opening a note, a theme change, a restore).
+    if bytes.windows(6).any(|window| window == br"\pndec") {
+        crate::wnd::format::renumber(editor);
+    }
 
     // SAFETY: the control is alive and owned by us.
     unsafe {
@@ -994,6 +1001,11 @@ pub fn command(app: &mut App, id: u16) {
         status::set_message(app, "No note open");
         return;
     };
+    // Copy and Select All stay available in a locked note.
+    let changes = !matches!(id, menu::IDM_EDIT_COPY | menu::IDM_EDIT_SELECT_ALL);
+    if changes && refuse_if_locked(app) {
+        return;
+    }
 
     // SAFETY: `editor` is a live Rich Edit control owned by this process.
     unsafe {
@@ -1120,6 +1132,9 @@ pub fn set_zoom_percent(editor: HWND, percent: i32) {
 /// Toggles bold/italic/underline/strikethrough on the current selection (or on
 /// the insertion point when there is no selection).
 pub fn toggle_effect(app: &mut App, id: u16) {
+    if refuse_if_locked(app) {
+        return;
+    }
     let (mask, effect) = match id {
         menu::IDM_FORMAT_BOLD => (CFM_BOLD, CFE_BOLD),
         menu::IDM_FORMAT_ITALIC => (CFM_ITALIC, CFE_ITALIC),
@@ -1164,4 +1179,118 @@ pub fn toggle_effect(app: &mut App, id: u16) {
 
     app.mark_dirty(editor);
     crate::wnd::toolbar::sync_format(app);
+}
+
+const EM_CHARFROMPOS: u32 = 0x00D7;
+const EM_POSFROMCHAR: u32 = 0x00D6;
+
+/// Character nearest to the client point `(x, y)`.
+pub fn char_at_point(editor: HWND, x: i32, y: i32) -> Option<i32> {
+    let point = POINTL { x, y };
+    // SAFETY: Rich Edit reads the POINTL for the duration of the call.
+    let pos =
+        unsafe { SendMessageW(editor, EM_CHARFROMPOS, 0, &point as *const POINTL as isize) as i32 };
+    (pos >= 0).then_some(pos)
+}
+
+/// Client position of the top-left corner of character `pos`.
+pub fn char_point(editor: HWND, pos: i32) -> (i32, i32) {
+    let mut point = POINTL { x: 0, y: 0 };
+    // SAFETY: `point` is a valid out parameter.
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_POSFROMCHAR,
+            &mut point as *mut POINTL as usize,
+            pos as isize,
+        );
+    }
+    (point.x, point.y)
+}
+
+/// True when the client point `(x, y)` lies on character `pos` itself (not
+/// just nearest to it): between its left edge and the next character's.
+pub fn point_on_char(editor: HWND, pos: i32, x: i32, y: i32) -> bool {
+    let (left, top) = char_point(editor, pos);
+    let (right, _) = char_point(editor, pos + 1);
+    x >= left && x < right.max(left + 1) && y >= top
+}
+
+const EM_SETREADONLY: u32 = 0x00CF;
+
+/// Read-only for locked notes (typing, pasting and formatting are refused).
+pub fn set_read_only(editor: HWND, read_only: bool) {
+    // SAFETY: plain message to our own control.
+    unsafe {
+        SendMessageW(editor, EM_SETREADONLY, usize::from(read_only), 0);
+    }
+}
+
+const EM_SETEDITSTYLE: u32 = WM_USER + 204;
+const SES_ALLOWBEEPS: usize = 0x0000_0100;
+
+/// Rich Edit's own beeps (e.g. typing into a locked note), off unless
+/// Preferences > Sounds is on.
+pub fn set_beeps(editor: HWND, on: bool) {
+    let flags = if on { SES_ALLOWBEEPS } else { 0 };
+    // SAFETY: plain message to our own control.
+    unsafe {
+        SendMessageW(editor, EM_SETEDITSTYLE, flags, SES_ALLOWBEEPS as isize);
+    }
+}
+
+/// True for a locked note's editor (`EM_SETREADONLY`).
+pub fn is_read_only(editor: HWND) -> bool {
+    // SAFETY: plain style query of our own window.
+    let style = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongW(
+            editor,
+            windows_sys::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+        )
+    };
+    style & 0x0800 != 0 // ES_READONLY
+}
+
+/// Rich Edit refuses typing into a read-only note, but not changes made by
+/// messages (formatting, inserted pictures, Nodi's own key handling). Every
+/// command that changes the active note asks here first; true = refused.
+pub fn refuse_if_locked(app: &mut App) -> bool {
+    let locked = app.active_editor().is_some_and(is_read_only);
+    if locked {
+        status::set_message(
+            app,
+            "This note is locked — right-click it > Unlock to change it",
+        );
+    }
+    locked
+}
+
+const EM_GETEVENTMASK: u32 = WM_USER + 59;
+const ENM_SELCHANGE_BIT: isize = 0x0008_0000;
+
+/// While alive, the editor sends no `EN_SELCHANGE` (internal selection moves
+/// of a long operation must not reach the frame once per paragraph).
+pub struct QuietSelection {
+    editor: HWND,
+    mask: isize,
+}
+
+impl QuietSelection {
+    pub fn new(editor: HWND) -> Self {
+        // SAFETY: plain messages to our own control.
+        let mask = unsafe { SendMessageW(editor, EM_GETEVENTMASK, 0, 0) };
+        unsafe {
+            SendMessageW(editor, EM_SETEVENTMASK, 0, mask & !ENM_SELCHANGE_BIT);
+        }
+        Self { editor, mask }
+    }
+}
+
+impl Drop for QuietSelection {
+    fn drop(&mut self) {
+        // SAFETY: restores the mask read in `new`.
+        unsafe {
+            SendMessageW(self.editor, EM_SETEVENTMASK, 0, self.mask);
+        }
+    }
 }

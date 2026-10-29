@@ -5,10 +5,12 @@
 
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use std::cell::Cell;
+
+use windows_sys::Win32::Foundation::{HWND, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
-    DrawTextW, SelectObject, SetBkMode, SetTextColor, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HGDIOBJ,
-    TRANSPARENT,
+    DrawTextW, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    DT_LEFT, DT_SINGLELINE, DT_VCENTER, HGDIOBJ, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, SBARS_SIZEGRIP, SB_SETPARTS, SB_SETTEXTW, STATUSCLASSNAMEW,
@@ -28,6 +30,43 @@ pub const PART_CARET: usize = 2;
 pub const PART_COUNTS: usize = 3;
 pub const PART_MODE: usize = 4;
 pub const PART_COUNT: usize = 5;
+
+thread_local! {
+    /// Width (pixels) the counts part needs for its current text, so a long
+    /// selection count is never covered by the mode part.
+    static COUNTS_WIDTH: Cell<i32> = const { Cell::new(0) };
+}
+
+/// Pixel width of `text` in the status bar's font.
+fn text_width(status: HWND, text: &str) -> i32 {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    // SAFETY: a DC of our own status bar, released below; the font handle is
+    // the bar's own and is selected back before release.
+    unsafe {
+        let dc = GetDC(status);
+        if dc.is_null() {
+            return 0;
+        }
+        let font = SendMessageW(
+            status,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_GETFONT,
+            0,
+            0,
+        );
+        let old = if font != 0 {
+            SelectObject(dc, font as HGDIOBJ)
+        } else {
+            ptr::null_mut()
+        };
+        let mut size = SIZE { cx: 0, cy: 0 };
+        GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut size);
+        if !old.is_null() {
+            SelectObject(dc, old);
+        }
+        ReleaseDC(status, dc);
+        size.cx
+    }
+}
 
 /// `SB_SETTEXT` flag: the parent draws this part (`WM_DRAWITEM`).
 const SBT_OWNERDRAW: usize = 0x1000;
@@ -105,8 +144,11 @@ pub fn clear_caret(app: &mut App) {
 pub fn update_caret(app: &mut App) {
     let text = match app.active_editor() {
         Some(editor_window) => {
-            let (line, column) = editor::line_col(editor_window);
-            format!("Ln {line}, Col {column}")
+            // Lines are paragraphs, as in the line-number strip, Go to Line
+            // and the Lines count (a wrapped paragraph is one line).
+            let (caret, _) = editor::selection(editor_window);
+            let (line, start) = crate::wnd::gutter::line_of(editor_window, caret);
+            format!("Ln {line}, Col {}", caret - start + 1)
         }
         None => String::new(),
     };
@@ -164,7 +206,16 @@ pub fn update_counts(app: &mut App) {
     let (from, to) = editor::selection(window);
     let note = count_text(&editor::plain_text(window));
     let selection = (from != to).then(|| count_text(&editor::text_range(window, from, to)));
-    set(app, PART_COUNTS, &counts_text(note, selection));
+    let text = counts_text(note, selection);
+    let needed = text_width(app.status, &text) + app.scale(16);
+    let current = COUNTS_WIDTH.with(Cell::get);
+    // Grow at once; shrink only by a clear margin, so the parts do not jump
+    // with every digit.
+    if needed > current || needed + app.scale(60) < current {
+        COUNTS_WIDTH.with(|width| width.set(needed));
+        crate::wnd::relayout_status(app);
+    }
+    set(app, PART_COUNTS, &text);
 }
 
 /// Lines (paragraphs), words and characters in `text`, ignoring line breaks
@@ -256,7 +307,7 @@ pub fn layout_parts(app: &App, width: i32) {
     // Parts: message | save state | Ln/Col | counts | mode. The counts part
     // holds the word/character counts plus the selection counts.
     let mode = app.scale(90);
-    let counts = app.scale(380);
+    let counts = COUNTS_WIDTH.with(Cell::get).max(app.scale(200));
     let caret = app.scale(110);
     let save = app.scale(100);
     let min_width = app.scale(40);

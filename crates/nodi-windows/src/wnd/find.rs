@@ -314,10 +314,36 @@ pub fn replace_all(editor: HWND, find: &str, replace: &str, case: bool, word: bo
 }
 
 /// Search > Search in All Notes...
+/// `…words around the first hit…` of `text` for the results list.
+fn snippet(text: &str, query: &str) -> String {
+    let lower = text.to_lowercase();
+    let Some(at) = lower.find(&query.to_lowercase()) else {
+        return String::new();
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let hit = lower[..at].chars().count();
+    let from = hit.saturating_sub(30);
+    let to = (hit + query.chars().count() + 40).min(chars.len());
+    let mut out: String = chars[from..to]
+        .iter()
+        .map(|ch| if ch.is_whitespace() { ' ' } else { *ch })
+        .collect();
+    out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "{}{out}{}",
+        if from > 0 { "…" } else { "" },
+        if to < chars.len() { "…" } else { "" }
+    )
+}
+
+/// Search > Find Notes (Ctrl+Shift+F): titles of notes and folders and the
+/// text inside every note; the results show where (folder path) and a bit of
+/// the text around the hit.
 pub fn search_all(app: &mut App) {
     let last = LAST.with(|last| last.borrow().as_ref().map(|(text, _, _)| text.clone()));
-    let Some(values) = Form::new("Search in All Notes")
-        .field(Field::new("Find text:", last.unwrap_or_default()))
+    let Some(values) = Form::new("Find Notes")
+        .note("Searches the titles of notes and folders and the text inside every note.")
+        .field(Field::new("Find:", last.unwrap_or_default()))
         .show(app.hwnd)
     else {
         return;
@@ -334,31 +360,76 @@ pub fn search_all(app: &mut App) {
     let Some(data) = app.data.clone() else {
         return;
     };
+    let place = |id: &nodi_core::NoteId| {
+        let path: Vec<String> = app
+            .tree
+            .ancestors(id)
+            .iter()
+            .rev()
+            .filter_map(|ancestor| app.tree.get(ancestor).map(|node| node.title.clone()))
+            .collect();
+        if path.is_empty() {
+            String::new()
+        } else {
+            format!("   [{}]", path.join(" › "))
+        }
+    };
+    let mut entries: Vec<(nodi_core::NoteId, String)> = Vec::new();
+    for node in search::search_titles(&app.tree, &query) {
+        let kind = if node.kind == nodi_core::NodeKind::Folder {
+            "folder"
+        } else {
+            "title"
+        };
+        entries.push((
+            node.id.clone(),
+            format!("{}    ({kind}){}", node.title, place(&node.id)),
+        ));
+    }
     let results = search::search_text(&data, &app.tree, &query);
-    if results.is_empty() {
-        dialogs::info(app.hwnd, &format!("No note contains \"{query}\"."));
+    for (id, hits) in &results {
+        if entries.iter().any(|(entry, _)| entry == id) {
+            continue;
+        }
+        let title = app
+            .tree
+            .get(id)
+            .map(|node| node.title.clone())
+            .unwrap_or_default();
+        let text = data.load_note_text(id).unwrap_or_default();
+        entries.push((
+            id.clone(),
+            format!(
+                "{title}    ({hits} match{}) {}{}",
+                if *hits == 1 { "" } else { "es" },
+                snippet(&text, &query),
+                place(id)
+            ),
+        ));
+    }
+    if entries.is_empty() {
+        dialogs::info(
+            app.hwnd,
+            &format!("No note or folder title and no note text contains \"{query}\"."),
+        );
         return;
     }
-    let entries: Vec<_> = results
-        .iter()
-        .map(|(id, hits)| {
-            let title = app
-                .tree
-                .get(id)
-                .map(|node| node.title.clone())
-                .unwrap_or_default();
-            (
-                id.clone(),
-                format!(
-                    "{title}    ({hits} match{})",
-                    if *hits == 1 { "" } else { "es" }
-                ),
-            )
-        })
-        .collect();
-    let caption = format!("{} note(s) contain \"{query}\"", results.len());
+    let caption = format!("{} result(s) for \"{query}\"", entries.len());
     if let Some(id) = dialogs::pick_note(app.hwnd, &caption, "Filter results:", &entries) {
         app.selected = Some(id.clone());
+        let folder = app
+            .tree
+            .get(&id)
+            .is_some_and(|node| node.kind == nodi_core::NodeKind::Folder);
+        if folder {
+            // A folder is shown in the Notes Explorer, not opened.
+            if let Some(parent) = app.tree.get(&id).and_then(|node| node.parent.clone()) {
+                app.expand(Some(parent));
+            }
+            crate::wnd::tree::select_item(app, &id);
+            crate::wnd::tree::focus_tree(app);
+            return;
+        }
         app.open_note(id);
         LAST.with(|last| *last.borrow_mut() = Some((query.clone(), false, false)));
         if let Some(editor) = app.active_editor() {

@@ -9,24 +9,21 @@ use std::ptr;
 
 use nodi_core::NoteId;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{
-    GetStockObject, InvalidateRect, UpdateWindow, DEFAULT_GUI_FONT, HBRUSH,
-};
+use windows_sys::Win32::Graphics::Gdi::{GetStockObject, UpdateWindow, DEFAULT_GUI_FONT, HBRUSH};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::SystemServices::SS_OWNERDRAW;
 use windows_sys::Win32::UI::Controls::{EM_SETLIMITTEXT, EM_SETSEL};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetActiveWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgItem, GetMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW,
     IsWindow, LoadCursorW, MessageBoxW, RegisterClassExW, SendMessageW, SetWindowLongPtrW,
     ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, ES_AUTOHSCROLL, GWLP_USERDATA, IDCANCEL, IDC_ARROW, IDOK, IDYES, LBN_DBLCLK,
+    CS_VREDRAW, ES_AUTOHSCROLL, GWLP_USERDATA, IDCANCEL, IDC_ARROW, IDNO, IDOK, IDYES, LBN_DBLCLK,
     LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DRAWITEM, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_USER, WNDCLASSEXW, WS_BORDER,
-    WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_CREATE, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 
 use crate::win;
@@ -77,19 +74,6 @@ pub fn ask_yes_no(owner: HWND, text: &str) -> bool {
     message(owner, "Nodi", text, MB_YESNO | MB_ICONWARNING) == IDYES
 }
 
-pub fn recovered(owner: HWND, paths: &[std::path::PathBuf]) {
-    let list = paths
-        .iter()
-        .map(|path| format!("  {}", path.display()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let text = format!(
-        "Nodi moved {} leftover file(s) into recovery/ (nothing was deleted):\n\n{list}",
-        paths.len()
-    );
-    info(owner, &text);
-}
-
 pub fn save_failed(owner: HWND, title: &str, message: &str) {
     let text = format!(
         "\"{title}\" could not be saved:\n{message}\n\n\
@@ -109,11 +93,51 @@ pub fn unsaved_close(owner: HWND, titles: &[String]) -> bool {
     message(owner, "Nodi", &text, MB_YESNO | MB_ICONWARNING) == IDYES
 }
 
+thread_local! {
+    /// Preferences > Sounds. Off (the default): message boxes are Nodi's own
+    /// silent dialog, because every Windows message box plays a system sound.
+    static SOUNDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn set_sounds(on: bool) {
+    SOUNDS.with(|flag| flag.set(on));
+}
+
+pub fn sounds() -> bool {
+    SOUNDS.with(|flag| flag.get())
+}
+
 fn message(owner: HWND, caption: &str, text: &str, style: u32) -> i32 {
+    if !sounds() {
+        return silent_message(owner, caption, text, style);
+    }
     let text = win::wide(text);
     let caption = win::wide(caption);
     // SAFETY: both buffers are NUL terminated and outlive the call.
     unsafe { MessageBoxW(owner, text.as_ptr(), caption.as_ptr(), style) }
+}
+
+/// The same message without a sound: OK, or Yes/No (Esc = No).
+fn silent_message(owner: HWND, caption: &str, text: &str, style: u32) -> i32 {
+    let yes_no = style & 0x0F == MB_YESNO;
+    let lines = text.lines().count();
+    let mut form = crate::wnd::form::Form::new(caption).wide(480);
+    form = if lines > 24 {
+        form.wide(560)
+            .field(crate::wnd::form::Field::multiline("", text, 22))
+    } else {
+        form.note(text)
+    };
+    form = if yes_no {
+        form.button(IDYES, "Yes").button(IDNO, "No")
+    } else {
+        form.button(IDOK, "OK")
+    };
+    match form.show_choice(owner) {
+        Some(id) => id,
+        None if yes_no => IDNO,
+        None => IDOK,
+    }
 }
 
 // ------------------------------------------------------------ modal plumbing
@@ -187,6 +211,9 @@ unsafe fn run_modal(owner: HWND, dialog: HWND) {
         let result = GetMessageW(&mut message, ptr::null_mut(), 0, 0);
         if result <= 0 {
             break;
+        }
+        if crate::wnd::editword::handle(&message) {
+            continue;
         }
         if IsDialogMessageW(dialog, &message) == 0 {
             TranslateMessage(&message);
@@ -581,16 +608,9 @@ unsafe extern "system" fn trash_proc(
                         state.and_then(|state| selected_index(state.list))
                     };
                     if let Some(index) = choice {
-                        let message = "Delete this item permanently?\n\nIts files are moved to \
+                        let question = "Delete this item permanently?\n\nIts files are moved to \
                              data/recovery/ (nothing is deleted).";
-                        let text = win::wide(message);
-                        let caption = win::wide("Nodi");
-                        let answer = MessageBoxW(
-                            hwnd,
-                            text.as_ptr(),
-                            caption.as_ptr(),
-                            MB_YESNO | MB_ICONWARNING,
-                        );
+                        let answer = message(hwnd, "Nodi", question, MB_YESNO | MB_ICONWARNING);
                         if answer == IDYES {
                             if let Some(state) = dialog_state::<TrashState>(hwnd) {
                                 if let Some((id, _)) = state.entries.get(index) {
@@ -1176,324 +1196,4 @@ unsafe extern "system" fn snapshot_proc(
     }
 }
 
-// ------------------------------------------------------------ custom theme
-
-const IDC_THEME_BG_BUTTON: i32 = 150;
-const IDC_THEME_TEXT_BUTTON: i32 = 151;
-const IDC_THEME_ACCENT_BUTTON: i32 = 152;
-const IDC_THEME_BG_SWATCH: i32 = 160;
-const IDC_THEME_TEXT_SWATCH: i32 = 161;
-const IDC_THEME_ACCENT_SWATCH: i32 = 162;
-const IDC_THEME_RESET: i32 = 170;
-
-type PreviewFn = extern "system" fn(HWND, u32, u32, u32);
-
-struct ThemeState {
-    /// `#rrggbb` values, in the same shape as `CustomTheme`.
-    values: [String; 3],
-    brushes: [HBRUSH; 3],
-    preview: PreviewFn,
-    frame: HWND,
-    result: Option<nodi_core::storage::CustomTheme>,
-}
-
-fn colorref(text: &str) -> u32 {
-    match nodi_core::storage::parse_hex_color(text) {
-        Some((red, green, blue)) => red as u32 | (green as u32) << 8 | (blue as u32) << 16,
-        None => 0,
-    }
-}
-
-fn hex_of(colour: u32) -> String {
-    nodi_core::storage::format_hex_color((
-        (colour & 0xFF) as u8,
-        ((colour >> 8) & 0xFF) as u8,
-        ((colour >> 16) & 0xFF) as u8,
-    ))
-}
-
-impl ThemeState {
-    fn new(current: &nodi_core::storage::CustomTheme, preview: PreviewFn, frame: HWND) -> Self {
-        Self {
-            values: [
-                current.background.clone(),
-                current.text.clone(),
-                current.accent.clone(),
-            ],
-            brushes: [ptr::null_mut(); 3],
-            preview,
-            frame,
-            result: None,
-        }
-    }
-
-    fn current(&self) -> nodi_core::storage::CustomTheme {
-        nodi_core::storage::CustomTheme {
-            background: self.values[0].clone(),
-            text: self.values[1].clone(),
-            accent: self.values[2].clone(),
-        }
-    }
-
-    fn notify(&self) {
-        (self.preview)(
-            self.frame,
-            colorref(&self.values[0]),
-            colorref(&self.values[1]),
-            colorref(&self.values[2]),
-        );
-    }
-}
-
-/// View > Theme > Custom...: three `ChooseColor` picks with live preview.
-pub fn custom_theme(
-    owner: HWND,
-    current: nodi_core::storage::CustomTheme,
-    frame: HWND,
-    preview: PreviewFn,
-) -> Option<nodi_core::storage::CustomTheme> {
-    // SAFETY: as in `pick_icon`.
-    unsafe {
-        ensure_class("NodiCustomTheme", Some(theme_proc));
-        let state = Box::new(ThemeState::new(&current, preview, frame));
-        let state_ptr = Box::into_raw(state);
-        let dialog = create_dialog(
-            owner,
-            "NodiCustomTheme",
-            "Custom Theme",
-            360,
-            220,
-            state_ptr as *mut core::ffi::c_void,
-        );
-        if dialog.is_null() {
-            drop(Box::from_raw(state_ptr));
-            return None;
-        }
-        run_modal(owner, dialog);
-        let state = Box::from_raw(state_ptr);
-        for brush in state.brushes {
-            if !brush.is_null() {
-                // SAFETY: every brush was created by this dialog.
-                windows_sys::Win32::Graphics::Gdi::DeleteObject(brush);
-            }
-        }
-        state.result
-    }
-}
-
-unsafe extern "system" fn theme_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_NCCREATE => {
-            let create = lparam as *const CREATESTRUCTW;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*create).lpCreateParams as isize);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        WM_CREATE => {
-            if dialog_state::<ThemeState>(hwnd).is_some() {
-                for (row, (label, button, swatch)) in [
-                    (
-                        "Editor background:",
-                        IDC_THEME_BG_BUTTON,
-                        IDC_THEME_BG_SWATCH,
-                    ),
-                    ("Editor text:", IDC_THEME_TEXT_BUTTON, IDC_THEME_TEXT_SWATCH),
-                    (
-                        "Selection accent:",
-                        IDC_THEME_ACCENT_BUTTON,
-                        IDC_THEME_ACCENT_SWATCH,
-                    ),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let y = 12 + row as i32 * 42;
-                    child(hwnd, "Static", label, 0, -1, 12, y + 4, 120, 18);
-                    child(
-                        hwnd,
-                        "Static",
-                        "",
-                        SS_OWNERDRAW | WS_BORDER,
-                        swatch,
-                        140,
-                        y,
-                        80,
-                        26,
-                    );
-                    child(
-                        hwnd,
-                        "BUTTON",
-                        "Choose...",
-                        BS_PUSHBUTTON as u32,
-                        button,
-                        230,
-                        y,
-                        110,
-                        26,
-                    );
-                }
-                child(
-                    hwnd,
-                    "BUTTON",
-                    "Reset",
-                    BS_PUSHBUTTON as u32,
-                    IDC_THEME_RESET,
-                    12,
-                    150,
-                    75,
-                    26,
-                );
-                child(
-                    hwnd,
-                    "BUTTON",
-                    "OK",
-                    BS_DEFPUSHBUTTON as u32,
-                    IDOK,
-                    180,
-                    150,
-                    75,
-                    26,
-                );
-                child(
-                    hwnd,
-                    "BUTTON",
-                    "Cancel",
-                    BS_PUSHBUTTON as u32,
-                    IDCANCEL,
-                    265,
-                    150,
-                    75,
-                    26,
-                );
-                SendMessageW(hwnd, WM_USER + 1, 0, 0);
-            }
-            0
-        }
-        msg if msg == WM_USER + 1 => {
-            // Refresh the three swatches from `values`.
-            if let Some(state) = dialog_state::<ThemeState>(hwnd) {
-                for index in 0..3 {
-                    if !state.brushes[index].is_null() {
-                        windows_sys::Win32::Graphics::Gdi::DeleteObject(state.brushes[index]);
-                    }
-                    // SAFETY: creates the brush the dialog owns from now on.
-                    state.brushes[index] = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(
-                        colorref(&state.values[index]),
-                    );
-                    let swatch = [
-                        IDC_THEME_BG_SWATCH,
-                        IDC_THEME_TEXT_SWATCH,
-                        IDC_THEME_ACCENT_SWATCH,
-                    ][index];
-                    let control = GetDlgItem(hwnd, swatch);
-                    if !control.is_null() {
-                        InvalidateRect(control, ptr::null(), 1);
-                    }
-                }
-            }
-            0
-        }
-        WM_DRAWITEM => {
-            let item = lparam as *const windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT;
-            if !item.is_null() {
-                let item = &*item;
-                let index = match item.CtlID as i32 {
-                    IDC_THEME_BG_SWATCH => Some(0),
-                    IDC_THEME_TEXT_SWATCH => Some(1),
-                    IDC_THEME_ACCENT_SWATCH => Some(2),
-                    _ => None,
-                };
-                if let Some(index) = index {
-                    if let Some(state) = dialog_state::<ThemeState>(hwnd) {
-                        windows_sys::Win32::Graphics::Gdi::FillRect(
-                            item.hDC,
-                            &item.rcItem,
-                            state.brushes[index],
-                        );
-                        return 1;
-                    }
-                }
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        WM_COMMAND => {
-            let id = win::loword(wparam) as i32;
-            match id {
-                IDC_THEME_BG_BUTTON | IDC_THEME_TEXT_BUTTON | IDC_THEME_ACCENT_BUTTON => {
-                    let index = match id {
-                        IDC_THEME_BG_BUTTON => 0,
-                        IDC_THEME_TEXT_BUTTON => 1,
-                        _ => 2,
-                    };
-                    if let Some(state) = dialog_state::<ThemeState>(hwnd) {
-                        let initial = colorref(&state.values[index]);
-                        if let Some(chosen) = choose_color(hwnd, initial) {
-                            state.values[index] = hex_of(chosen);
-                            SendMessageW(hwnd, WM_USER + 1, 0, 0);
-                            state.notify();
-                        }
-                    }
-                }
-                IDC_THEME_RESET => {
-                    if let Some(state) = dialog_state::<ThemeState>(hwnd) {
-                        let defaults = nodi_core::storage::CustomTheme::default();
-                        state.values = [
-                            defaults.background.clone(),
-                            defaults.text.clone(),
-                            defaults.accent.clone(),
-                        ];
-                        SendMessageW(hwnd, WM_USER + 1, 0, 0);
-                        state.notify();
-                    }
-                }
-                IDOK => {
-                    if let Some(state) = dialog_state::<ThemeState>(hwnd) {
-                        state.result = Some(state.current());
-                    }
-                    DestroyWindow(hwnd);
-                }
-                IDCANCEL => {
-                    DestroyWindow(hwnd);
-                }
-                _ => {}
-            }
-            0
-        }
-        WM_CLOSE => {
-            DestroyWindow(hwnd);
-            0
-        }
-        WM_NCDESTROY => {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-fn choose_color(owner: HWND, initial: u32) -> Option<u32> {
-    use windows_sys::Win32::UI::Controls::Dialogs::{
-        ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
-    };
-    let mut custom = [0u32; 16];
-    let mut dialog: CHOOSECOLORW = unsafe { std::mem::zeroed() };
-    dialog.lStructSize = std::mem::size_of::<CHOOSECOLORW>() as u32;
-    dialog.hwndOwner = owner;
-    dialog.rgbResult = initial;
-    dialog.lpCustColors = custom.as_mut_ptr();
-    dialog.Flags = CC_FULLOPEN | CC_RGBINIT;
-    // SAFETY: every pointer refers to this stack frame and outlives the call.
-    if unsafe { ChooseColorW(&mut dialog) } == 0 {
-        None
-    } else {
-        Some(dialog.rgbResult)
-    }
-}
-
-// Keep the instance handle import used (documentation for the class instance).
-#[allow(dead_code)]
 fn _assert_hinstance(_: HINSTANCE) {}

@@ -67,6 +67,79 @@ pub fn rebuild(data: &DataDir, tree: &Tree) -> io::Result<Report> {
 /// Markdown files (front matter, pictures in `<title>_files`), in the same
 /// layout as the mirror. Nothing else in `dest` is touched; existing files
 /// with the same names are overwritten. Returns the number of notes written.
+/// File formats written by [`export_many`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Formats {
+    /// `<title>.md` with a `<title>_files` folder for pictures.
+    pub markdown: bool,
+    /// `<title>.rtf`: the note exactly as Nodi stores it (opens in Word).
+    pub rtf: bool,
+    /// `<title>.txt`: plain text, UTF-8.
+    pub txt: bool,
+}
+
+/// Exports notes into `dest`, one file per note per format, with folders
+/// mirroring the Notes Explorer. `roots` are the selected nodes (each with
+/// everything below it); `None` exports every note. Returns the number of
+/// notes written.
+pub fn export_many(
+    data: &DataDir,
+    tree: &Tree,
+    roots: Option<&[NoteId]>,
+    dest: &Path,
+    formats: Formats,
+) -> io::Result<usize> {
+    let mut sub = tree.clone();
+    if let Some(roots) = roots {
+        for (index, root) in roots.iter().enumerate() {
+            sub.move_node(root, None, index)
+                .map_err(|err| io::Error::new(io::ErrorKind::NotFound, format!("{err:?}")))?;
+        }
+        let others: Vec<NoteId> = sub
+            .children(None)
+            .iter()
+            .filter(|node| !roots.contains(&node.id))
+            .map(|node| node.id.clone())
+            .collect();
+        for id in others {
+            sub.trash(&id);
+        }
+    }
+    std::fs::create_dir_all(dest)?;
+    let mut written = 0;
+    for (id, planned) in plan_ordered(&sub) {
+        let rtf = data.load_note(&id);
+        if formats.markdown {
+            write_note_file(dest, &sub, &id, &planned, rtf.as_deref())?;
+        }
+        let mut path = dest.to_path_buf();
+        for dir in &planned.dirs {
+            path.push(dir);
+        }
+        std::fs::create_dir_all(&path)?;
+        let stem = planned.file.trim_end_matches(".md");
+        if formats.rtf {
+            std::fs::write(
+                path.join(format!("{stem}.rtf")),
+                rtf.as_deref().unwrap_or(b"{\\rtf1\\ansi }"),
+            )?;
+        }
+        if formats.txt {
+            let text = data.load_note_text(&id).unwrap_or_default();
+            let mut bytes = b"\xEF\xBB\xBF".to_vec();
+            bytes.extend_from_slice(
+                text.replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .replace('\n', "\r\n")
+                    .as_bytes(),
+            );
+            std::fs::write(path.join(format!("{stem}.txt")), bytes)?;
+        }
+        written += 1;
+    }
+    Ok(written)
+}
+
 pub fn export(data: &DataDir, tree: &Tree, root: &NoteId, dest: &Path) -> io::Result<usize> {
     let mut sub = tree.clone();
     sub.move_node(root, None, 0)

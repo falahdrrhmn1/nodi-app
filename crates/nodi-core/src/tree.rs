@@ -9,6 +9,7 @@
 //! * sibling `order` values are unique and dense inside a parent,
 //! * a trashed node is never returned by [`Tree::children`].
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -51,6 +52,70 @@ pub struct Node {
     /// never renamed by hand). See [`auto_title`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_title: bool,
+    /// Locked in the Notes Explorer: no editing, renaming, moving or
+    /// trashing until unlocked. A locked folder locks everything inside it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    /// The file this note was imported from (never written to unless the
+    /// user chooses Save Back to Original File).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// How the Notes Explorer orders siblings (View > Sort Notes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    /// The order the user arranged (drag & drop, Move Up/Down).
+    #[default]
+    Manual,
+    /// By title, numbers compared as numbers (`2` before `10`, `00-…` first).
+    Name,
+    Created,
+    Modified,
+}
+
+/// Compares titles the way people read numbered names: case-insensitive, and
+/// runs of digits by value (`file2` < `file10`, `01-a` < `02-b`).
+pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let mut left = a.chars().peekable();
+    let mut right = b.chars().peekable();
+    loop {
+        match (left.peek().copied(), right.peek().copied()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let mut first = String::new();
+                while let Some(ch) = left.peek().copied().filter(char::is_ascii_digit) {
+                    first.push(ch);
+                    left.next();
+                }
+                let mut second = String::new();
+                while let Some(ch) = right.peek().copied().filter(char::is_ascii_digit) {
+                    second.push(ch);
+                    right.next();
+                }
+                let first_value = first.trim_start_matches('0');
+                let second_value = second.trim_start_matches('0');
+                let order = first_value
+                    .len()
+                    .cmp(&second_value.len())
+                    .then_with(|| first_value.cmp(second_value));
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let order = x.to_lowercase().cmp(y.to_lowercase());
+                if order != Ordering::Equal {
+                    return order;
+                }
+                left.next();
+                right.next();
+            }
+        }
+    }
 }
 
 /// One Notes Explorer change that Ctrl+Z in the tree can take back.
@@ -71,6 +136,11 @@ pub enum TreeUndo {
         title: String,
         auto_title: bool,
         new_title: String,
+    },
+    /// One command on several selected nodes; undone together, last first.
+    Batch {
+        changes: Vec<TreeUndo>,
+        title: String,
     },
 }
 
@@ -97,6 +167,9 @@ impl TreeUndo {
             TreeUndo::Rename {
                 title, new_title, ..
             } => format!("Undo: rename \"{new_title}\" back to \"{title}\"?"),
+            TreeUndo::Batch { changes, title } => {
+                format!("Undo: {title} ({} items)?", changes.len())
+            }
         }
     }
 }
@@ -253,6 +326,8 @@ impl Tree {
             created: now,
             modified: now,
             auto_title: false,
+            locked: false,
+            source: None,
         };
         self.nodes.insert(id.clone(), node);
         id
@@ -568,6 +643,8 @@ impl Tree {
             created: now,
             modified: now,
             auto_title: false,
+            locked: false,
+            source: None,
         };
         self.nodes.insert(new_id.clone(), copy);
         Some(new_id)
@@ -703,7 +780,95 @@ impl Tree {
                 self.set_auto_title(id, *auto_title);
                 Ok(())
             }
+            TreeUndo::Batch { changes, .. } => {
+                let mut result = Ok(());
+                for change in changes.iter().rev() {
+                    if let Err(err) = self.undo(change) {
+                        result = Err(err);
+                    }
+                }
+                result
+            }
         }
+    }
+
+    /// Remembers the file a node was imported from.
+    pub fn set_source(&mut self, id: &NoteId, source: Option<String>) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.source = source;
+        }
+    }
+
+    /// Locks or unlocks one node.
+    pub fn set_locked(&mut self, id: &NoteId, locked: bool) -> bool {
+        match self.nodes.get_mut(id) {
+            Some(node) => {
+                node.locked = locked;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// True when `id` or any of its ancestors is locked.
+    pub fn is_locked(&self, id: &NoteId) -> bool {
+        let mut current = self.nodes.get(id);
+        let mut guard = 0;
+        while let Some(node) = current {
+            if node.locked {
+                return true;
+            }
+            guard += 1;
+            if guard > 4096 {
+                return false;
+            }
+            current = node
+                .parent
+                .as_ref()
+                .and_then(|parent| self.nodes.get(parent));
+        }
+        false
+    }
+
+    /// True when `id` or anything below it is locked (a subtree that must not
+    /// be trashed or moved as a whole).
+    pub fn subtree_locked(&self, id: &NoteId) -> bool {
+        self.is_locked(id)
+            || self
+                .descendants(id)
+                .iter()
+                .any(|child| self.nodes.get(child).is_some_and(|node| node.locked))
+    }
+
+    /// Visible children of `parent` in the Notes Explorer's display order.
+    pub fn sorted_children(
+        &self,
+        parent: Option<&NoteId>,
+        order: SortOrder,
+        descending: bool,
+        folders_first: bool,
+    ) -> Vec<&Node> {
+        let mut children = self.children(parent);
+        if order == SortOrder::Manual {
+            return children;
+        }
+        children.sort_by(|a, b| {
+            let by_key = match order {
+                SortOrder::Manual => Ordering::Equal,
+                SortOrder::Name => natural_cmp(&a.title, &b.title),
+                SortOrder::Created => a.created.cmp(&b.created),
+                SortOrder::Modified => a.modified.cmp(&b.modified),
+            }
+            .then_with(|| a.order.cmp(&b.order));
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            if folders_first {
+                let folder = |node: &Node| u8::from(node.kind != NodeKind::Folder);
+                folder(a).cmp(&folder(b)).then(by_key)
+            } else {
+                by_key
+            }
+        });
+        children
     }
 
     /// True when `node` is a descendant of `ancestor` (or equal).

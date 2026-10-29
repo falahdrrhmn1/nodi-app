@@ -37,6 +37,43 @@ pub fn snapshot(data: &DataDir) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// File > Export > Complete Backup Copy: everything Nodi needs to come back
+/// (`tree.json`, notes, attachments, icons, settings) copied into a new
+/// `Nodi backup <time>` folder inside `parent`, with a README. Tools >
+/// Restore Backup > From a Folder reads it back. Returns the new folder.
+pub fn copy_to(data: &DataDir, parent: &Path) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(parent)?;
+    let base = format!("Nodi backup {}", timestamp_name(now_secs()));
+    let mut dir = parent.join(&base);
+    let mut counter = 1;
+    while dir.exists() {
+        counter += 1;
+        dir = parent.join(format!("{base} ({counter})"));
+    }
+    std::fs::create_dir_all(&dir)?;
+    copy_file_if_exists(&data.tree_path(), &dir.join("tree.json"))?;
+    copy_file_if_exists(&data.settings_path(), &dir.join("settings.json"))?;
+    copy_tree(&data.notes_dir(), &dir.join("notes"))?;
+    copy_tree(&data.attachments_dir(), &dir.join("attachments"))?;
+    copy_tree(&data.icons_dir(), &dir.join("icons"))?;
+    std::fs::write(
+        dir.join("README.txt"),
+        "Complete copy of a Nodi notebook.\r\n\r\n\
+         To bring it back: Nodi > Tools > Restore Backup... > From a Folder...,\r\n\
+         then choose this folder. Nodi first saves your current notes as a\r\n\
+         backup, so restoring never loses anything.\r\n\r\n\
+         notes\\<id>.rtf  the notes (open in Word/WordPad)\r\n\
+         notes\\<id>.txt  their plain text\r\n\
+         tree.json       titles and folder structure\r\n",
+    )?;
+    Ok(dir)
+}
+
+/// True when `dir` looks like a snapshot or backup copy (has `tree.json`).
+pub fn is_backup(dir: &Path) -> bool {
+    dir.join("tree.json").is_file()
+}
+
 /// Snapshot directories, oldest first.
 pub fn list(data: &DataDir) -> io::Result<Vec<PathBuf>> {
     let base = data.backups_dir();

@@ -28,5 +28,7 @@ pub mod storage;
 pub mod tree;
 
 pub use id::NoteId;
-pub use storage::{CustomTheme, DataDir, Session, Settings, TabState, Theme, WindowRect};
+pub use storage::{
+    Background, CustomTheme, DataDir, Session, Settings, TabState, Theme, ThemeSpec, WindowRect,
+};
 pub use tree::{Node, NodeKind, Tree, TreeError, TreeUndo};

@@ -541,6 +541,9 @@ pub fn link_rtf(text: &str, target: &str) -> String {
 
 /// Insert > Link... (Ctrl+K): create a link, or edit the selected one.
 pub fn insert_or_edit(app: &mut App) {
+    if crate::wnd::editor::refuse_if_locked(app) {
+        return;
+    }
     let Some(editor) = app.active_editor() else {
         return;
     };

@@ -7,18 +7,21 @@ use nodi_core::tree::Position;
 use nodi_core::{NodeKind, NoteId};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateBitmap, CreateDIBSection, DeleteObject, ScreenToClient, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, RGBQUAD,
+    ClientToScreen, CreateBitmap, CreateDIBSection, DeleteObject, InvalidateRect, ScreenToClient,
+    UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, RGBQUAD,
 };
 use windows_sys::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_LEFT, SS_NOPREFIX};
 use windows_sys::Win32::UI::Controls::{
     ImageList_BeginDrag, ImageList_Create, ImageList_DragEnter, ImageList_DragLeave,
-    ImageList_DragMove, ImageList_EndDrag, ImageList_ReplaceIcon, ILC_COLOR32, ILC_MASK, NMHDR,
-    NMTREEVIEWW, NMTVDISPINFOW, NMTVKEYDOWN, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET,
-    TVGN_DROPHILITE, TVHITTESTINFO, TVHT_ONITEM, TVHT_ONITEMBUTTON, TVHT_ONITEMINDENT,
-    TVHT_ONITEMRIGHT, TVIF_CHILDREN, TVIF_IMAGE, TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW,
-    TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_EDITLABELW,
-    TVM_EXPAND, TVM_GETEDITCONTROL, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST,
+    ImageList_DragMove, ImageList_DragShowNolock, ImageList_EndDrag, ImageList_ReplaceIcon,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW,
+    ILC_COLOR32, ILC_MASK, NMHDR, NMTREEVIEWW, NMTVCUSTOMDRAW, NMTVDISPINFOW, NMTVKEYDOWN,
+    NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET, TVGN_DROPHILITE,
+    TVGN_FIRSTVISIBLE, TVGN_NEXTVISIBLE, TVGN_PREVIOUS, TVGN_ROOT, TVHITTESTINFO, TVHT_ONITEM,
+    TVHT_ONITEMBUTTON, TVHT_ONITEMINDENT, TVHT_ONITEMRIGHT, TVIF_CHILDREN, TVIF_IMAGE,
+    TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW,
+    TVI_FIRST, TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_EDITLABELW, TVM_ENSUREVISIBLE, TVM_EXPAND,
+    TVM_GETEDITCONTROL, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST,
     TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETIMAGELIST, TVM_SETINSERTMARK, TVM_SETITEMW,
     TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW, TVN_ITEMEXPANDEDW, TVN_KEYDOWN,
     TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT,
@@ -38,8 +41,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, KillTimer, LoadImageW, PostMessageW, SendMessageW,
     SetMenuDefaultItem, SetTimer, SetWindowTextW, TrackPopupMenu, HICON, HMENU, ICONINFO,
     IMAGE_ICON, LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING, SB_LINEDOWN, SB_LINEUP, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_TIMER, WM_VSCROLL,
-    WS_CHILD, WS_EX_CLIENTEDGE, WS_VISIBLE,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_SETREDRAW, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_EX_CLIENTEDGE, WS_VISIBLE,
 };
 
 use crate::app::App;
@@ -398,8 +401,12 @@ pub fn rebuild(app: &mut App) {
         return;
     }
     app.suppress_select += 1;
+    // Keep the view where it was (a drop or rename must not jump to the
+    // top), and paint once at the end instead of item by item.
+    let first_visible = first_visible_note(app);
     // SAFETY: `tree_view` is our TreeView; TVI_ROOT deletes every item.
     unsafe {
+        SendMessageW(app.tree_view, WM_SETREDRAW, 0, 0);
         SendMessageW(app.tree_view, TVM_DELETEITEM, TVI_ROOT as usize, 0);
     }
     app.tree_items.clear();
@@ -414,7 +421,45 @@ pub fn rebuild(app: &mut App) {
     if let Some(id) = app.selected.clone() {
         select_item(app, &id);
     }
+    if let Some(item) = first_visible.and_then(|id| item_of(app, &id)) {
+        // SAFETY: `item` is a live item of our TreeView.
+        unsafe {
+            SendMessageW(
+                app.tree_view,
+                TVM_SELECTITEM,
+                TVGN_FIRSTVISIBLE as usize,
+                item,
+            );
+        }
+    }
+    if let Some(id) = app.selected.clone() {
+        if let Some(item) = item_of(app, &id) {
+            // SAFETY: as above.
+            unsafe {
+                SendMessageW(app.tree_view, TVM_ENSUREVISIBLE, 0, item);
+            }
+        }
+    }
+    // SAFETY: as above; repaint everything once.
+    unsafe {
+        SendMessageW(app.tree_view, WM_SETREDRAW, 1, 0);
+        InvalidateRect(app.tree_view, ptr::null(), 1);
+    }
     app.suppress_select -= 1;
+}
+
+/// The note shown in the tree's first visible row.
+fn first_visible_note(app: &App) -> Option<NoteId> {
+    // SAFETY: plain query of our TreeView.
+    let item = unsafe {
+        SendMessageW(
+            app.tree_view,
+            TVM_GETNEXTITEM,
+            TVGN_FIRSTVISIBLE as usize,
+            0,
+        )
+    };
+    item_note(app, item)
 }
 
 /// Adds the permanent "Trash (N)" pseudo-item at the bottom of the tree. It is
@@ -490,13 +535,28 @@ pub fn trash_label(app: &App) -> String {
     String::from_utf16_lossy(&buffer[..end])
 }
 
+/// Title shown in the tree: a locked node carries a padlock.
+pub fn display_title(node: &nodi_core::Node) -> String {
+    if node.locked {
+        format!("{} 🔒", node.title)
+    } else {
+        node.title.clone()
+    }
+}
+
 fn child_infos(app: &App, parent: Option<&NoteId>) -> Vec<Pending> {
+    let settings = &app.settings;
     app.tree
-        .children(parent)
+        .sorted_children(
+            parent,
+            settings.tree_sort,
+            settings.tree_sort_desc,
+            settings.folders_first,
+        )
         .into_iter()
         .map(|node| Pending {
             id: node.id.clone(),
-            title: node.title.clone(),
+            title: display_title(node),
             kind: node.kind,
             icon: node.icon.clone(),
             has_children: !app.tree.children(Some(&node.id)).is_empty(),
@@ -538,9 +598,28 @@ fn insert_item(app: &mut App, parent_item: isize, info: &Pending) -> isize {
         cChildren: i32::from(info.has_children),
         lParam: 0,
     };
+    // The Trash pseudo-item stays the last top-level row.
+    let after = if parent_item == TVI_ROOT && app.trash_item != 0 {
+        // SAFETY: plain query of our TreeView.
+        let previous = unsafe {
+            SendMessageW(
+                app.tree_view,
+                TVM_GETNEXTITEM,
+                TVGN_PREVIOUS as usize,
+                app.trash_item,
+            )
+        };
+        if previous == 0 {
+            TVI_FIRST
+        } else {
+            previous
+        }
+    } else {
+        TVI_LAST
+    };
     let insert = TVINSERTSTRUCTW {
         hParent: parent_item,
-        hInsertAfter: TVI_LAST,
+        hInsertAfter: after,
         Anonymous: TVINSERTSTRUCTW_0 { item },
     };
     // SAFETY: `insert` and `text` live for the duration of the call.
@@ -584,6 +663,10 @@ fn item_of(app: &App, id: &NoteId) -> Option<isize> {
 /// Adds one freshly created node (a last child) without rebuilding the tree.
 /// Returns false when its parent has no item, so the caller rebuilds.
 pub fn add_node(app: &mut App, id: &NoteId) -> bool {
+    // A sorted tree puts the node somewhere in the middle: rebuild.
+    if app.settings.tree_sort != nodi_core::tree::SortOrder::Manual {
+        return false;
+    }
     let Some(node) = app.tree.get(id) else {
         return false;
     };
@@ -802,6 +885,87 @@ fn row_rect(app: &App, item: isize) -> Option<RECT> {
 
 // --------------------------------------------------------------- notifications
 
+/// Every row in display order, as far as it is expanded.
+pub fn visible_ids(app: &App) -> Vec<NoteId> {
+    let mut ids = Vec::new();
+    // SAFETY: plain queries of our TreeView.
+    let mut item = unsafe { SendMessageW(app.tree_view, TVM_GETNEXTITEM, TVGN_ROOT as usize, 0) };
+    let mut guard = 0;
+    while item != 0 && guard < 100_000 {
+        if let Some(id) = item_note(app, item) {
+            ids.push(id);
+        }
+        // SAFETY: as above.
+        item = unsafe {
+            SendMessageW(
+                app.tree_view,
+                TVM_GETNEXTITEM,
+                TVGN_NEXTVISIBLE as usize,
+                item,
+            )
+        };
+        guard += 1;
+    }
+    ids
+}
+
+/// Repaints the tree (multi-selection changed).
+pub fn redraw(app: &App) {
+    if !app.tree_view.is_null() {
+        // SAFETY: our own window.
+        unsafe {
+            InvalidateRect(app.tree_view, ptr::null(), 1);
+        }
+    }
+}
+
+/// Notifications whose return value matters: the multi-selection colours
+/// (`NM_CUSTOMDRAW`) and refusing to rename a locked node.
+pub fn notify_result(app: &mut App, header: &NMHDR, lparam: LPARAM) -> Option<LRESULT> {
+    if header.hwndFrom != app.tree_view || app.tree_view.is_null() {
+        return None;
+    }
+    match header.code {
+        NM_CUSTOMDRAW => {
+            let draw = lparam as *mut NMTVCUSTOMDRAW;
+            // SAFETY: the TreeView sent an NMTVCUSTOMDRAW for this code.
+            unsafe {
+                match (*draw).nmcd.dwDrawStage {
+                    CDDS_PREPAINT => {
+                        if app.multi.len() > 1 {
+                            return Some(CDRF_NOTIFYITEMDRAW as LRESULT);
+                        }
+                        None
+                    }
+                    CDDS_ITEMPREPAINT => {
+                        let item = (*draw).nmcd.dwItemSpec as isize;
+                        let picked = item_note(app, item).is_some_and(|id| app.multi.contains(&id));
+                        if picked {
+                            (*draw).clrTextBk = app.palette.accent;
+                            (*draw).clrText = app.palette.editor_text;
+                            return Some(CDRF_NEWFONT as LRESULT);
+                        }
+                        Some(CDRF_DODEFAULT as LRESULT)
+                    }
+                    _ => None,
+                }
+            }
+        }
+        TVN_BEGINLABELEDITW => {
+            let info = header as *const NMHDR as *const NMTVDISPINFOW;
+            // SAFETY: the TreeView sent an NMTVDISPINFOW for this code.
+            let item = unsafe { (*info).item.hItem };
+            let id = item_note(app, item)?;
+            if app.tree.is_locked(&id) {
+                app.check_unlocked(&id);
+                return Some(1);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Handles a `WM_NOTIFY` that came from the TreeView. Returns true when the
 /// notification belonged to the tree.
 pub fn handle_notify(app: &mut App, header: &NMHDR) -> bool {
@@ -903,12 +1067,10 @@ pub fn handle_notify(app: &mut App, header: &NMHDR) -> bool {
                 }
                 VK_DELETE => {
                     if !trash_focused(app) {
-                        if let Some(id) = app.context_note.clone().or_else(|| app.selected.clone())
-                        {
-                            app.trash_node(id);
-                        }
+                        app.trash_selection();
                     }
                 }
+                VK_ESCAPE => app.clear_multi(),
                 VK_APPS => show_context_menu(app, None),
                 _ => {}
             }
@@ -963,6 +1125,46 @@ unsafe extern "system" fn tree_subclass(
 ) -> LRESULT {
     let frame = refdata as HWND;
     match msg {
+        WM_LBUTTONDOWN => {
+            if let Some(app) = crate::wnd::app_mut(frame) {
+                let point = POINT {
+                    x: win::x_from_lparam(lparam),
+                    y: win::y_from_lparam(lparam),
+                };
+                let ctrl = wparam & 0x0008 != 0; // MK_CONTROL
+                let shift = wparam & 0x0004 != 0; // MK_SHIFT
+                let item = hit_row(app, point);
+                let id = item_note(app, item);
+                if ctrl || shift {
+                    // Ctrl+click / Shift+click build a multi-selection; the
+                    // caret (and the open note) stay where they are.
+                    if let Some(id) = id {
+                        SetFocus(hwnd);
+                        if ctrl {
+                            app.toggle_multi(id);
+                        } else {
+                            app.range_multi(id);
+                        }
+                    }
+                    return 0;
+                }
+                let in_multi = id.as_ref().is_some_and(|id| app.multi.contains(id));
+                if !in_multi {
+                    app.clear_multi();
+                    app.multi_anchor = id;
+                    return DefSubclassProc(hwnd, msg, wparam, lparam);
+                }
+                // A press on a selected row may start dragging the whole
+                // selection; a plain click (no drag) selects just that row.
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                if let Some(app) = crate::wnd::app_mut(frame) {
+                    if !app.dragging {
+                        app.clear_multi();
+                    }
+                }
+                return result;
+            }
+        }
         WM_MOUSEMOVE => {
             if let Some(app) = crate::wnd::app_mut(frame) {
                 if app.dragging {
@@ -1069,6 +1271,15 @@ fn show_drop(app: &App, hover: Option<(NoteId, Position)>) {
     if app.tree_view.is_null() {
         return;
     }
+    // The drag image is drawn over the tree with XOR; hide it while the marks
+    // repaint the rows below it, or it leaves trails behind.
+    if app.dragging {
+        // SAFETY: a drag image is in progress.
+        unsafe {
+            ImageList_DragShowNolock(0);
+        }
+    }
+    let _restore = DragImageBack(app.dragging);
     // SAFETY: plain messages to our TreeView; a zero item clears each mark.
     unsafe {
         SendMessageW(app.tree_view, TVM_SETINSERTMARK, 0, 0);
@@ -1091,6 +1302,21 @@ fn show_drop(app: &App, hover: Option<(NoteId, Position)>) {
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Shows the drag image again (and repaints the tree under it first) when
+/// dropped.
+struct DragImageBack(bool);
+
+impl Drop for DragImageBack {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: matching the DragShowNolock(0) above.
+            unsafe {
+                ImageList_DragShowNolock(1);
             }
         }
     }
@@ -1122,10 +1348,18 @@ fn auto_scroll(app: &App, y: i32) {
         return;
     };
     let lines = (distance / 8).clamp(1, 4);
-    for _ in 0..lines {
-        // SAFETY: a vertical scroll message to our own TreeView.
-        unsafe {
+    // SAFETY: drag image calls match an active drag; scroll messages go to
+    // our own TreeView.
+    unsafe {
+        if app.dragging {
+            ImageList_DragShowNolock(0);
+        }
+        for _ in 0..lines {
             SendMessageW(app.tree_view, WM_VSCROLL, direction as usize, 0);
+        }
+        if app.dragging {
+            UpdateWindow(app.tree_view);
+            ImageList_DragShowNolock(1);
         }
     }
 }
@@ -1181,17 +1415,22 @@ fn on_drop(app: &mut App, lparam: LPARAM) {
         return;
     }
     if let Some(source) = source {
+        let group = app.multi.len() > 1 && app.multi.contains(&source);
         match hover {
             Some((target, position)) if target != source => {
                 // A refused move is reported in the status bar.
-                let _ = app.move_node_relative(source, target, position);
+                let _ = app.move_selection_relative(source, target, position);
             }
             Some(_) => {}
             // Dropped on empty space: move to the top level.
             None => {
-                app.context_note = Some(source.clone());
-                app.selected = Some(source);
-                app.move_selected_to_root();
+                if !group {
+                    app.multi.clear();
+                    app.context_note = Some(source.clone());
+                    app.selected = Some(source);
+                }
+                app.move_selection_into(None);
+                app.context_note = None;
             }
         }
     }
@@ -1228,6 +1467,11 @@ pub fn show_context_menu(app: &mut App, screen: Option<POINT>) {
             } else {
                 match item_note(app, item) {
                     Some(id) => {
+                        // Right-click outside the multi-selection: the
+                        // menu is for that one row.
+                        if !app.multi.contains(&id) {
+                            app.clear_multi();
+                        }
                         select_item(app, &id);
                         Some(id)
                     }
@@ -1259,6 +1503,8 @@ pub fn show_context_menu(app: &mut App, screen: Option<POINT>) {
     app.context_note = target;
     let menu = if on_trash {
         build_trash_menu()
+    } else if app.multi.len() > 1 {
+        build_multi_menu(app)
     } else {
         build_menu(app)
     };
@@ -1303,6 +1549,73 @@ fn build_trash_menu() -> HMENU {
     }
 }
 
+/// Menu for several selected rows: only commands that make sense for all.
+fn build_multi_menu(app: &App) -> HMENU {
+    // SAFETY: every call below creates/edits a menu we own.
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return menu;
+        }
+        let title = win::wide(&format!("{} items selected", app.multi.len()));
+        AppendMenuW(
+            menu,
+            MF_STRING | windows_sys::Win32::UI::WindowsAndMessaging::MF_GRAYED,
+            0,
+            title.as_ptr(),
+        );
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        append(menu, menu::IDM_NOTES_MOVE_TO, "Move to...");
+        append(menu, menu::IDM_NOTES_MOVE_ROOT, "Move to Top Level");
+        append(menu, menu::IDM_NOTES_EXPORT, "Export...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        if app.selection_locked() {
+            append(menu, menu::IDM_NOTES_UNLOCK, "Unlock");
+        } else {
+            append(menu, menu::IDM_NOTES_LOCK, "Lock");
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        append(menu, menu::IDM_NOTES_TRASH, "Move to Trash");
+        menu
+    }
+}
+
+/// The lock / export / import part shared by note and folder menus.
+unsafe fn append_common(menu: HMENU, app: &App, folder_like: bool) {
+    AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+    append(menu, menu::IDM_NOTES_EXPORT, "Export...");
+    if folder_like {
+        append(menu, menu::IDM_NOTES_IMPORT_HERE, "Import Files Here...");
+        append(
+            menu,
+            menu::IDM_NOTES_IMPORT_FOLDER_HERE,
+            "Import Folder Here...",
+        );
+    }
+    let source = app
+        .context_note
+        .as_ref()
+        .and_then(|id| app.import_source(id));
+    if source.is_some() {
+        append(menu, menu::IDM_NOTES_SHOW_ORIGINAL, "Show Original File");
+        append(
+            menu,
+            menu::IDM_NOTES_SAVE_BACK,
+            "Save Back to Original File...",
+        );
+    }
+    let locked = app
+        .context_note
+        .as_ref()
+        .and_then(|id| app.tree.get(id))
+        .is_some_and(|node| node.locked);
+    if locked {
+        append(menu, menu::IDM_NOTES_UNLOCK, "Unlock");
+    } else {
+        append(menu, menu::IDM_NOTES_LOCK, "Lock");
+    }
+}
+
 fn build_menu(app: &App) -> HMENU {
     // SAFETY: every call below creates/edits a menu we own.
     unsafe {
@@ -1322,6 +1635,17 @@ fn build_menu(app: &App) -> HMENU {
                 AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
                 append(menu, menu::IDM_VIEW_EXPAND_ALL, "Expand All");
                 append(menu, menu::IDM_VIEW_COLLAPSE_ALL, "Collapse All");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(menu, menu::IDM_NOTES_IMPORT_HERE, "Import Files...");
+                append(menu, menu::IDM_NOTES_IMPORT_FOLDER_HERE, "Import Folder...");
+                append(menu, menu::IDM_FILE_EXPORT_ALL, "Export All Notes...");
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                append(
+                    menu,
+                    menu::IDM_SEARCH_ALL_NOTES,
+                    "Find Notes...\tCtrl+Shift+F",
+                );
+                append(menu, menu::IDM_VIEW_REFRESH, "Refresh\tF5");
             }
             Some(NodeKind::Note) => {
                 append(menu, menu::IDM_NOTES_OPEN, "Open");
@@ -1338,6 +1662,7 @@ fn build_menu(app: &App) -> HMENU {
                 append(menu, menu::IDM_NOTES_MOVE_DOWN, "Move Down");
                 append(menu, menu::IDM_NOTES_MOVE_TO, "Move to...");
                 append(menu, menu::IDM_NOTES_MOVE_ROOT, "Move to Top Level");
+                append_common(menu, app, true);
                 AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
                 append(menu, menu::IDM_NOTES_TRASH, "Move to Trash");
                 append(menu, menu::IDM_NOTES_PROPERTIES, "Properties");
@@ -1354,6 +1679,7 @@ fn build_menu(app: &App) -> HMENU {
                 append(menu, menu::IDM_NOTES_MOVE_DOWN, "Move Down");
                 append(menu, menu::IDM_NOTES_MOVE_TO, "Move to...");
                 append(menu, menu::IDM_NOTES_MOVE_ROOT, "Move to Top Level");
+                append_common(menu, app, true);
                 AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
                 append(menu, menu::IDM_NOTES_TRASH, "Move to Trash");
                 append(menu, menu::IDM_NOTES_PROPERTIES, "Properties");

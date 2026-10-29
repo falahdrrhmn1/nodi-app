@@ -16,20 +16,39 @@ WYSIWYG — Ctrl+B makes text bold instead of inserting `**text**`.
   numbered lists, alignment, font, size, colour, highlight, inline code, real
   tables, pictures (insert, paste a screenshot, resize, crop), formulas
   (LaTeX rendered in place and editable again), undo/redo, zoom.
-- **Markdown-style typing**: `- `, `1. `, `# `…`#### `, `---` + Enter; Tab
-  indents the paragraph or nests a list item, Enter keeps the indentation.
+- **Markdown-style typing**: `- `, `1. `, `[ ] `, `# `…`#### `, `---` +
+  Enter (separator), `----` + Enter (page break); Tab indents the paragraph or
+  nests a list item at any depth, Enter keeps the indentation. Numbered lists
+  number like an outline (a deeper list starts at 1, Shift+Tab continues the
+  outer numbers), with Restart / Continue Numbering. **Checklists** with boxes
+  you click.
+- **Notes Explorer**: Ctrl+click / Shift+click several notes and folders and
+  trash, move, export or lock them together; **Lock** keeps a note or folder
+  read-only (no edit, rename, move or trash) until unlocked; **sort** by your
+  own order, name (`2` before `10`, `00-…` first), date created or modified;
+  F5 refreshes; Trash stays the last row.
+- **Find Notes** (Ctrl+Shift+F) searches note and folder titles and the text
+  of every note, with the folder path and a bit of text around each hit.
 - **Tabs** with a × close button and a + that opens a new note (**Ctrl+T**).
   A new note is titled by its first line until you rename it.
 - **Ctrl+Z in the Notes Explorer** undoes a move to the Trash, a move or a
   rename (it asks first).
-- **Paste from ChatGPT or a web page** keeps headings, lists, tables, code and
-  links; `$…$`, `$$…$$`, `\(…\)`, `\[…\]` and KaTeX/MathJax/Wikipedia formulas
-  become rendered formulas.
-- **Import** old notes (File > Import Files / Import Folder, or drag files from
-  Explorer onto the window): `.md`, `.txt` (any encoding) and `.rtf` become
-  notes under "Imported <date>", folders keep their structure, the originals
-  are only read. **Export** a note as `.md`, `.rtf` or `.txt` (File > Export
-  Note As…) or a whole folder as Markdown (File > Export Folder…).
+- **Paste from ChatGPT or a web page** keeps headings, lists, task lists,
+  tables, code, links and pictures (embedded ones, local files and web
+  pictures, downloaded through Windows); `$…$`, `$$…$$`, `\(…\)`, `\[…\]`
+  and KaTeX/MathJax/Wikipedia formulas become rendered formulas. Terminal
+  output with a drawn table (`pm2 ls`, `docker ps`, MySQL) becomes a real table.
+- **Import** (File > Import, right-click > Import Files Here, or drag files
+  onto the window): `.md`, `.txt` (any encoding) and `.rtf` become notes,
+  folders keep their structure. Import **copies**: the original files are
+  never changed. Each imported note remembers its file (right-click > Show
+  Original File); right-click > Save Back to Original File writes your edits
+  into it, after keeping a copy of the old file in `data\recovery\originals`.
+  Removing an import (Move to Trash) never touches the files on disk.
+- **Export / Save As** (File > Export, or right-click): this note as `.md`,
+  `.rtf` or `.txt` (Ctrl+Shift+S); the selected notes and folders, or all notes,
+  as `.md` / `.rtf` / `.txt` files in folders like the tree; or a **complete
+  backup copy** that Tools > Restore From Backup Folder brings back.
 - **Autosave** with atomic writes, a `.prev` generation, crash recovery and
   honest status (`Modified` / `Saving…` / `Saved` / `Save Failed`); the note is
   flushed on tab switch, on close and on a Windows shutdown.
@@ -38,8 +57,18 @@ WYSIWYG — Ctrl+B makes text bold instead of inserting `**text**`.
   after a restart.
 - Search and replace, search in all notes, read-only Markdown view, export a
   note as Markdown with its pictures.
-- Light / dark / custom themes; lines, words and characters (and the
-  selection's) in the status bar; Ctrl+Up/Down scroll the view (View menu).
+- **Themes**: 15 built in (Light, Paper, GitHub Light, Solarized Light/Dark,
+  VS Code Dark+ / Dark Modern, Monokai, Dracula, One Dark, Nord, Gruvbox Dark,
+  Tokyo Night, Catppuccin Mocha, High Contrast). The title bar, menus,
+  toolbars, tree, tabs and status bar follow the theme. The Theme Editor sets
+  every colour and the chrome font, previews live and saves **your own
+  themes**; copy a theme as text and paste it on another PC.
+- **View**: line numbers next to the text (as in Notepad++), a background
+  pattern (lines, grid, dots — drawn on screen only), sort order.
+- **Tools > Preferences**: default font and size for new notes, sounds (off
+  by default: no beeps, silent message boxes), two quick spaces → `. `.
+- Lines, words and characters (and the selection's) in the status bar;
+  Ctrl+Up/Down scroll the view.
 - **AI Markdown mirror** — see below.
 - Every shortcut: [`docs/SHORTCUTS.md`](docs/SHORTCUTS.md), or **F1** in the app.
 
@@ -116,6 +145,7 @@ Tools > Rebuild AI Markdown Mirror regenerates it on demand.
 cargo test                              # unit + integration tests (nodi-core)
 pwsh -File scripts\e2e.ps1              # end-to-end against the real nodi.exe
 pwsh -File scripts\persist-torture.ps1  # save-reliability torture (restarts + kills)
+pwsh -File scripts\stress-heavy.ps1     # big note, killed while saving (-HogMB: low memory)
 pwsh -File scripts\smoke.ps1            # startup time, RAM, screenshot
 ```
 

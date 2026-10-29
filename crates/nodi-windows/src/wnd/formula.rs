@@ -426,6 +426,9 @@ pub fn render_pasted(editor: HWND) -> (usize, Vec<String>) {
 
 /// Insert > Formula... (Alt+=): new formula, or edit the selected one.
 pub fn insert_or_edit(app: &mut App) {
+    if crate::wnd::editor::refuse_if_locked(app) {
+        return;
+    }
     let Some(editor) = app.active_editor() else {
         return;
     };

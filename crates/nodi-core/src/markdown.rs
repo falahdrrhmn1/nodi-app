@@ -45,7 +45,8 @@ enum Inline {
     /// A formula picture (LaTeX from its `nodi-math:` link).
     Math(String),
     /// The `---` separator picture (`nodi-hr:` link).
-    Rule,
+    /// A separator picture; `true` for a page break.
+    Rule(bool),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -185,10 +186,12 @@ impl<'a> Reader<'a> {
             let target = self.link.as_deref();
             // Older notes mark the rule with a `nodi-hr:` link; newer ones only
             // by the picture's shape (Rich Edit underlines link results).
-            if target.is_some_and(crate::links::is_rule_link)
+            if crate::image::is_page_picture(&bytes) {
+                self.push_inline(Inline::Rule(true));
+            } else if target.is_some_and(crate::links::is_rule_link)
                 || crate::image::is_rule_picture(&bytes)
             {
-                self.push_inline(Inline::Rule);
+                self.push_inline(Inline::Rule(false));
             } else if let Some(latex) = target.and_then(crate::links::parse_math_link) {
                 self.push_inline(Inline::Math(latex));
             } else if !bytes.is_empty() {
@@ -620,7 +623,7 @@ impl Writer {
                 .iter()
                 .filter_map(|inline| match inline {
                     Inline::Text(text, _, _) => Some(text.as_str()),
-                    Inline::Picture(_) | Inline::Math(_) | Inline::Rule => None,
+                    Inline::Picture(_) | Inline::Math(_) | Inline::Rule(_) => None,
                 })
                 .collect();
             // The editable heading keeps a `# ` marker in its own text; it must
@@ -633,6 +636,19 @@ impl Writer {
         // A deeper bullet level is stored as a literal glyph + tab (Rich Edit
         // only has one native bullet glyph), see `format::list_level_marker`.
         if paragraph.list.is_none() {
+            // A checklist item (`☐`/`☑` + tab) is a Markdown task.
+            for (glyph, mark) in [('☐', ' '), ('☑', 'x')] {
+                if let Some(rest) = body
+                    .strip_prefix(glyph)
+                    .and_then(|rest| rest.strip_prefix('\t'))
+                {
+                    return format!(
+                        "{}- [{mark}] {}",
+                        "  ".repeat(level.saturating_sub(1)),
+                        rest.trim_start()
+                    );
+                }
+            }
             if let Some((glyph_level, rest)) = strip_literal_bullet(&body, level) {
                 return format!(
                     "{}- {}",
@@ -681,8 +697,12 @@ impl Writer {
         }
         let level = Self::indent_level(paragraph.indent);
         paragraph.inlines.iter().any(|inline| match inline {
-            Inline::Text(text, _, _) => strip_literal_bullet(text, level).is_some(),
-            Inline::Picture(_) | Inline::Math(_) | Inline::Rule => false,
+            Inline::Text(text, _, _) => {
+                strip_literal_bullet(text, level).is_some()
+                    || text.starts_with("☐\t")
+                    || text.starts_with("☑\t")
+            }
+            Inline::Picture(_) | Inline::Math(_) | Inline::Rule(_) => false,
         })
     }
 
@@ -695,7 +715,7 @@ impl Writer {
             .flat_map(|paragraph| paragraph.inlines.iter())
             .filter_map(|inline| match inline {
                 Inline::Text(text, _, _) => Some(text.as_str()),
-                Inline::Picture(_) | Inline::Math(_) | Inline::Rule => None,
+                Inline::Picture(_) | Inline::Math(_) | Inline::Rule(_) => None,
             })
             .collect();
         let label = text.split('\t').next().unwrap_or("").trim();
@@ -715,7 +735,7 @@ impl Writer {
                 }
                 Inline::Picture(bytes) => out.push_str(&self.picture(bytes)),
                 Inline::Math(latex) => out.push_str(&format!("${}$", latex.trim())),
-                Inline::Rule => out.push_str("---"),
+                Inline::Rule(page) => out.push_str(if *page { PAGE_BREAK } else { "---" }),
             }
         }
         out
@@ -787,7 +807,7 @@ impl Writer {
             let all_code = cell.iter().all(|paragraph| {
                 paragraph.inlines.iter().all(|inline| match inline {
                     Inline::Text(text, format, _) => format.code || text.trim().is_empty(),
-                    Inline::Picture(_) | Inline::Math(_) | Inline::Rule => false,
+                    Inline::Picture(_) | Inline::Math(_) | Inline::Rule(_) => false,
                 })
             });
             let any_code = cell.iter().any(|paragraph| {
@@ -805,7 +825,7 @@ impl Writer {
                             .iter()
                             .filter_map(|inline| match inline {
                                 Inline::Text(text, _, _) => Some(text.as_str()),
-                                Inline::Picture(_) | Inline::Math(_) | Inline::Rule => None,
+                                Inline::Picture(_) | Inline::Math(_) | Inline::Rule(_) => None,
                             })
                             .collect()
                     })
@@ -875,6 +895,10 @@ fn strip_literal_bullet(body: &str, indent_level: usize) -> Option<(usize, &str)
     };
     Some((level, &body[after + 1..]))
 }
+
+/// A page break in Markdown: the HTML that Obsidian, Pandoc and browsers turn
+/// into a new page when printing; Nodi reads it back as a page break.
+pub const PAGE_BREAK: &str = "<div style=\"page-break-after: always;\"></div>";
 
 /// Escapes characters that would otherwise start Markdown syntax.
 fn escape(text: &str) -> String {

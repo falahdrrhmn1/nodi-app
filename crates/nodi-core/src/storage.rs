@@ -646,6 +646,177 @@ pub struct Settings {
     /// `data/markdown`).
     #[serde(default)]
     pub markdown_dir: String,
+    /// View > Sort Notes.
+    #[serde(default)]
+    pub tree_sort: crate::tree::SortOrder,
+    #[serde(default)]
+    pub tree_sort_desc: bool,
+    /// Folders above notes when sorted (not in the manual order).
+    #[serde(default = "default_true")]
+    pub folders_first: bool,
+    /// Preferences > Sounds: beeps and message-box sounds (default off).
+    #[serde(default)]
+    pub sounds: bool,
+    /// Preferences > two quick spaces type ". ".
+    #[serde(default = "default_true")]
+    pub double_space_period: bool,
+    /// View > Line Numbers.
+    #[serde(default = "default_true")]
+    pub line_numbers: bool,
+    /// View > Background: plain, lines, grid or dots behind the text.
+    #[serde(default)]
+    pub background: Background,
+    /// Preferences > default font for new text.
+    #[serde(default = "default_body_font")]
+    pub body_font: String,
+    /// Preferences > default size (points) for new text.
+    #[serde(default = "default_body_size")]
+    pub body_size: u32,
+    /// Name of the chosen theme preset or saved theme (`theme` keeps the
+    /// light/dark/custom mode for older files).
+    #[serde(default)]
+    pub theme_name: String,
+    /// Themes the user saved (Theme Editor > Save As My Theme).
+    #[serde(default)]
+    pub my_themes: Vec<ThemeSpec>,
+}
+
+/// Editor background pattern (View > Background).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Background {
+    #[default]
+    Plain,
+    Lines,
+    Grid,
+    Dots,
+}
+
+fn default_body_font() -> String {
+    "Segoe UI".to_owned()
+}
+
+fn default_body_size() -> u32 {
+    11
+}
+
+/// A complete colour + font theme: every colour of the window, as `#rrggbb`.
+/// Presets ship with Nodi; users save their own and copy them as JSON text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeSpec {
+    pub name: String,
+    /// Note area.
+    pub editor_bg: String,
+    pub editor_text: String,
+    /// Frame, toolbars, menus and dialogs around the note.
+    pub window_bg: String,
+    pub window_text: String,
+    /// Notes Explorer.
+    pub tree_bg: String,
+    pub tree_text: String,
+    /// Tabs.
+    pub tab_bg: String,
+    pub tab_active: String,
+    /// Selection / checked buttons / highlights.
+    pub accent: String,
+    pub border: String,
+    /// Line numbers and the background pattern.
+    pub gutter_text: String,
+    pub pattern: String,
+    /// Font of the tree, tabs and status bar (empty = Segoe UI).
+    pub ui_font: String,
+    pub ui_size: u32,
+}
+
+impl Default for ThemeSpec {
+    fn default() -> Self {
+        Self {
+            name: "Light".to_owned(),
+            editor_bg: "#ffffff".to_owned(),
+            editor_text: "#1f1f1f".to_owned(),
+            window_bg: "#f0f0f0".to_owned(),
+            window_text: "#1f1f1f".to_owned(),
+            tree_bg: "#ffffff".to_owned(),
+            tree_text: "#1f1f1f".to_owned(),
+            tab_bg: "#f0f0f0".to_owned(),
+            tab_active: "#ffffff".to_owned(),
+            accent: "#cce8ff".to_owned(),
+            border: "#c8c8c8".to_owned(),
+            gutter_text: "#9a9a9a".to_owned(),
+            pattern: "#e8edf3".to_owned(),
+            ui_font: "Segoe UI".to_owned(),
+            ui_size: 9,
+        }
+    }
+}
+
+impl ThemeSpec {
+    /// Every colour field with its label (Theme Editor rows).
+    pub fn colours_mut(&mut self) -> [(&'static str, &mut String); 12] {
+        [
+            ("Note background", &mut self.editor_bg),
+            ("Note text", &mut self.editor_text),
+            ("Window background", &mut self.window_bg),
+            ("Window text", &mut self.window_text),
+            ("Notes Explorer background", &mut self.tree_bg),
+            ("Notes Explorer text", &mut self.tree_text),
+            ("Tab bar", &mut self.tab_bg),
+            ("Active tab", &mut self.tab_active),
+            ("Accent (selection, checked)", &mut self.accent),
+            ("Borders", &mut self.border),
+            ("Line numbers", &mut self.gutter_text),
+            ("Background pattern", &mut self.pattern),
+        ]
+    }
+
+    /// Replaces unparsable colours with this theme's defaults, so a pasted
+    /// or hand-edited theme can never make text unreadable.
+    pub fn clamp(&mut self) {
+        let fallback = ThemeSpec::default();
+        let pairs = [
+            (&mut self.editor_bg, &fallback.editor_bg),
+            (&mut self.editor_text, &fallback.editor_text),
+            (&mut self.window_bg, &fallback.window_bg),
+            (&mut self.window_text, &fallback.window_text),
+            (&mut self.tree_bg, &fallback.tree_bg),
+            (&mut self.tree_text, &fallback.tree_text),
+            (&mut self.tab_bg, &fallback.tab_bg),
+            (&mut self.tab_active, &fallback.tab_active),
+            (&mut self.accent, &fallback.accent),
+            (&mut self.border, &fallback.border),
+            (&mut self.gutter_text, &fallback.gutter_text),
+            (&mut self.pattern, &fallback.pattern),
+        ];
+        for (value, default) in pairs {
+            match parse_hex_color(value) {
+                Some(rgb) => *value = format_hex_color(rgb),
+                None => *value = default.clone(),
+            }
+        }
+        if self.ui_font.trim().is_empty() {
+            self.ui_font = fallback.ui_font;
+        }
+        self.ui_size = self.ui_size.clamp(7, 16);
+        let name = self.name.trim().to_owned();
+        self.name = if name.is_empty() {
+            "My theme".to_owned()
+        } else {
+            name.chars().take(60).collect()
+        };
+    }
+
+    /// The theme as pretty JSON (Copy Theme).
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+
+    /// A theme pasted as JSON text (Paste Theme); colours are checked.
+    pub fn from_json(text: &str) -> Option<Self> {
+        let mut spec: ThemeSpec = serde_json::from_str(text.trim()).ok()?;
+        spec.clamp();
+        Some(spec)
+    }
 }
 
 impl Default for Settings {
@@ -657,6 +828,17 @@ impl Default for Settings {
             spell_check: false,
             ctrl_arrow_scroll: true,
             markdown_dir: String::new(),
+            tree_sort: crate::tree::SortOrder::Manual,
+            tree_sort_desc: false,
+            folders_first: true,
+            sounds: false,
+            double_space_period: true,
+            line_numbers: true,
+            background: Background::Plain,
+            body_font: default_body_font(),
+            body_size: default_body_size(),
+            theme_name: String::new(),
+            my_themes: Vec::new(),
         }
     }
 }
@@ -679,6 +861,13 @@ impl Settings {
             if parse_hex_color(value).is_none() {
                 *value = (*fallback).clone();
             }
+        }
+        if self.body_font.trim().is_empty() {
+            self.body_font = default_body_font();
+        }
+        self.body_size = self.body_size.clamp(6, 72);
+        for theme in &mut self.my_themes {
+            theme.clamp();
         }
     }
 }
