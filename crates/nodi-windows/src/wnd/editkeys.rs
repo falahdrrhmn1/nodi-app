@@ -248,7 +248,11 @@ unsafe extern "system" fn subclass(
                 editor::scroll_lines(hwnd, if key == VK_UP { -1 } else { 1 });
                 return 0;
             }
-            if !alt && !crate::wnd::dialogs::sounds() && silent_boundary(hwnd, key, ctrl) {
+            // Backspace at the very start still removes a list marker or a
+            // heading first (below); only a Backspace that does nothing is
+            // swallowed, after that.
+            let silent = !alt && !crate::wnd::dialogs::sounds();
+            if silent && key != VK_BACK && silent_boundary(hwnd, key, ctrl) {
                 return 0;
             }
             if ctrl || alt {
@@ -278,6 +282,9 @@ unsafe extern "system" fn subclass(
                     return result;
                 }
             } else if key == VK_BACK && !shift && backspace_key(hwnd) {
+                return 0;
+            }
+            if silent && key == VK_BACK && silent_boundary(hwnd, key, ctrl) {
                 return 0;
             }
             let paste =
