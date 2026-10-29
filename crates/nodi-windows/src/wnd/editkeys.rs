@@ -22,12 +22,14 @@ use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_BACK, VK_CONTROL, VK_DOWN, VK_INSERT, VK_MENU, VK_RETURN, VK_SHIFT, VK_UP,
+    GetKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_PASTE,
+    PostMessageW, SendMessageW, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_PASTE,
 };
 
 use crate::wnd::{editor, format, image, link};
@@ -79,6 +81,40 @@ pub fn install(editor: HWND, frame: HWND) {
 fn key_down(key: u16) -> bool {
     // SAFETY: plain key state query.
     unsafe { GetKeyState(i32::from(key)) < 0 }
+}
+
+/// `EM_GETLINECOUNT`: how many display lines the editor holds.
+const EM_GETLINECOUNT: u32 = 0x00BA;
+
+/// True when pressing `key` can neither move the caret nor change the text,
+/// so Rich Edit would only beep (or do nothing) if it got the key. Used while
+/// Preferences > Sounds is off, where that beep is unwanted.
+///
+/// Ctrl+Left/Right/Back/Delete keep their word-wise behaviour: their boundary
+/// cases are the same as here (nothing to move over or delete). Ctrl+Up/Down
+/// are left alone because they scroll (`CTRL_ARROW_SCROLL`) or jump by
+/// paragraph. Shift is irrelevant: a selection at the edge beeps too.
+fn silent_boundary(editor: HWND, key: u16, ctrl: bool) -> bool {
+    if ctrl && matches!(key, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT) {
+        return false;
+    }
+    let (from, to) = editor::selection(editor);
+    let length = editor::text_length(editor);
+    let line_of = |pos: i32| -> i32 {
+        // SAFETY: `editor` is the live Rich Edit control of this subclass.
+        unsafe { SendMessageW(editor, editor::EM_EXLINEFROMCHAR, 0, pos as isize) as i32 }
+    };
+    match key {
+        VK_DOWN | VK_NEXT => {
+            // SAFETY: plain query of our own control.
+            let lines = unsafe { SendMessageW(editor, EM_GETLINECOUNT, 0, 0) as i32 };
+            line_of(to) >= lines - 1
+        }
+        VK_UP | VK_PRIOR => line_of(from) == 0,
+        VK_RIGHT | VK_DELETE => from == to && to >= length,
+        VK_LEFT | VK_BACK => from == to && from == 0,
+        _ => false,
+    }
 }
 
 /// Forgets the remembered marker conversion (any later edit invalidates it).
@@ -144,6 +180,14 @@ unsafe extern "system" fn subclass(
     // (list Enter/Backspace, markers, paste conversions, checkbox clicks)
     // must not change it either. Scrolling and selecting still work.
     if editor::is_read_only(hwnd) {
+        // A locked note beeps for every refused key. With Preferences > Sounds
+        // off those keys are swallowed here instead of reaching Rich Edit.
+        if !crate::wnd::dialogs::sounds()
+            && ((msg == WM_CHAR && wparam >= 0x20)
+                || (msg == WM_KEYDOWN && matches!(wparam as u16, VK_RETURN | VK_BACK | VK_DELETE)))
+        {
+            return 0;
+        }
         let editing_key = msg == WM_KEYDOWN
             && matches!(wparam as u16, VK_RETURN | VK_BACK | VK_INSERT)
             || (msg == WM_KEYDOWN && ctrl && wparam as u16 == u16::from(b'V'));
@@ -202,6 +246,9 @@ unsafe extern "system" fn subclass(
                 && CTRL_ARROW_SCROLL.with(|flag| flag.get())
             {
                 editor::scroll_lines(hwnd, if key == VK_UP { -1 } else { 1 });
+                return 0;
+            }
+            if !alt && !crate::wnd::dialogs::sounds() && silent_boundary(hwnd, key, ctrl) {
                 return 0;
             }
             if ctrl || alt {
