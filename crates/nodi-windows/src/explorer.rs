@@ -362,8 +362,19 @@ impl App {
 
 impl App {
     /// The file a note was imported from, when it still has one recorded.
+    ///
+    /// `tree.json` can come from elsewhere (a restored backup), so the value
+    /// is only trusted as a note file on a local drive: a network path would
+    /// send the Windows login to that host, and Save Back must never write
+    /// anything but a `.md` / `.markdown` / `.rtf` / `.txt` file.
     pub fn import_source(&self, id: &NoteId) -> Option<String> {
-        self.tree.get(id).and_then(|node| node.source.clone())
+        let source = self.tree.get(id).and_then(|node| node.source.clone())?;
+        let path = nodi_core::links::local_path(&source)?;
+        let extension = std::path::Path::new(&path)
+            .extension()?
+            .to_str()?
+            .to_ascii_lowercase();
+        matches!(extension.as_str(), "md" | "markdown" | "rtf" | "txt").then_some(path)
     }
 
     /// View > Refresh Notes (F5 in the tree): reads `tree.json` and the

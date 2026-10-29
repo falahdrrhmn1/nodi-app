@@ -721,6 +721,9 @@ fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
 fn take_pictures(markdown: &str) -> (String, Vec<Vec<u8>>) {
     const MAX_PICTURES: usize = 12;
     const MAX_BYTES: usize = 15 * 1024 * 1024;
+    // The paste waits for downloads on the UI thread: at most 10 s for one
+    // picture and 20 s for all of them; slower ones stay links.
+    let all_done = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let mut pictures = Vec::new();
     let mut text = String::with_capacity(markdown.len());
     let mut rest = markdown;
@@ -743,11 +746,16 @@ fn take_pictures(markdown: &str) -> (String, Vec<Vec<u8>>) {
             let bytes = if let Some(bytes) = nodi_core::links::data_uri_bytes(target) {
                 Some(bytes)
             } else if target.starts_with("http://") || target.starts_with("https://") {
-                crate::wnd::net::get(target, MAX_BYTES)
+                let one = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                crate::wnd::net::get(target, MAX_BYTES, one.min(all_done))
             } else {
+                // Size checked before reading; only ordinary files.
                 nodi_core::links::local_path(target)
+                    .filter(|path| {
+                        std::fs::metadata(path)
+                            .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_BYTES as u64)
+                    })
                     .and_then(|path| std::fs::read(path).ok())
-                    .filter(|bytes| bytes.len() <= MAX_BYTES)
             };
             bytes.filter(|bytes| nodi_core::image::sniff(bytes).is_some())
         });

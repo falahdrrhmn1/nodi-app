@@ -6,9 +6,9 @@ use std::ptr;
 
 use windows_sys::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts, URL_COMPONENTS, WINHTTP_FLAG_SECURE,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpQueryOption, WinHttpReadData,
+    WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
+    URL_COMPONENTS, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 use crate::win;
@@ -48,20 +48,55 @@ fn is_public(address: &std::net::IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public(&std::net::IpAddr::V4(v4));
             }
+            let [_, second, ..] = v6.segments();
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (first & 0xFE00) == 0xFC00
-                || (first & 0xFFC0) == 0xFE80)
+                || (first & 0xFE00) == 0xFC00 // unique local
+                || (first & 0xFFC0) == 0xFE80 // link-local
+                || (first & 0xFFC0) == 0xFEC0 // site-local
+                || first == 0x2002 // 6to4: wraps any IPv4 address
+                || (first == 0x0064 && second == 0xFF9B) // NAT64
+                || v6.to_ipv4().is_some()) // IPv4-compatible
         }
     }
 }
 
+/// The remote address the request really connected to
+/// (`WINHTTP_OPTION_CONNECTION_INFO`).
+unsafe fn connected_address(request: *mut core::ffi::c_void) -> Option<std::net::IpAddr> {
+    // WINHTTP_CONNECTION_INFO: cbSize, then two SOCKADDR_STORAGE (128 bytes,
+    // 8-byte aligned): the local address at 8, the remote one at 136.
+    let mut buffer = [0u64; 33];
+    let length = std::mem::size_of_val(&buffer) as u32;
+    let bytes = buffer.as_mut_ptr() as *mut u8;
+    std::ptr::copy_nonoverlapping(length.to_le_bytes().as_ptr(), bytes, 4);
+    let mut size = length;
+    if WinHttpQueryOption(request, 93, bytes as *mut core::ffi::c_void, &mut size) == 0 {
+        return None;
+    }
+    let raw = std::slice::from_raw_parts(bytes, length as usize);
+    let remote = &raw[136..];
+    match u16::from_le_bytes([remote[0], remote[1]]) {
+        2 => {
+            let octets: [u8; 4] = remote[4..8].try_into().ok()?;
+            Some(std::net::IpAddr::from(octets))
+        }
+        23 => {
+            let octets: [u8; 16] = remote[8..24].try_into().ok()?;
+            Some(std::net::IpAddr::from(octets))
+        }
+        _ => None,
+    }
+}
+
 /// GET `url` (http or https); `None` on any error, a status other than 200,
-/// or more than `max_bytes`. Waits at most a few seconds. Pasted content
-/// decides the address, so only hosts on the public internet are contacted
-/// (no loopback, LAN or link-local addresses) and redirects are not followed.
-pub fn get(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
+/// more than `max_bytes`, or when `deadline` passes. Pasted content decides
+/// the address, so only hosts on the public internet are contacted: the
+/// name must resolve to public addresses only, the address really connected
+/// to is checked again before the body is read (no DNS rebinding), no proxy
+/// is used and redirects are not followed.
+pub fn get(url: &str, max_bytes: usize, deadline: std::time::Instant) -> Option<Vec<u8>> {
     let lower = url.to_ascii_lowercase();
     if !lower.starts_with("http://") && !lower.starts_with("https://") {
         return None;
@@ -103,13 +138,17 @@ pub fn get(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
             .chain([0])
             .collect();
 
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         let agent = win::wide("Nodi");
-        // 4 = WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY (Windows' proxy settings).
-        let session = Handle(WinHttpOpen(agent.as_ptr(), 4, ptr::null(), ptr::null(), 0));
+        // 1 = WINHTTP_ACCESS_TYPE_NO_PROXY: the connected address must be the
+        // server's own, so it can be checked.
+        let session = Handle(WinHttpOpen(agent.as_ptr(), 1, ptr::null(), ptr::null(), 0));
         if session.0.is_null() {
             return None;
         }
-        WinHttpSetTimeouts(session.0, 4000, 4000, 4000, 8000);
+        WinHttpSetTimeouts(session.0, 3000, 3000, 3000, 4000);
         let connection = Handle(WinHttpConnect(
             session.0,
             host_name.as_ptr(),
@@ -145,6 +184,11 @@ pub fn get(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
         {
             return None;
         }
+        // The name may have resolved differently for WinHTTP than for the
+        // check above (DNS rebinding): verify where the request really went.
+        if !connected_address(request.0).is_some_and(|address| is_public(&address)) {
+            return None;
+        }
         let mut status = 0u32;
         let mut size = std::mem::size_of::<u32>() as u32;
         WinHttpQueryHeaders(
@@ -160,6 +204,9 @@ pub fn get(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
         }
         let mut body = Vec::new();
         loop {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
             let mut available = 0u32;
             if WinHttpQueryDataAvailable(request.0, &mut available) == 0 {
                 return None;
@@ -210,11 +257,25 @@ mod tests {
             let address: std::net::IpAddr = private.parse().unwrap();
             assert!(!is_public(&address), "{private}");
         }
+        for wrapped in [
+            "2002:c0a8:0101::1",
+            "64:ff9b::c0a8:101",
+            "fec0::1",
+            "::c0a8:101",
+        ] {
+            let address: std::net::IpAddr = wrapped.parse().unwrap();
+            assert!(!is_public(&address), "{wrapped}");
+        }
         for public in ["8.8.8.8", "140.82.112.3", "2606:4700::1111"] {
             let address: std::net::IpAddr = public.parse().unwrap();
             assert!(is_public(&address), "{public}");
         }
-        assert_eq!(get("http://127.0.0.1:9/x.png", 1024), None);
-        assert_eq!(get("file:///C:/x.png", 1024), None);
+        let soon = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(get("http://127.0.0.1:9/x.png", 1024, soon), None);
+        assert_eq!(get("file:///C:/x.png", 1024, soon), None);
+        assert_eq!(
+            get("http://example.com/x.png", 1024, std::time::Instant::now()),
+            None
+        );
     }
 }
