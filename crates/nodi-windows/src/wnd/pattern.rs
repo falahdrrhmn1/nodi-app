@@ -17,8 +17,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, LineTo, MaskBlt, MoveToEx,
     SelectObject, SetBkColor, HGDIOBJ, PAINTSTRUCT, PS_SOLID, SRCCOPY,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, HideCaret, SendMessageW, ShowCaret,
+    GetClientRect, GetGUIThreadInfo, HideCaret, SendMessageW, ShowCaret, GUITHREADINFO,
 };
 
 thread_local! {
@@ -66,8 +67,10 @@ pub unsafe fn paint(editor: HWND, dpi: i32) -> bool {
     }
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(editor, &mut ps);
-    // Our own painting would copy the caret into the memory bitmap; hide it
-    // while the pattern is drawn and show it again afterwards.
+    // Rich Edit draws its insertion caret into the bitmap it prints for us.
+    // Hidden while the pattern is painted, that caret never reaches the
+    // screen; `clear_printed_caret` also clears the strip it left behind, so
+    // moving the caret cannot leave a second one where it used to be.
     HideCaret(editor);
     let mut rect = RECT::default();
     GetClientRect(editor, &mut rect);
@@ -82,6 +85,7 @@ pub unsafe fn paint(editor: HWND, dpi: i32) -> bool {
         content as usize,
         PRF_CLIENT | PRF_ERASEBKGND,
     );
+    clear_printed_caret(editor, content);
 
     let pattern = CreateCompatibleDC(dc);
     let pattern_bitmap = CreateCompatibleBitmap(dc, width, height);
@@ -118,6 +122,11 @@ pub unsafe fn paint(editor: HWND, dpi: i32) -> bool {
         0,
         ROP_PATTERN_ON_BACKGROUND,
     );
+    // `WM_PRINTCLIENT` hides and shows the caret around its own painting, so
+    // it may be visible again even though it is still inside our paint. Hide
+    // it a second time (matched by the second `ShowCaret` below) while the
+    // finished bitmap replaces the pixels on screen.
+    HideCaret(editor);
     let paint = ps.rcPaint;
     BitBlt(
         dc,
@@ -141,8 +150,48 @@ pub unsafe fn paint(editor: HWND, dpi: i32) -> bool {
     DeleteObject(content_bitmap as HGDIOBJ);
     DeleteDC(content);
     ShowCaret(editor);
+    ShowCaret(editor);
     EndPaint(editor, &ps);
     true
+}
+
+/// Paints the key colour over the caret Rich Edit printed into `dc`. Without
+/// this the bitmap would carry a copy of the caret to its old position when a
+/// key moved it, showing a second caret until that area repainted.
+unsafe fn clear_printed_caret(editor: HWND, dc: windows_sys::Win32::Graphics::Gdi::HDC) {
+    if GetFocus() != editor {
+        return;
+    }
+    // A selection is drawn instead of the caret, so there is nothing to clear
+    // (and clearing would punch a pattern hole through the highlight).
+    let (from, to) = crate::wnd::editor::selection(editor);
+    if from != to {
+        return;
+    }
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..GUITHREADINFO::default()
+    };
+    if GetGUIThreadInfo(0, &mut info) == 0 || info.hwndCaret != editor {
+        return;
+    }
+    let rc = info.rcCaret;
+    if rc.bottom <= rc.top {
+        return;
+    }
+    // The insertion point is the left edge even for a block caret; a two-pixel
+    // strip is enough for the line Rich Edit draws. The pixel before the caret
+    // is left alone: it belongs to the character (or picture) before it.
+    let strip = RECT {
+        left: rc.left,
+        top: rc.top,
+        right: rc.left + 2,
+        bottom: rc.bottom,
+    };
+    let (_, _, editor_bg) = CURRENT.with(Cell::get);
+    let brush = CreateSolidBrush(key_colour(editor_bg));
+    FillRect(dc, &strip, brush);
+    DeleteObject(brush as HGDIOBJ);
 }
 
 unsafe fn draw_pattern(

@@ -187,8 +187,8 @@ pub const PAGE_BREAK_SIZE: (u32, u32) = (600, 40);
 /// written with it still carry a page break.
 const OLD_PAGE_BREAK_SIZE: (u32, u32) = (600, 24);
 
-/// The page-break picture: a solid grey band across the note with a slightly
-/// darker edge, like the gap between two pages in Word. The rows above and
+/// The page-break picture: a solid grey band across the note with a lighter
+/// one-pixel edge, like the gap between two pages in Word. The rows above and
 /// below the band are transparent, so only the band itself separates the
 /// pages. A grey + alpha PNG, recognised later by its exact size
 /// ([`is_page_picture`]).
@@ -199,12 +199,12 @@ pub fn page_break_png() -> Vec<u8> {
         let (grey, alpha) = match y {
             // Transparent gap above the band.
             0..=7 => (0xFF, 0),
-            // Darker top edge of the band.
-            8 => (0x48, 0xFF),
-            // The solid band between the two pages.
-            9..=31 => (0x60, 0xFF),
-            // Darker bottom edge of the band.
-            32 => (0x48, 0xFF),
+            // Lighter page edge above the gap.
+            8 => (0x8C, 0xFF),
+            // The solid gap between the two pages.
+            9..=31 => (0x52, 0xFF),
+            // Lighter page edge below the gap.
+            32 => (0x8C, 0xFF),
             // Transparent gap below the band.
             _ => (0xFF, 0),
         };
