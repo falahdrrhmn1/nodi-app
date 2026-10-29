@@ -1,5 +1,6 @@
 //! Frame window: creation, message loop, layout and splitter handling.
 
+pub mod caret;
 pub mod clipboard;
 pub mod context;
 pub mod dialogs;

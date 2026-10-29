@@ -17,7 +17,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, LineTo, MaskBlt, MoveToEx,
     SelectObject, SetBkColor, HGDIOBJ, PAINTSTRUCT, PS_SOLID, SRCCOPY,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, SendMessageW};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, HideCaret, SendMessageW, ShowCaret,
+};
 
 thread_local! {
     /// (pattern, pattern colour, real background colour).
@@ -64,6 +66,9 @@ pub unsafe fn paint(editor: HWND, dpi: i32) -> bool {
     }
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(editor, &mut ps);
+    // Our own painting would copy the caret into the memory bitmap; hide it
+    // while the pattern is drawn and show it again afterwards.
+    HideCaret(editor);
     let mut rect = RECT::default();
     GetClientRect(editor, &mut rect);
     let (width, height) = (rect.right.max(1), rect.bottom.max(1));
@@ -135,6 +140,7 @@ pub unsafe fn paint(editor: HWND, dpi: i32) -> bool {
     SelectObject(content, old_content);
     DeleteObject(content_bitmap as HGDIOBJ);
     DeleteDC(content);
+    ShowCaret(editor);
     EndPaint(editor, &ps);
     true
 }

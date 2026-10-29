@@ -181,25 +181,34 @@ pub fn is_rule_picture(bytes: &[u8]) -> bool {
 }
 
 /// Size of the page-break picture (`----` + Enter, Insert > Page Break).
-pub const PAGE_BREAK_SIZE: (u32, u32) = (600, 24);
+pub const PAGE_BREAK_SIZE: (u32, u32) = (600, 40);
 
-/// The page-break picture: the soft bottom edge of one page, a dashed line,
-/// and the top edge of the next — a grey + alpha PNG, recognised later by
-/// its exact size ([`is_page_picture`]).
+/// Size the page-break picture had before it became a solid band; notes
+/// written with it still carry a page break.
+const OLD_PAGE_BREAK_SIZE: (u32, u32) = (600, 24);
+
+/// The page-break picture: a solid grey band across the note with a slightly
+/// darker edge, like the gap between two pages in Word. The rows above and
+/// below the band are transparent, so only the band itself separates the
+/// pages. A grey + alpha PNG, recognised later by its exact size
+/// ([`is_page_picture`]).
 pub fn page_break_png() -> Vec<u8> {
     let (width, height) = PAGE_BREAK_SIZE;
     let mut pixels = Vec::with_capacity((width * height * 2) as usize);
     for y in 0..height {
-        for x in 0..width {
-            let (grey, alpha) = match y {
-                // Shadow under the page above, fading out.
-                0..=4 => (0x60, [70u8, 48, 30, 16, 6][y as usize]),
-                // The dashed cut between the pages.
-                11 | 12 if (x / 8) % 2 == 0 => (0x90, 0xFF),
-                // Shadow over the top of the next page.
-                19..=23 => (0x60, [6u8, 16, 30, 48, 70][(y - 19) as usize]),
-                _ => (0xFF, 0),
-            };
+        let (grey, alpha) = match y {
+            // Transparent gap above the band.
+            0..=7 => (0xFF, 0),
+            // Darker top edge of the band.
+            8 => (0x48, 0xFF),
+            // The solid band between the two pages.
+            9..=31 => (0x60, 0xFF),
+            // Darker bottom edge of the band.
+            32 => (0x48, 0xFF),
+            // Transparent gap below the band.
+            _ => (0xFF, 0),
+        };
+        for _ in 0..width {
             pixels.push(grey);
             pixels.push(alpha);
         }
@@ -207,9 +216,13 @@ pub fn page_break_png() -> Vec<u8> {
     crate::math::encode_png(width, height, &pixels, "")
 }
 
-/// True for the page-break picture (exactly [`PAGE_BREAK_SIZE`]).
+/// True for the page-break picture: the current [`PAGE_BREAK_SIZE`], or the
+/// size older notes were written with.
 pub fn is_page_picture(bytes: &[u8]) -> bool {
-    sniff(bytes).is_some_and(|info| (info.width, info.height) == PAGE_BREAK_SIZE)
+    sniff(bytes).is_some_and(|info| {
+        (info.width, info.height) == PAGE_BREAK_SIZE
+            || (info.width, info.height) == OLD_PAGE_BREAK_SIZE
+    })
 }
 
 #[cfg(test)]
@@ -221,6 +234,9 @@ mod tests {
         let png = page_break_png();
         assert!(is_page_picture(&png));
         assert!(!is_rule_picture(&png));
+        // Notes written before the band was this tall still hold one.
+        assert!(is_page_picture(&png_header(600, 24)));
+        assert!(!is_page_picture(&png_header(600, 25)));
     }
 
     fn png_header(width: u32, height: u32) -> Vec<u8> {

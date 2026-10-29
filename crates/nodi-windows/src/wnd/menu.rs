@@ -5,7 +5,7 @@
 use std::ptr;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use nodi_core::storage::Background;
+use nodi_core::storage::{Background, CaretStyle};
 use nodi_core::tree::SortOrder;
 use nodi_core::NodeKind;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -197,6 +197,11 @@ pub const IDM_BG_PLAIN: u16 = 310;
 pub const IDM_BG_LINES: u16 = 311;
 pub const IDM_BG_GRID: u16 = 312;
 pub const IDM_BG_DOTS: u16 = 313;
+/// View > Cursor: the text caret's shape.
+pub const IDM_CARET_LINE: u16 = 380;
+pub const IDM_CARET_THICK: u16 = 381;
+pub const IDM_CARET_BLOCK: u16 = 382;
+pub const IDM_CARET_UNDERLINE: u16 = 383;
 /// View > Theme presets (one id each, in `theme::presets` order).
 pub const IDM_THEME_PRESET_FIRST: u16 = 320;
 pub const IDM_THEME_PRESET_LAST: u16 = 344;
@@ -410,6 +415,15 @@ pub fn create_menu() -> HMENU {
                     Item::Cmd(IDM_BG_DOTS, "&Dots"),
                 ]),
                 "&Background",
+            ),
+            Item::Popup(
+                popup(&[
+                    Item::Cmd(IDM_CARET_LINE, "&Line (default)"),
+                    Item::Cmd(IDM_CARET_THICK, "&Thick line"),
+                    Item::Cmd(IDM_CARET_BLOCK, "&Block"),
+                    Item::Cmd(IDM_CARET_UNDERLINE, "&Underline"),
+                ]),
+                "&Cursor",
             ),
             Item::Checked(IDM_VIEW_LINE_NUMBERS, "&Line Numbers"),
             Item::Sep,
@@ -698,6 +712,12 @@ pub fn sync_settings(app: &App) {
     check_item(app, IDM_BG_LINES, background == Background::Lines);
     check_item(app, IDM_BG_GRID, background == Background::Grid);
     check_item(app, IDM_BG_DOTS, background == Background::Dots);
+    let caret = app.settings.caret_style;
+    check_item(app, IDM_CARET_LINE, caret == CaretStyle::Line);
+    check_item(app, IDM_CARET_THICK, caret == CaretStyle::Thick);
+    check_item(app, IDM_CARET_BLOCK, caret == CaretStyle::Block);
+    check_item(app, IDM_CARET_UNDERLINE, caret == CaretStyle::Underline);
+    crate::wnd::caret::set_style(caret);
     check_item(app, IDM_TOOLS_MIRROR_TOGGLE, app.settings.markdown_mirror);
     let sort = app.settings.tree_sort;
     check_item(app, IDM_SORT_MANUAL, sort == SortOrder::Manual);
@@ -1035,6 +1055,10 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_BG_LINES => app.set_background(Background::Lines),
         IDM_BG_GRID => app.set_background(Background::Grid),
         IDM_BG_DOTS => app.set_background(Background::Dots),
+        IDM_CARET_LINE => app.set_caret_style(CaretStyle::Line),
+        IDM_CARET_THICK => app.set_caret_style(CaretStyle::Thick),
+        IDM_CARET_BLOCK => app.set_caret_style(CaretStyle::Block),
+        IDM_CARET_UNDERLINE => app.set_caret_style(CaretStyle::Underline),
         IDM_VIEW_LINE_NUMBERS => {
             app.settings.line_numbers = !app.settings.line_numbers;
             app.save_settings();

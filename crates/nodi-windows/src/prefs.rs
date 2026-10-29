@@ -1,11 +1,34 @@
 //! Tools > Preferences: default font and size, sounds, typing helpers and
 //! the switches that also live in the View/Tools menus.
 
+use nodi_core::storage::CaretStyle;
+
 use crate::app::App;
 use crate::wnd::form::{Field, Form};
 use crate::wnd::{dialogs, editor, menu, status};
 
 impl App {
+    /// View > Cursor: Line (default), Thick line, Block or Underline.
+    pub fn set_caret_style(&mut self, style: CaretStyle) {
+        self.settings.caret_style = style;
+        self.save_settings();
+        menu::sync_settings(self);
+        if let Some(editor) = self.active_editor() {
+            if style == CaretStyle::Line {
+                crate::wnd::caret::reset(editor);
+            } else {
+                crate::wnd::caret::refresh(editor);
+            }
+        }
+        let name = match style {
+            CaretStyle::Line => "line",
+            CaretStyle::Thick => "thick line",
+            CaretStyle::Block => "block",
+            CaretStyle::Underline => "underline",
+        };
+        status::set_message(self, &format!("Cursor: {name}"));
+    }
+
     /// Hands the saved default font to the editors and the paste converters.
     pub fn apply_body_font(&self) {
         nodi_core::markdown_in::set_body(

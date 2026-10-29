@@ -666,6 +666,9 @@ pub struct Settings {
     /// View > Background: plain, lines, grid or dots behind the text.
     #[serde(default)]
     pub background: Background,
+    /// View > Cursor: the shape of the text caret.
+    #[serde(default)]
+    pub caret_style: CaretStyle,
     /// Preferences > default font for new text.
     #[serde(default = "default_body_font")]
     pub body_font: String,
@@ -690,6 +693,21 @@ pub enum Background {
     Lines,
     Grid,
     Dots,
+}
+
+/// Shape of the text caret (View > Cursor).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaretStyle {
+    /// The thin line Rich Edit draws itself (the default).
+    #[default]
+    Line,
+    /// A line three pixels wide.
+    Thick,
+    /// A block over the character after the caret.
+    Block,
+    /// A line under the character after the caret.
+    Underline,
 }
 
 fn default_body_font() -> String {
@@ -835,6 +853,7 @@ impl Default for Settings {
             double_space_period: true,
             line_numbers: true,
             background: Background::Plain,
+            caret_style: CaretStyle::Line,
             body_font: default_body_font(),
             body_size: default_body_size(),
             theme_name: String::new(),

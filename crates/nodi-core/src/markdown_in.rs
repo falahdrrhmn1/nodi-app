@@ -1015,7 +1015,7 @@ fn push_table(out: &mut String, rows: &[Vec<Vec<Run>>], width: i32) {
 fn push_page_break(out: &mut String, width: i32) {
     let (picture_width, picture_height) = crate::image::PAGE_BREAK_SIZE;
     out.push_str(&format!(
-        "\\pard\\sa0\\sb0{{\\pict\\pngblip\\picw{picture_width}\\pich{picture_height}\\picwgoal{width}\\pichgoal360 "
+        "\\pard\\sa0\\sb0{{\\pict\\pngblip\\picw{picture_width}\\pich{picture_height}\\picwgoal{width}\\pichgoal600 "
     ));
     for byte in crate::image::page_break_png() {
         out.push_str(&format!("{byte:02x}"));

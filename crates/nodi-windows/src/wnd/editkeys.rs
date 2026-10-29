@@ -28,8 +28,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, SendMessageW, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_PASTE,
+    PostMessageW, SendMessageW, WM_CHAR, WM_COMMAND, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PASTE,
+    WM_SETFOCUS, WM_SIZE, WM_VSCROLL,
 };
 
 use crate::wnd::{editor, format, image, link};
@@ -165,7 +166,47 @@ pub fn undo_marker_conversion(editor: HWND) -> bool {
     true
 }
 
+thread_local! {
+    /// How deep the editor subclass is nested (Rich Edit sends messages to
+    /// itself while handling one).
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
 unsafe extern "system" fn subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    frame: usize,
+) -> LRESULT {
+    let depth = DEPTH.with(|depth| depth.replace(depth.get() + 1));
+    let result = subclass_inner(hwnd, msg, wparam, lparam, id, frame);
+    DEPTH.with(|cell| cell.set(depth));
+    // The caret shape is re-applied once Rich Edit has finished with a user
+    // action — never in the middle of it: replacing its caret while it still
+    // handles a message makes it send itself more messages, without end.
+    let user_action = matches!(
+        msg,
+        WM_KEYDOWN
+            | WM_KEYUP
+            | WM_CHAR
+            | WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_MOUSEMOVE
+            | WM_MOUSEWHEEL
+            | WM_SETFOCUS
+            | WM_VSCROLL
+            | WM_HSCROLL
+            | WM_SIZE
+    );
+    if depth == 0 && user_action {
+        crate::wnd::caret::refresh(hwnd);
+    }
+    result
+}
+
+unsafe fn subclass_inner(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,

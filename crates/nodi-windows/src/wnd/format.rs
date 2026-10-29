@@ -1127,7 +1127,7 @@ pub fn insert_page_break(editor: HWND) {
     insert_flat_picture(
         editor,
         &nodi_core::image::page_break_png(),
-        360,
+        600,
         "page break",
     );
 }
@@ -1189,7 +1189,7 @@ pub fn separator_from_marker(editor: HWND) -> bool {
         insert_flat_picture(
             editor,
             &nodi_core::image::page_break_png(),
-            360,
+            600,
             "page break",
         );
     } else {
