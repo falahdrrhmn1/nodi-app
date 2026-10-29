@@ -43,10 +43,26 @@ impl App {
         };
         let flag = |index: usize| values.get(index).is_some_and(|value| value == "1");
         let font = values[0].trim().to_owned();
-        if !font.is_empty() && !crate::wnd::toolbar::font_installed(self, &font) {
+        // "Fixedsys" (a bitmap font Rich Edit cannot draw) can still mean a
+        // TrueType remake such as "Fixedsys Excelsior": take the first
+        // installed font whose name starts with what was typed.
+        let closest = (!font.is_empty() && !crate::wnd::toolbar::font_installed(self, &font))
+            .then(|| crate::wnd::toolbar::closest_font(self, &font))
+            .flatten();
+        if let Some(found) = closest {
             dialogs::info(
                 self.hwnd,
-                &format!("No installed font is called \"{font}\"; the default font stays."),
+                &format!(
+                    "\"{font}\" itself cannot be drawn by the note editor (an old bitmap font or not installed); using \"{found}\" instead."
+                ),
+            );
+            self.settings.body_font = found;
+        } else if !font.is_empty() && !crate::wnd::toolbar::font_installed(self, &font) {
+            dialogs::info(
+                self.hwnd,
+                &format!(
+                    "\"{font}\" cannot be used: it is not installed, or it is an old bitmap font (Fixedsys, Terminal, System…) that the note editor cannot draw. Choose a TrueType/OpenType font such as Consolas or Lucida Console; the default font stays."
+                ),
             );
         } else if !font.is_empty() {
             self.settings.body_font = font;

@@ -10,7 +10,7 @@ use std::ptr;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, EnumFontFamiliesExW, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject,
-    DEFAULT_CHARSET, LOGFONTW, TEXTMETRICW,
+    DEFAULT_CHARSET, LOGFONTW, RASTER_FONTTYPE, TEXTMETRICW,
 };
 use windows_sys::Win32::UI::Controls::{
     BTNS_AUTOSIZE, BTNS_BUTTON, BTNS_CHECK, BTNS_DROPDOWN, BTNS_SEP, BTNS_SHOWTEXT, CCS_NODIVIDER,
@@ -463,11 +463,16 @@ fn installed_fonts(window: HWND) -> Vec<String> {
     unsafe extern "system" fn collect(
         logfont: *const LOGFONTW,
         _metrics: *const TEXTMETRICW,
-        _kind: u32,
+        kind: u32,
         data: LPARAM,
     ) -> i32 {
         // SAFETY: `data` is the `BTreeSet` passed by `installed_fonts`.
         let names = &mut *(data as *mut BTreeSet<String>);
+        // Rich Edit silently substitutes a TrueType face for old bitmap fonts
+        // (Fixedsys, Terminal, System), so listing them would only mislead.
+        if kind & RASTER_FONTTYPE != 0 {
+            return 1;
+        }
         if logfont.is_null() || names.len() > 4096 {
             return 0;
         }
@@ -1006,7 +1011,10 @@ pub fn on_combo_commit(app: &mut App, combo: HWND, code: u16) {
                 apply_face(app, &face);
                 return;
             }
-            let message = format!("No installed font is called {}", text.trim());
+            let message = format!(
+                "\"{}\" cannot be used (not installed, or an old bitmap font such as Fixedsys) — try Consolas or Lucida Console",
+                text.trim()
+            );
             crate::wnd::status::set_message(app, &message);
         } else if combo == app.size_combo {
             match text.trim().parse::<f32>() {
@@ -1250,4 +1258,13 @@ pub fn font_installed(app: &App, name: &str) -> bool {
         )
     };
     index >= 0
+}
+
+/// The first listed (drawable) font whose name starts with `name`, e.g.
+/// "Fixedsys Excelsior 3.01" for "Fixedsys".
+pub fn closest_font(app: &App, name: &str) -> Option<String> {
+    if app.font_combo.is_null() {
+        return None;
+    }
+    combo_match(app.font_combo, name)
 }
