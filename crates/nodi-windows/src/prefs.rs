@@ -51,6 +51,10 @@ impl App {
                 "Default size (pt):",
                 settings.body_size.to_string(),
             ))
+            .field(Field::new(
+                "Default zoom (%):",
+                settings.default_zoom.to_string(),
+            ))
             .checkbox("Sounds (beeps and message-box sounds)", settings.sounds)
             .checkbox("Two quick spaces type \". \"", settings.double_space_period)
             .checkbox("Line numbers next to the text", settings.line_numbers)
@@ -94,12 +98,16 @@ impl App {
             Ok(size) if (6..=72).contains(&size) => self.settings.body_size = size,
             _ => status::set_message(self, "Default size must be 6–72 pt; it was not changed"),
         }
-        self.settings.sounds = flag(2);
-        self.settings.double_space_period = flag(3);
-        let line_numbers = flag(4);
-        self.settings.ctrl_arrow_scroll = flag(5);
-        let spell = flag(6);
-        let mirror = flag(7);
+        let zoom = match values[2].trim().parse::<i32>() {
+            Ok(zoom) if (25..=500).contains(&zoom) => Some(zoom),
+            _ => None,
+        };
+        self.settings.sounds = flag(3);
+        self.settings.double_space_period = flag(4);
+        let line_numbers = flag(5);
+        self.settings.ctrl_arrow_scroll = flag(6);
+        let spell = flag(7);
+        let mirror = flag(8);
 
         self.apply_body_font();
         dialogs::set_sounds(self.settings.sounds);
@@ -109,6 +117,16 @@ impl App {
         if line_numbers != self.settings.line_numbers {
             self.settings.line_numbers = line_numbers;
             crate::wnd::layout(self);
+        }
+        match zoom {
+            Some(percent) => {
+                self.settings.default_zoom = percent;
+                crate::app::set_zoom(self, percent);
+            }
+            None => status::set_message(
+                self,
+                "Default zoom must be a whole number from 25 to 500; it was not changed",
+            ),
         }
         self.save_settings();
         if spell != self.settings.spell_check {

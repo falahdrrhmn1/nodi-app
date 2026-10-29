@@ -1124,9 +1124,10 @@ pub fn insert_page_break(editor: HWND) {
     let Some(_busy) = Busy::enter() else {
         return;
     };
+    let band = crate::wnd::theme::page_band_rgb();
     insert_flat_picture(
         editor,
-        &nodi_core::image::page_break_png(),
+        &nodi_core::image::page_break_png_coloured(band),
         600,
         "page break",
     );
@@ -1186,9 +1187,10 @@ pub fn separator_from_marker(editor: HWND) -> bool {
     editor::replace_selection(editor, "", true);
     editor::set_selection(editor, start, start);
     if page {
+        let band = crate::wnd::theme::page_band_rgb();
         insert_flat_picture(
             editor,
-            &nodi_core::image::page_break_png(),
+            &nodi_core::image::page_break_png_coloured(band),
             600,
             "page break",
         );

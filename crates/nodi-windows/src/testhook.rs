@@ -113,6 +113,7 @@ fn run(app: &mut App, line: &str) -> String {
             })
             .unwrap_or_else(|| "not found".to_owned()),
         ("firstline", Some(window)) => editor::first_visible_line(window).to_string(),
+        ("zoom", Some(window)) => editor::zoom_percent(window).to_string(),
         // Batch 6: screen point a few pixels inside character `n`.
         ("charscreen", Some(window)) => {
             let index: i32 = rest.trim().parse().unwrap_or(0);

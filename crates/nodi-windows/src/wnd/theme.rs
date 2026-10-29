@@ -13,6 +13,7 @@
 //! Themes are full colour sets ([`ThemeSpec`]): presets, plus the user's own
 //! saved themes.
 
+use std::cell::Cell;
 use std::mem::size_of;
 use std::ptr;
 
@@ -22,12 +23,14 @@ use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, SelectObject, HBRUSH, HDC, HGDIOBJ,
+    CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, InvalidateRect, RestoreDC,
+    SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, HBRUSH, HDC, HGDIOBJ, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
-    SetWindowTheme, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_CHECKED, CDRF_DODEFAULT, CDRF_NEWFONT,
-    CDRF_NOTIFYITEMDRAW, NMHDR, NMTBCUSTOMDRAW, NM_CUSTOMDRAW, TBCDRF_NOBACKGROUND, TBCDRF_NOEDGES,
-    TBCDRF_USECDCOLORS,
+    SetWindowTheme, CDDS_ITEMPOSTPAINT, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_CHECKED, CDIS_HOT,
+    CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, NMHDR,
+    NMTBCUSTOMDRAW, NM_CUSTOMDRAW, TBCDRF_NOBACKGROUND, TBCDRF_NOEDGES, TBCDRF_USECDCOLORS,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_GETFONT};
 
@@ -67,6 +70,29 @@ pub struct Palette {
 /// `COLORREF` from components.
 pub const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
     red as u32 | (green as u32) << 8 | (blue as u32) << 16
+}
+
+fn rgb_tuple(colour: u32) -> (u8, u8, u8) {
+    (
+        (colour & 0xFF) as u8,
+        ((colour >> 8) & 0xFF) as u8,
+        ((colour >> 16) & 0xFF) as u8,
+    )
+}
+
+thread_local! {
+    /// Line-number background of the active theme, used for new page gaps.
+    static PAGE_BAND: Cell<u32> = const { Cell::new(0x0052_5252) };
+}
+
+/// Remembers the line-number colour for page breaks inserted from now on.
+pub fn set_page_band(colour: u32) {
+    PAGE_BAND.with(|band| band.set(colour));
+}
+
+/// RGB of the active theme's line-number strip.
+pub fn page_band_rgb() -> (u8, u8, u8) {
+    rgb_tuple(PAGE_BAND.with(Cell::get))
 }
 
 fn darken(colour: u32, amount: u8) -> u32 {
@@ -403,12 +429,16 @@ impl Default for Palette {
 
 /// RTF for display in `palette` (adds the theme sentinels when needed).
 pub fn theme_bytes(palette: &Palette, rtf: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(rtf);
+    // The page gap is a picture, so its pixels cannot follow the theme by
+    // themselves: repaint every page-break picture in the line-number colour
+    // before the RTF reaches Rich Edit (also for notes written by older
+    // versions or imported from Markdown).
+    let gap = nodi_core::image::page_break_png_coloured(rgb_tuple(palette.gutter_bg));
+    let text = nodi_core::rtf::replace_page_breaks(&text, &gap);
     match (palette.auto_sentinel, palette.black_sentinel) {
-        (Some(auto), Some(black)) => {
-            let text = String::from_utf8_lossy(rtf);
-            apply_theme_colors(&text, auto, black).into_bytes()
-        }
-        _ => rtf.to_vec(),
+        (Some(auto), Some(black)) => apply_theme_colors(&text, auto, black).into_bytes(),
+        _ => text.into_bytes(),
     }
 }
 
@@ -450,9 +480,10 @@ pub unsafe fn fill(hdc: HDC, rect: &windows_sys::Win32::Foundation::RECT, colour
 pub fn apply(app: &mut App) {
     let old = app.palette;
     let new = Palette::from_settings(&app.settings);
-    if old.sentinels() != new.sentinels() {
+    if old.sentinels() != new.sentinels() || old.gutter_bg != new.gutter_bg {
         // Read every editor while the old display colours are installed, so
-        // they fold back correctly, then reload in the new ones.
+        // they fold back correctly, then reload in the new ones. The page gap
+        // follows the line-number colour, so it is repainted too.
         let stored: Vec<(HWND, Vec<u8>)> = app
             .tabs
             .iter()
@@ -465,6 +496,7 @@ pub fn apply(app: &mut App) {
     }
     new.install_display_colours();
     app.palette = new;
+    set_page_band(new.gutter_bg);
 
     let spec = active_spec(&app.settings);
     let font = (spec.ui_font.clone(), spec.ui_size);
@@ -577,13 +609,35 @@ pub unsafe fn on_notify(app: &App, header: &NMHDR, lparam: LPARAM) -> Option<LRE
     }
     let draw = &mut *(lparam as *mut NMTBCUSTOMDRAW);
     if header.hwndFrom == app.toolbar {
-        // The icon toolbar uses Windows' coloured standard glyphs with dark
-        // outlines: a strip a little lighter than the window keeps them
-        // readable while the top of the window follows the theme.
-        if draw.nmcd.dwDrawStage == CDDS_PREPAINT && !draw.nmcd.hdc.is_null() {
-            fill(draw.nmcd.hdc, &draw.nmcd.rc, icon_strip(&app.palette));
-        }
-        return Some(CDRF_DODEFAULT as LRESULT);
+        // The standard toolbar bitmaps were made for a light background: their
+        // dark outlines vanish on a dark theme. Paint the same buttons as
+        // Segoe MDL2 glyphs (and the one text button) in the theme colours.
+        let result = match draw.nmcd.dwDrawStage {
+            CDDS_PREPAINT => {
+                if !draw.nmcd.hdc.is_null() {
+                    fill(draw.nmcd.hdc, &draw.nmcd.rc, icon_strip(&app.palette));
+                }
+                CDRF_NOTIFYITEMDRAW
+            }
+            CDDS_ITEMPREPAINT => CDRF_NOTIFYPOSTPAINT,
+            CDDS_ITEMPOSTPAINT => {
+                let command = draw.nmcd.dwItemSpec as u16;
+                if let Some(glyph) = toolbar_glyph(command) {
+                    draw_toolbar_glyph(app, draw, glyph);
+                } else if command == crate::wnd::menu::IDM_VIEW_WORD_WRAP {
+                    draw_toolbar_text(app, draw, "Wrap");
+                } else if command == 0 {
+                    // Separator: a one-pixel rule in the theme's border colour.
+                    let mut line = draw.nmcd.rc;
+                    line.left = (line.left + line.right) / 2;
+                    line.right = line.left + 1;
+                    fill(draw.nmcd.hdc, &line, app.palette.border);
+                }
+                CDRF_DODEFAULT
+            }
+            _ => CDRF_DODEFAULT,
+        };
+        return Some(result as LRESULT);
     }
     let result = match draw.nmcd.dwDrawStage {
         CDDS_PREPAINT => {
@@ -621,6 +675,107 @@ pub unsafe fn on_notify(app: &App, header: &NMHDR, lparam: LPARAM) -> Option<LRE
 /// Constant declared here so `mod.rs` can match the tree background helper.
 pub const TVM_SETBKCOLOR: u32 = 0x1100 + 29;
 pub const TVM_SETTEXTCOLOR: u32 = 0x1100 + 30;
+
+/// Segoe MDL2 Assets glyph for a standard toolbar command.
+fn toolbar_glyph(command: u16) -> Option<u16> {
+    Some(match command {
+        crate::wnd::menu::IDM_FILE_NEW => 0xE8A5,  // page
+        crate::wnd::menu::IDM_FILE_SAVE => 0xE74E, // floppy
+        crate::wnd::menu::IDM_EDIT_CUT => 0xE8C6,  // scissors
+        crate::wnd::menu::IDM_EDIT_COPY => 0xE8C8, // two pages
+        crate::wnd::menu::IDM_EDIT_PASTE => 0xE77F,
+        crate::wnd::menu::IDM_EDIT_UNDO => 0xE7A7,
+        crate::wnd::menu::IDM_EDIT_REDO => 0xE7A6,
+        crate::wnd::menu::IDM_SEARCH_FIND => 0xE721, // magnifier
+        _ => return None,
+    })
+}
+
+/// Paints one toolbar button as a theme-coloured MDL2 glyph.
+unsafe fn draw_toolbar_glyph(app: &App, draw: &NMTBCUSTOMDRAW, glyph: u16) {
+    let hdc = draw.nmcd.hdc;
+    if hdc.is_null() {
+        return;
+    }
+    let strip = icon_strip(&app.palette);
+    let hot = draw.nmcd.uItemState & (CDIS_HOT | CDIS_SELECTED) != 0;
+    fill(
+        hdc,
+        &draw.nmcd.rc,
+        if hot { lighten(strip, 26) } else { strip },
+    );
+    let height = (draw.nmcd.rc.bottom - draw.nmcd.rc.top - 7).clamp(10, 22);
+    let face = win::wide("Segoe MDL2 Assets");
+    let font = CreateFontW(-height, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
+    if font.is_null() {
+        return;
+    }
+    let saved = SaveDC(hdc);
+    SelectObject(hdc, font as HGDIOBJ);
+    SetBkMode(hdc, TRANSPARENT as i32);
+    SetTextColor(
+        hdc,
+        if hot {
+            app.palette.accent
+        } else {
+            app.palette.window_text
+        },
+    );
+    let mut rect = draw.nmcd.rc;
+    let text = [glyph];
+    DrawTextW(
+        hdc,
+        text.as_ptr(),
+        1,
+        &mut rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    RestoreDC(hdc, saved);
+    DeleteObject(font as HGDIOBJ);
+}
+
+/// Paints a text button (Word Wrap) with the toolbar font and theme colours.
+unsafe fn draw_toolbar_text(app: &App, draw: &NMTBCUSTOMDRAW, label: &str) {
+    let hdc = draw.nmcd.hdc;
+    if hdc.is_null() {
+        return;
+    }
+    let strip = icon_strip(&app.palette);
+    let checked = draw.nmcd.uItemState & CDIS_CHECKED != 0;
+    let hot = draw.nmcd.uItemState & (CDIS_HOT | CDIS_SELECTED) != 0;
+    let background = if hot {
+        lighten(strip, 26)
+    } else if checked {
+        lighten(strip, 18)
+    } else {
+        strip
+    };
+    fill(hdc, &draw.nmcd.rc, background);
+    if checked {
+        // A toggle reads better as a bar in the accent colour than as a
+        // full accent fill (the accent can be a light colour in dark themes).
+        let mut bar = draw.nmcd.rc;
+        bar.top = bar.bottom - 2;
+        fill(hdc, &bar, app.palette.accent);
+    }
+    let font = SendMessageW(draw.nmcd.hdr.hwndFrom, WM_GETFONT, 0, 0);
+    let saved = SaveDC(hdc);
+    if font != 0 {
+        SelectObject(hdc, font as HGDIOBJ);
+    }
+    SetBkMode(hdc, TRANSPARENT as i32);
+    SetTextColor(hdc, app.palette.window_text);
+    let mut rect = draw.nmcd.rc;
+    let text = win::wide(label);
+    DrawTextW(
+        hdc,
+        text.as_ptr(),
+        -1,
+        &mut rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    RestoreDC(hdc, saved);
+}
 
 /// Background of the icon toolbar in a dark theme.
 fn icon_strip(palette: &Palette) -> u32 {

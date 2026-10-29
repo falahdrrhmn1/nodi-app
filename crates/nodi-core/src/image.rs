@@ -193,27 +193,46 @@ const OLD_PAGE_BREAK_SIZE: (u32, u32) = (600, 24);
 /// pages. A grey + alpha PNG, recognised later by its exact size
 /// ([`is_page_picture`]).
 pub fn page_break_png() -> Vec<u8> {
+    page_break_png_coloured((0x52, 0x52, 0x52))
+}
+
+/// [`page_break_png`] in the given band colour (RGB). The app passes the
+/// line-number background so the gap looks like the gutter crossing the page.
+/// The 1 px edge is a little lighter on dark colours and a little darker on
+/// light ones, so it still reads as the edge of a page.
+pub fn page_break_png_coloured(band: (u8, u8, u8)) -> Vec<u8> {
     let (width, height) = PAGE_BREAK_SIZE;
-    let mut pixels = Vec::with_capacity((width * height * 2) as usize);
+    let luma = 0.2126 * f32::from(band.0) + 0.7152 * f32::from(band.1) + 0.0722 * f32::from(band.2);
+    let shift = |value: u8| {
+        if luma < 128.0 {
+            value.saturating_add(0x30)
+        } else {
+            value.saturating_sub(0x18)
+        }
+    };
+    let edge = (shift(band.0), shift(band.1), shift(band.2));
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {
-        let (grey, alpha) = match y {
+        let (colour, alpha) = match y {
             // Transparent gap above the band.
-            0..=7 => (0xFF, 0),
+            0..=7 => ((0xFF, 0xFF, 0xFF), 0),
             // Lighter page edge above the gap.
-            8 => (0x8C, 0xFF),
+            8 => (edge, 0xFF),
             // The solid gap between the two pages.
-            9..=31 => (0x52, 0xFF),
+            9..=31 => (band, 0xFF),
             // Lighter page edge below the gap.
-            32 => (0x8C, 0xFF),
+            32 => (edge, 0xFF),
             // Transparent gap below the band.
-            _ => (0xFF, 0),
+            _ => ((0xFF, 0xFF, 0xFF), 0),
         };
         for _ in 0..width {
-            pixels.push(grey);
+            pixels.push(colour.0);
+            pixels.push(colour.1);
+            pixels.push(colour.2);
             pixels.push(alpha);
         }
     }
-    crate::math::encode_png(width, height, &pixels, "")
+    crate::math::encode_png_rgba(width, height, &pixels, "")
 }
 
 /// True for the page-break picture: the current [`PAGE_BREAK_SIZE`], or the

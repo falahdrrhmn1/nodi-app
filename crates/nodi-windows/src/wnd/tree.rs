@@ -1,6 +1,7 @@
 //! Notes Explorer: the `TreeView` mirror of `Tree`, its shell-stock icon list,
 //! the rename/expand/drag notifications and the node context menu.
 
+use std::cell::Cell;
 use std::ptr;
 
 use nodi_core::tree::Position;
@@ -1076,6 +1077,7 @@ pub fn handle_notify(app: &mut App, header: &NMHDR) -> bool {
             }
         }
         NM_RCLICK => {
+            MOUSE_MENU.with(|shown| shown.set(true));
             show_context_menu(app, Some(cursor_pos()));
         }
         NM_DBLCLK => {
@@ -1437,6 +1439,19 @@ fn on_drop(app: &mut App, lparam: LPARAM) {
 }
 
 // -------------------------------------------------------------- context menu
+
+thread_local! {
+    /// Set when `NM_RCLICK` has just shown the menu. Windows sends a
+    /// `WM_CONTEXTMENU` for the same right-click after the tree finishes the
+    /// button message (i.e. after our menu closes, with the cursor over the
+    /// item we chose), which would open a second menu at that spot.
+    static MOUSE_MENU: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True when the menu for this right-click was already shown; clears the mark.
+pub fn take_mouse_menu() -> bool {
+    MOUSE_MENU.with(|shown| shown.replace(false))
+}
 
 /// Shows the node context menu. `screen` is the click position in screen
 /// coordinates, or `None` for a keyboard invocation (under the selected item).

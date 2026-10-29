@@ -203,6 +203,14 @@ unsafe extern "system" fn subclass(
     if depth == 0 && user_action {
         crate::wnd::caret::refresh(hwnd);
     }
+    // A scrollbar appearing or disappearing changes the client width. Rich
+    // Edit's printed page can come back blank during that transition, and the
+    // strip it reveals would otherwise stay unpainted, so a size change always
+    // repaints the whole editor instead of only the new strip.
+    if msg == WM_SIZE {
+        // SAFETY: invalidating our own editor.
+        windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
     result
 }
 

@@ -402,7 +402,7 @@ impl App {
         }
         self.expanded = session.expanded.iter().cloned().collect();
         self.word_wrap = session.word_wrap;
-        self.zoom = session.zoom.clamp(25, 500);
+        self.zoom = self.settings.default_zoom.clamp(25, 500);
         self.recent = session
             .recent
             .iter()
@@ -855,6 +855,10 @@ impl App {
             }
         }
         let _ = loaded;
+
+        // Rich Edit drops EM_SETZOOM when new content is streamed in, so the
+        // preferred zoom has to be applied again after the note is loaded.
+        editor::set_zoom_percent(editor, self.zoom);
 
         // Rich Edit's default tab stop is 0.5"; Nodi uses half of that for the
         // whole document (new paragraphs inherit it).
@@ -2487,7 +2491,8 @@ pub fn go_to_line(app: &mut App) {
     }
 }
 
-/// View > Zoom In / Out (`Some(true)` / `Some(false)`) or reset (`None`).
+/// View > Zoom In / Out (`Some(true)` / `Some(false)`) or reset (`None`,
+/// which goes back to the default zoom in Preferences).
 pub fn zoom(app: &mut App, larger: Option<bool>) {
     const STEPS: [i32; 13] = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300];
     let current = app
@@ -2506,14 +2511,39 @@ pub fn zoom(app: &mut App, larger: Option<bool>) {
             .copied()
             .find(|step| *step < current)
             .unwrap_or(50),
-        None => 100,
+        None => app.settings.default_zoom.clamp(25, 500),
     };
+    set_zoom(app, next);
+}
+
+/// Applies one zoom percentage to every open editor.
+pub fn set_zoom(app: &mut App, percent: i32) {
+    let next = percent.clamp(25, 500);
     app.zoom = next;
     for tab in &app.tabs {
         editor::set_zoom_percent(tab.editor, next);
     }
     status::set_message(app, &format!("Zoom {next}%"));
     app.save_session_now();
+}
+
+/// View > Set Zoom...: type the percentage instead of stepping through it.
+pub fn zoom_dialog(app: &mut App) {
+    let current = app
+        .active_editor()
+        .map(editor::zoom_percent)
+        .unwrap_or(app.zoom);
+    let Some(values) = Form::new("Zoom")
+        .note("Choose a zoom level from 25% to 500%. The default level is in Tools > Preferences.")
+        .field(Field::new("Zoom (%):", current.to_string()))
+        .show(app.hwnd)
+    else {
+        return;
+    };
+    match values[0].trim().parse::<i32>() {
+        Ok(percent) if (25..=500).contains(&percent) => set_zoom(app, percent),
+        _ => status::set_message(app, "Zoom must be a whole number from 25 to 500"),
+    }
 }
 
 /// Notes > Copy Internal Link: puts a link to the note on the clipboard, as

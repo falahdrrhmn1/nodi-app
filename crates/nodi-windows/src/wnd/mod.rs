@@ -777,7 +777,13 @@ pub unsafe extern "system" fn wndproc(
                             y: win::y_from_lparam(lparam),
                         })
                     };
-                    tree::show_context_menu(app, screen);
+                    // A mouse right-click already opened the menu in
+                    // `NM_RCLICK`; the `WM_CONTEXTMENU` that follows would
+                    // open it again at the menu item the user just chose.
+                    let already = tree::take_mouse_menu() && lparam != -1;
+                    if !already {
+                        tree::show_context_menu(app, screen);
+                    }
                     handled = true;
                 } else if wparam as HWND == app.tabctrl {
                     let screen = (lparam != -1).then(|| POINT {

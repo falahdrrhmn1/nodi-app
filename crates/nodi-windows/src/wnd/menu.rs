@@ -96,6 +96,7 @@ pub const IDM_VIEW_WORD_WRAP: u16 = 134;
 pub const IDM_VIEW_ZOOM_IN: u16 = 135;
 pub const IDM_VIEW_ZOOM_OUT: u16 = 136;
 pub const IDM_VIEW_ZOOM_RESET: u16 = 137;
+pub const IDM_VIEW_ZOOM_SET: u16 = 147;
 pub const IDM_VIEW_MARKDOWN: u16 = 138;
 pub const IDM_VIEW_SPELL: u16 = 139;
 pub const IDM_VIEW_OUTLINE: u16 = 142;
@@ -396,6 +397,7 @@ pub fn create_menu() -> HMENU {
             Item::Sep,
             Item::Cmd(IDM_VIEW_ZOOM_IN, "Zoom &In\tCtrl+="),
             Item::Cmd(IDM_VIEW_ZOOM_OUT, "Zoom &Out\tCtrl+-"),
+            Item::Cmd(IDM_VIEW_ZOOM_SET, "Set &Zoom..."),
             Item::Cmd(IDM_VIEW_ZOOM_RESET, "&Reset Zoom\tCtrl+0"),
             Item::Sep,
             Item::Cmd(
@@ -1021,6 +1023,7 @@ pub fn on_command(app: &mut App, id: u16) {
         }
         IDM_VIEW_ZOOM_IN => app::zoom(app, Some(true)),
         IDM_VIEW_ZOOM_OUT => app::zoom(app, Some(false)),
+        IDM_VIEW_ZOOM_SET => app::zoom_dialog(app),
         IDM_VIEW_ZOOM_RESET => app::zoom(app, None),
         IDM_VIEW_MARKDOWN => app::show_markdown(app),
         IDM_VIEW_OUTLINE => app::show_outline(app),

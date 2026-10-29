@@ -15,10 +15,27 @@ pub const LATEX_KEYWORD: &str = "nodi-latex";
 /// Encodes 8-bit grey + alpha pixels (`2 * width * height` bytes, rows top to
 /// bottom) as a PNG and embeds `latex` in an `iTXt` chunk.
 pub fn encode_png(width: u32, height: u32, gray_alpha: &[u8], latex: &str) -> Vec<u8> {
-    assert_eq!(gray_alpha.len(), (width * height * 2) as usize);
-    let stride = width as usize * 2;
+    encode_png_with(width, height, 4, 2, gray_alpha, latex)
+}
+
+/// Encodes 8-bit RGBA pixels (`4 * width * height` bytes, rows top to bottom)
+/// as a PNG. Used by pictures that must match a theme colour exactly.
+pub fn encode_png_rgba(width: u32, height: u32, rgba: &[u8], latex: &str) -> Vec<u8> {
+    encode_png_with(width, height, 6, 4, rgba, latex)
+}
+
+fn encode_png_with(
+    width: u32,
+    height: u32,
+    colour_type: u8,
+    channels: usize,
+    pixels: &[u8],
+    latex: &str,
+) -> Vec<u8> {
+    assert_eq!(pixels.len(), (width as usize * height as usize) * channels);
+    let stride = width as usize * channels;
     let mut raw = Vec::with_capacity((stride + 1) * height as usize);
-    for row in gray_alpha.chunks_exact(stride) {
+    for row in pixels.chunks_exact(stride) {
         raw.push(0); // filter: none
         raw.extend_from_slice(row);
     }
@@ -28,7 +45,7 @@ pub fn encode_png(width: u32, height: u32, gray_alpha: &[u8], latex: &str) -> Ve
     let mut header = Vec::with_capacity(13);
     header.extend_from_slice(&width.to_be_bytes());
     header.extend_from_slice(&height.to_be_bytes());
-    header.extend_from_slice(&[8, 4, 0, 0, 0]); // 8-bit, grey+alpha
+    header.extend_from_slice(&[8, colour_type, 0, 0, 0]);
     chunk(&mut png, b"IHDR", &header);
 
     let mut text = Vec::new();

@@ -97,6 +97,27 @@ pub fn set_picture_crop(rtf: &str, left: i32, top: i32, right: i32, bottom: i32)
 /// The encoded bytes (PNG/JPEG/…) of the first picture, decoded from hex.
 pub fn picture_blob(rtf: &str) -> Option<Vec<u8>> {
     let pict = pict_group(rtf)?;
+    let start = picture_data_start(pict)?;
+    let data = &pict[start..];
+    let hex: Vec<u8> = data
+        .bytes()
+        .take_while(|byte| *byte != b'}')
+        .filter(u8::is_ascii_hexdigit)
+        .collect();
+    if hex.len() < 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_chunks::<2>().0 {
+        let text = std::str::from_utf8(pair).ok()?;
+        out.push(u8::from_str_radix(text, 16).ok()?);
+    }
+    Some(out)
+}
+
+/// Index just after the last control word of a `{\pict ...}` group, where its
+/// hex-encoded data begins.
+fn picture_data_start(pict: &str) -> Option<usize> {
     // The data follows the last control word of the group (skipping nested
     // groups such as `{\*\picprop ...}`).
     let mut depth = 0i32;
@@ -121,21 +142,44 @@ pub fn picture_blob(rtf: &str) -> Option<Vec<u8>> {
         }
         index += 1;
     }
-    let data = &pict[data_start?..];
-    let hex: Vec<u8> = data
-        .bytes()
-        .take_while(|byte| *byte != b'}')
-        .filter(u8::is_ascii_hexdigit)
-        .collect();
-    if hex.len() < 2 {
-        return None;
+    data_start
+}
+
+/// Returns `rtf` with the data of every page-break picture replaced by `png`,
+/// keeping the group's control words (size, goal, properties) untouched.
+/// Page breaks are bitmaps baked into the RTF, so a new theme has to repaint
+/// them: the gap follows the line-number strip in every theme.
+pub fn replace_page_breaks(rtf: &str, png: &[u8]) -> String {
+    if !rtf.contains("{\\pict") {
+        return rtf.to_owned();
     }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_chunks::<2>().0 {
-        let text = std::str::from_utf8(pair).ok()?;
-        out.push(u8::from_str_radix(text, 16).ok()?);
+    let hex: String = png.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut out = String::with_capacity(rtf.len() + hex.len());
+    let mut rest = rtf;
+    while let Some(start) = rest.find("{\\pict") {
+        out.push_str(&rest[..start]);
+        let group = &rest[start..];
+        let Some(len) = group_len(group) else {
+            out.push_str(group);
+            return out;
+        };
+        let pict = &group[..len];
+        let is_page = picture_blob(pict).is_some_and(|blob| crate::image::is_page_picture(&blob));
+        if is_page {
+            if let (Some(data_start), Some(brace)) = (picture_data_start(pict), pict.rfind('}')) {
+                out.push_str(&pict[..data_start]);
+                out.push_str(&hex);
+                out.push_str(&pict[brace..]);
+            } else {
+                out.push_str(pict);
+            }
+        } else {
+            out.push_str(pict);
+        }
+        rest = &group[len..];
     }
-    Some(out)
+    out.push_str(rest);
+    out
 }
 
 /// True when the RTF contains a picture.
@@ -546,6 +590,26 @@ mod tests {
             picture_blob(SAMPLE).unwrap(),
             vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
         );
+    }
+
+    #[test]
+    fn retints_page_break_pictures_only() {
+        let old = crate::image::page_break_png();
+        let new = crate::image::page_break_png_coloured((0x2f, 0x26, 0x24));
+        let hex = |png: &[u8]| -> String { png.iter().map(|byte| format!("{byte:02x}")).collect() };
+        let rtf = format!(
+            "{{\\rtf1{{\\pict\\pngblip\\picw600\\pich40 {}}}{}\\par}}",
+            hex(&old),
+            SAMPLE
+        );
+        let patched = replace_page_breaks(&rtf, &new);
+        let first = picture_blob(&patched).unwrap();
+        assert_eq!(first, new);
+        assert!(!patched.contains(&hex(&old)));
+        // The ordinary picture after it is untouched.
+        assert!(patched.contains(SAMPLE));
+        // A document without a page break is returned unchanged.
+        assert_eq!(replace_page_breaks(SAMPLE, &new), SAMPLE);
     }
 
     #[test]

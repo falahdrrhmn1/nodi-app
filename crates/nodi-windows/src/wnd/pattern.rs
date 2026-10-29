@@ -79,6 +79,12 @@ pub unsafe fn paint(editor: HWND, dpi: i32) -> bool {
     let content = CreateCompatibleDC(dc);
     let content_bitmap = CreateCompatibleBitmap(dc, width, height);
     let old_content = SelectObject(content, content_bitmap as HGDIOBJ);
+    // Rich Edit sometimes prints nothing while its scrollbar is being added
+    // (the bitmap then keeps its initial black), so start from the key colour
+    // the print would have used for the page.
+    let key_brush = CreateSolidBrush(key_colour(editor_bg));
+    FillRect(content, &rect, key_brush);
+    DeleteObject(key_brush as HGDIOBJ);
     SendMessageW(
         editor,
         WM_PRINTCLIENT,

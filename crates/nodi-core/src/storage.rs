@@ -669,6 +669,9 @@ pub struct Settings {
     /// View > Cursor: the shape of the text caret.
     #[serde(default)]
     pub caret_style: CaretStyle,
+    /// Preferences > default editor zoom in percent (also Reset Zoom).
+    #[serde(default = "default_zoom")]
+    pub default_zoom: i32,
     /// Preferences > default font for new text.
     #[serde(default = "default_body_font")]
     pub body_font: String,
@@ -854,6 +857,7 @@ impl Default for Settings {
             line_numbers: true,
             background: Background::Plain,
             caret_style: CaretStyle::Line,
+            default_zoom: 100,
             body_font: default_body_font(),
             body_size: default_body_size(),
             theme_name: String::new(),
@@ -885,6 +889,7 @@ impl Settings {
             self.body_font = default_body_font();
         }
         self.body_size = self.body_size.clamp(6, 72);
+        self.default_zoom = self.default_zoom.clamp(25, 500);
         for theme in &mut self.my_themes {
             theme.clamp();
         }
