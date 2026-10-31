@@ -1211,6 +1211,11 @@ Test-Case 'AG' 'dark theme: persists, editor is dark, stored colours stay automa
     $bitmap = [Drawing.Bitmap]::FromFile($shot)
     $x = [int]$rect[2] - $window.L + [int]$rect[0] / 2
     $y = [int]$rect[3] - $window.T + [int]$rect[1] - 20
+    # A maximized window can be captured with a one-pixel discrepancy between
+    # the reported client rectangle and the bitmap dimensions. Keep the probe
+    # diagnostic instead of failing before the actual dark-paint assertion.
+    $x = [Math]::Max(0, [Math]::Min($bitmap.Width - 1, $x))
+    $y = [Math]::Max(0, [Math]::Min($bitmap.Height - 1, $y))
     $pixel = $bitmap.GetPixel($x, $y)
     $bitmap.Dispose()
     Assert ($pixel.R -lt 60 -and $pixel.G -lt 60 -and $pixel.B -lt 60) "editor is not dark at ($x,$y): $pixel"
