@@ -1205,6 +1205,25 @@ pub fn separator_from_marker(editor: HWND) -> bool {
     let end = editor::paragraph_end(editor, from);
     let text = editor::text_range(editor, start, end);
     let marker = text.trim();
+    // Editable titled separators. Unlike picture separators, the title stays
+    // ordinary Rich Edit text, so it can be recoloured, highlighted, aligned,
+    // or deleted without needing to decode an embedded image.
+    for dash_count in [4usize, 3usize] {
+        let prefix = "-".repeat(dash_count);
+        if marker.len() >= dash_count * 2
+            && marker.starts_with(&prefix)
+            && marker.ends_with(&prefix)
+        {
+            let title = marker[dash_count..marker.len() - dash_count].trim();
+            if !title.is_empty() {
+                editor::set_selection(editor, start, end);
+                editor::replace_selection(editor, marker, true);
+                editor::set_selection(editor, start, end);
+                align(editor, PFA_CENTER);
+                return true;
+            }
+        }
+    }
     // `---` is a separator, `----` (or longer) a page break.
     let page = marker.len() >= 4 && marker.chars().all(|ch| ch == '-');
     if (marker != "---" && !page) || from < start {
