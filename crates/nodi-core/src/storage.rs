@@ -663,6 +663,9 @@ pub struct Settings {
     /// View > same-page word autocomplete (default on).
     #[serde(default = "default_true")]
     pub autocomplete: bool,
+    /// User text expansions. Scope is `page`, `all`, or `folder`.
+    #[serde(default)]
+    pub text_shortcuts: Vec<TextShortcut>,
     /// View > Line Numbers.
     #[serde(default = "default_true")]
     pub line_numbers: bool,
@@ -688,6 +691,23 @@ pub struct Settings {
     /// Themes the user saved (Theme Editor > Save As My Theme).
     #[serde(default)]
     pub my_themes: Vec<ThemeSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextShortcut {
+    pub trigger: String,
+    pub replacement: String,
+    /// `page`, `all`, or `folder`.
+    #[serde(default = "default_shortcut_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub note: Option<crate::NoteId>,
+    #[serde(default)]
+    pub folder: Option<crate::NoteId>,
+}
+
+fn default_shortcut_scope() -> String {
+    "page".to_owned()
 }
 
 /// Editor background pattern (View > Background).
@@ -858,6 +878,7 @@ impl Default for Settings {
             sounds: false,
             double_space_period: true,
             autocomplete: true,
+            text_shortcuts: Vec::new(),
             line_numbers: true,
             background: Background::Plain,
             caret_style: CaretStyle::Line,

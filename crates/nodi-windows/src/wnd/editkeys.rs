@@ -131,6 +131,37 @@ fn complete_word(editor: HWND) -> bool {
     true
 }
 
+fn expand_shortcut(editor: HWND, frame: HWND) -> bool {
+    let Some(app) = (unsafe { crate::wnd::app_mut(frame) }) else {
+        return false;
+    };
+    let Some(index) = app.tab_index(editor) else {
+        return false;
+    };
+    let note = app.tabs[index].note.clone();
+    let parent = app.tree.get(&note).and_then(|node| node.parent.clone());
+    let (from, to) = editor::selection(editor);
+    if from != to || from <= 0 {
+        return false;
+    }
+    let text = editor::text_range(editor, 0, from);
+    let trigger = text.split_whitespace().last().unwrap_or("");
+    let Some(shortcut) = app.settings.text_shortcuts.iter().find(|item| {
+        item.trigger == trigger
+            && match item.scope.as_str() {
+                "all" => true,
+                "folder" => item.folder.as_ref() == parent.as_ref(),
+                _ => item.note.as_ref() == Some(&note),
+            }
+    }) else {
+        return false;
+    };
+    let start = from - trigger.encode_utf16().count() as i32;
+    editor::set_selection(editor, start, from);
+    editor::replace_selection(editor, &shortcut.replacement, true);
+    true
+}
+
 pub fn install(editor: HWND, frame: HWND) {
     // SAFETY: `editor` is our Rich Edit; the frame handle is the ref data.
     unsafe {
@@ -348,6 +379,9 @@ unsafe fn subclass_inner(
         WM_KEYDOWN => {
             let key = wparam as u16;
             if ctrl && !shift && !alt && key == VK_SPACE && complete_word(hwnd) {
+                return 0;
+            }
+            if !ctrl && !shift && !alt && key == VK_RETURN && expand_shortcut(hwnd, frame as HWND) {
                 return 0;
             }
             if ctrl && shift && !alt && key == VK_H {
