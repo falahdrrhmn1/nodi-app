@@ -12,7 +12,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
 
 use crate::wnd::editor;
-use crate::wnd::format::{full_width_twips, rgb};
+use crate::wnd::format::full_width_twips;
 
 const WM_USER: u32 = 0x0400;
 const EM_INSERTTABLE: u32 = WM_USER + 232;
@@ -77,8 +77,7 @@ fn row_parms(cells: usize, rows: usize, cp_start_row: i32) -> RowParms {
     }
 }
 
-fn plain_cell(width: i32) -> CellParms {
-    let border = rgb(160, 160, 160);
+fn plain_cell(width: i32, background: u32, border: u32) -> CellParms {
     CellParms {
         dx_width: width,
         dx_brdr_left: 10,
@@ -89,13 +88,19 @@ fn plain_cell(width: i32) -> CellParms {
         cr_brdr_top: border,
         cr_brdr_right: border,
         cr_brdr_bottom: border,
-        cr_back_pat: rgb(255, 255, 255),
+        cr_back_pat: background,
         ..CellParms::default()
     }
 }
 
 /// Insert > Table: `rows`×`cols` empty cells spanning the editor width.
-pub fn insert(editor: HWND, rows: usize, cols: usize) -> Result<(), String> {
+pub fn insert(
+    editor: HWND,
+    rows: usize,
+    cols: usize,
+    background: u32,
+    border: u32,
+) -> Result<(), String> {
     let rows = rows.clamp(1, 255);
     let cols = cols.clamp(1, MAX_CELLS);
     let at = crate::wnd::format::prepare_block(editor);
@@ -103,7 +108,7 @@ pub fn insert(editor: HWND, rows: usize, cols: usize) -> Result<(), String> {
     // code block). New cells must use the automatic text colour instead.
     crate::wnd::format::set_text_color(editor, None);
     let width = full_width_twips(editor) / cols as i32;
-    let cells = vec![plain_cell(width.max(400)); cols];
+    let cells = vec![plain_cell(width.max(400), background, border); cols];
     let row = row_parms(cols, rows, -1);
     // SAFETY: `row` and `cells` (one entry per cell) outlive the call.
     let result = unsafe {
@@ -119,6 +124,41 @@ pub fn insert(editor: HWND, rows: usize, cols: usize) -> Result<(), String> {
     // the first cell (row start U+FFF9 + its paragraph mark).
     editor::set_selection(editor, at + 2, at + 2);
     Ok(())
+}
+
+/// Repaints the cells and borders of every table in `editor` for the current
+/// theme. Rich Edit stores table shading in the row parameters, so existing
+/// notes need this pass after a theme switch as well as after loading.
+pub fn retheme(editor: HWND, background: u32, border: u32) {
+    let units = document(editor);
+    let all_rows = rows(&units);
+    for row in all_rows {
+        let Some((mut params, mut cells)) = get_params(editor, row) else {
+            continue;
+        };
+        for cell in &mut cells {
+            cell.cr_back_pat = background;
+            cell.cr_brdr_left = border;
+            cell.cr_brdr_top = border;
+            cell.cr_brdr_right = border;
+            cell.cr_brdr_bottom = border;
+        }
+        params.cb_row = size_of::<RowParms>() as u8;
+        params.cb_cell = size_of::<CellParms>() as u8;
+        params.c_cell = cells.len() as u8;
+        params.c_row = 1;
+        params.i_cell = 0;
+        params.cp_start_row = row.start;
+        // SAFETY: `params` and `cells` outlive the call.
+        unsafe {
+            SendMessageW(
+                editor,
+                EM_SETTABLEPARMS,
+                &params as *const RowParms as usize,
+                cells.as_ptr() as isize,
+            );
+        }
+    }
 }
 
 fn hresult(value: isize, what: &str) -> Result<(), String> {

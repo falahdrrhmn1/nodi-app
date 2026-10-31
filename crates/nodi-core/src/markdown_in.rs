@@ -244,6 +244,15 @@ pub fn text_table_markdown(text: &str) -> Option<String> {
     Some(out)
 }
 
+/// True when `text` contains a GFM table: a `| ... |` header row immediately
+/// followed by a `|---|` delimiter row.
+pub fn is_markdown_table(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .windows(2)
+        .any(|pair| is_table_row(pair[0]) && is_table_delimiter(pair[1]))
+}
+
 /// Plain text that carries at least two Markdown signals (or a code fence) is
 /// treated as Markdown when pasted. Ordinary prose never reaches this.
 pub fn looks_like_markdown(text: &str) -> bool {
@@ -1235,6 +1244,15 @@ mod tests {
         assert!(markdown.contains("| Nama | Nilai |"), "{markdown}");
         assert!(markdown.contains("| --- | --- |"), "{markdown}");
         assert!(markdown.contains("| A | 92% |"), "{markdown}");
+    }
+
+    #[test]
+    fn detects_gfm_tables() {
+        assert!(is_markdown_table(
+            "| Name | Score |\n| --- | ---: |\n| Ada | 92 |"
+        ));
+        assert!(!is_markdown_table("| Name | Score |\n| Ada | 92 |"));
+        assert!(!is_markdown_table("just prose\nand more prose"));
     }
 
     #[test]

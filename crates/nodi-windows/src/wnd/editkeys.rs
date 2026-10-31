@@ -22,8 +22,8 @@ use std::cell::{Cell, RefCell};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT,
-    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_H, VK_INSERT, VK_LEFT, VK_MENU,
+    VK_NEXT, VK_PRIOR, VK_R, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP, VK_Y,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
@@ -54,6 +54,7 @@ thread_local! {
     static CTRL_ARROW_SCROLL: Cell<bool> = const { Cell::new(true) };
     /// Preferences > "Two quick spaces type a period" (mirrors `Settings`).
     static DOUBLE_SPACE_PERIOD: Cell<bool> = const { Cell::new(true) };
+    static AUTOCOMPLETE: Cell<bool> = const { Cell::new(true) };
     /// Message time and caret after the last plain space typed, for the
     /// double-space period.
     static LAST_SPACE: Cell<Option<(u32, i32)>> = const { Cell::new(None) };
@@ -70,6 +71,64 @@ pub fn set_double_space_period(enabled: bool) {
 /// (Notepad++) when on; Rich Edit's paragraph jump when off.
 pub fn set_ctrl_arrow_scroll(enabled: bool) {
     CTRL_ARROW_SCROLL.with(|flag| flag.set(enabled));
+}
+
+pub fn set_autocomplete(enabled: bool) {
+    AUTOCOMPLETE.with(|flag| flag.set(enabled));
+}
+
+fn complete_word(editor: HWND) -> bool {
+    if !AUTOCOMPLETE.with(|flag| flag.get()) {
+        return false;
+    }
+    let (from, to) = editor::selection(editor);
+    if from != to {
+        return false;
+    }
+    let units = editor::raw_text(editor);
+    let caret = (from.max(0) as usize).min(units.len());
+    let is_word =
+        |unit: u16| char::from_u32(unit as u32).is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+    let mut start = caret;
+    while start > 0 && is_word(units[start - 1]) {
+        start -= 1;
+    }
+    if start == caret {
+        return false;
+    }
+    let prefix: String = units[start..caret]
+        .iter()
+        .filter_map(|unit| char::from_u32(*unit as u32))
+        .collect();
+    let mut index = 0;
+    let mut best: Option<String> = None;
+    while index < units.len() {
+        while index < units.len() && !is_word(units[index]) {
+            index += 1;
+        }
+        let word_start = index;
+        while index < units.len() && is_word(units[index]) {
+            index += 1;
+        }
+        if word_start == index || word_start == start {
+            continue;
+        }
+        let word: String = units[word_start..index]
+            .iter()
+            .filter_map(|unit| char::from_u32(*unit as u32))
+            .collect();
+        if word.len() > prefix.len()
+            && word.starts_with(&prefix)
+            && best
+                .as_ref()
+                .is_none_or(|current| word.len() < current.len())
+        {
+            best = Some(word);
+        }
+    }
+    let Some(word) = best else { return false };
+    editor::replace_selection(editor, &word[prefix.len()..], true);
+    true
 }
 
 pub fn install(editor: HWND, frame: HWND) {
@@ -288,6 +347,33 @@ unsafe fn subclass_inner(
         }
         WM_KEYDOWN => {
             let key = wparam as u16;
+            if ctrl && !shift && !alt && key == VK_SPACE && complete_word(hwnd) {
+                return 0;
+            }
+            if ctrl && shift && !alt && key == VK_H {
+                PostMessageW(
+                    frame as HWND,
+                    WM_COMMAND,
+                    usize::from(crate::wnd::menu::IDM_FORMAT_HIGHLIGHT),
+                    0,
+                );
+                return 0;
+            }
+            if ctrl && shift && !alt && (key == VK_R || key == VK_Y) {
+                let Some(app) = crate::wnd::app_mut(frame as HWND) else {
+                    return 0;
+                };
+                if let Some(editor) = app.active_editor() {
+                    if key == VK_R {
+                        format::set_text_color(editor, Some(format::rgb(229, 57, 53)));
+                    } else {
+                        format::set_highlight(editor, Some(format::rgb(255, 238, 112)));
+                    }
+                    app.mark_dirty(editor);
+                    crate::wnd::toolbar::sync_format(app);
+                }
+                return 0;
+            }
             if ctrl
                 && !alt
                 && !shift
@@ -301,7 +387,11 @@ unsafe fn subclass_inner(
             // heading first (below); only a Backspace that does nothing is
             // swallowed, after that.
             let silent = !alt && !crate::wnd::dialogs::sounds();
-            if silent && key != VK_BACK && silent_boundary(hwnd, key, ctrl) {
+            // Never swallow Shift+Arrow: Rich Edit owns the selection anchor
+            // and must receive the key even at the document boundary. The old
+            // boundary shortcut treated Shift+Down like an unmodified move,
+            // which could leave the caret/selection painting out of sync.
+            if silent && !shift && key != VK_BACK && silent_boundary(hwnd, key, ctrl) {
                 return 0;
             }
             if ctrl || alt {
@@ -773,14 +863,32 @@ fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
         }
         return true;
     }
-    // Terminal output with a drawn table (pm2, docker, MySQL...) becomes a
-    // real table, whatever other formats the terminal put on the clipboard.
+    // Tables come before Rich Text Format: an agent's answer copies as
+    // HTML+RTF+text, and pasting its RTF would keep the table's own background
+    // (often white) instead of Nodi's theme. A drawn terminal table, a GFM
+    // table in the text and an HTML `<table>` all paste as a real Nodi table.
     if !format::in_code(editor) && !editor::in_table(editor) {
-        if let Some(markdown) = image::clipboard_text(frame)
-            .and_then(|text| nodi_core::markdown_in::text_table_markdown(&text))
-        {
-            if paste_markdown(editor, frame, &markdown) {
+        if let Some(text) = image::clipboard_text(frame) {
+            if let Some(markdown) = nodi_core::markdown_in::text_table_markdown(&text) {
+                if paste_markdown(editor, frame, &markdown) {
+                    return true;
+                }
+            }
+            if nodi_core::markdown_in::is_markdown_table(&text)
+                && paste_markdown(editor, frame, &text)
+            {
                 return true;
+            }
+        }
+        if let Some(html) = image::clipboard_html(frame) {
+            let has_table = html
+                .windows(b"<table".len())
+                .any(|window| window.eq_ignore_ascii_case(b"<table"));
+            if has_table {
+                let markdown = nodi_core::html_in::cf_html_to_markdown(&html);
+                if paste_markdown(editor, frame, &markdown) {
+                    return true;
+                }
             }
         }
     }
@@ -926,6 +1034,15 @@ fn paste_markdown(editor: HWND, frame: HWND, markdown: &str) -> bool {
     if !editor::insert_rtf(editor, rtf.as_bytes()) {
         return false;
     }
+    // Pasted tables (and code fences) arrive with no cell shading: give their
+    // cells the same background and border as a table inserted here.
+    // SAFETY: `frame` is our main window; it owns the palette.
+    let (table_bg, table_border) = unsafe {
+        crate::wnd::app_mut(frame).map_or((0x00FF_FFFF, 0x00A0_A0A0), |app| {
+            (app.palette.table_bg(), app.palette.table_border())
+        })
+    };
+    crate::wnd::table::retheme(editor, table_bg, table_border);
     let pictures = if pictures.is_empty() {
         0
     } else {
@@ -936,7 +1053,10 @@ fn paste_markdown(editor: HWND, frame: HWND, markdown: &str) -> bool {
             crate::wnd::status::set_message(app, &format!("Pasted with {pictures} picture(s)"));
         }
     }
-    let (rendered, kept) = crate::wnd::formula::render_pasted(editor);
+    // SAFETY: `frame` is our main window; it owns the palette.
+    let formula_colour =
+        unsafe { crate::wnd::app_mut(frame).map_or(0, |app| app.palette.editor_text) };
+    let (rendered, kept) = crate::wnd::formula::render_pasted(editor, formula_colour);
     if rendered > 0 || !kept.is_empty() {
         let mut message = format!("Pasted with {rendered} formula(s)");
         if !kept.is_empty() {

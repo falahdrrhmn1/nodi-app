@@ -90,8 +90,11 @@ pub fn decode(bytes: &[u8]) -> Result<Rgba, String> {
     if !seen_header {
         return Err("PNG has no IHDR".to_owned());
     }
-    if width == 0 || height == 0 || width > 512 || height > 512 {
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
         return Err(format!("unsupported PNG size {width}x{height}"));
+    }
+    if u64::from(width) * u64::from(height) > 16_000_000 {
+        return Err(format!("PNG is too large to decode ({width}x{height})"));
     }
     if depth != 8 {
         return Err(format!("unsupported PNG bit depth {depth} (8 is required)"));

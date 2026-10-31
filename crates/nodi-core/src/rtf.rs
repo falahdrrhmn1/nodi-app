@@ -145,16 +145,14 @@ fn picture_data_start(pict: &str) -> Option<usize> {
     data_start
 }
 
-/// Returns `rtf` with the data of every page-break picture replaced by `png`,
-/// keeping the group's control words (size, goal, properties) untouched.
-/// Page breaks are bitmaps baked into the RTF, so a new theme has to repaint
-/// them: the gap follows the line-number strip in every theme.
-pub fn replace_page_breaks(rtf: &str, png: &[u8]) -> String {
+/// Rewrites the bitmap data of every picture for which `paint` returns a
+/// replacement, keeping the group's control words (size, goal, properties,
+/// link wrapper) untouched. `paint` receives the decoded PNG/JPEG bytes.
+pub fn map_pictures(rtf: &str, mut paint: impl FnMut(&[u8]) -> Option<Vec<u8>>) -> String {
     if !rtf.contains("{\\pict") {
         return rtf.to_owned();
     }
-    let hex: String = png.iter().map(|byte| format!("{byte:02x}")).collect();
-    let mut out = String::with_capacity(rtf.len() + hex.len());
+    let mut out = String::with_capacity(rtf.len());
     let mut rest = rtf;
     while let Some(start) = rest.find("{\\pict") {
         out.push_str(&rest[..start]);
@@ -164,9 +162,10 @@ pub fn replace_page_breaks(rtf: &str, png: &[u8]) -> String {
             return out;
         };
         let pict = &group[..len];
-        let is_page = picture_blob(pict).is_some_and(|blob| crate::image::is_page_picture(&blob));
-        if is_page {
+        let replacement = picture_blob(pict).and_then(|blob| paint(&blob));
+        if let Some(png) = replacement {
             if let (Some(data_start), Some(brace)) = (picture_data_start(pict), pict.rfind('}')) {
+                let hex: String = png.iter().map(|byte| format!("{byte:02x}")).collect();
                 out.push_str(&pict[..data_start]);
                 out.push_str(&hex);
                 out.push_str(&pict[brace..]);
@@ -180,6 +179,25 @@ pub fn replace_page_breaks(rtf: &str, png: &[u8]) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Returns `rtf` with the data of every page-break picture replaced by `png`.
+/// Page breaks are bitmaps baked into the RTF, so a new theme has to repaint
+/// them: the gap follows the line-number strip in every theme.
+pub fn replace_page_breaks(rtf: &str, png: &[u8]) -> String {
+    map_pictures(rtf, |blob| {
+        if crate::image::is_page_picture(blob) {
+            Some(png.to_vec())
+        } else {
+            None
+        }
+    })
+}
+
+/// Repaints every embedded formula in `rgb` so formulas stay readable when the
+/// theme changes. Non-formula pictures are left untouched.
+pub fn replace_formula_pictures(rtf: &str, rgb: (u8, u8, u8)) -> String {
+    map_pictures(rtf, |blob| crate::math::recolour_png(blob, rgb))
 }
 
 /// True when the RTF contains a picture.
@@ -610,6 +628,26 @@ mod tests {
         assert!(patched.contains(SAMPLE));
         // A document without a page break is returned unchanged.
         assert_eq!(replace_page_breaks(SAMPLE, &new), SAMPLE);
+    }
+
+    #[test]
+    fn retints_formula_pictures_only() {
+        let formula = crate::math::encode_png(1, 1, &[0, 255], r"x^2");
+        let hex = |png: &[u8]| -> String { png.iter().map(|byte| format!("{byte:02x}")).collect() };
+        let rtf = format!(
+            "{{\\rtf1{{\\pict\\pngblip\\picw1\\pich1 {}}}\r\n{}\\par}}",
+            hex(&formula),
+            SAMPLE
+        );
+        let patched = replace_formula_pictures(&rtf, (230, 230, 230));
+        let first = picture_blob(&patched).unwrap();
+        assert_eq!(crate::math::latex_from_png(&first).as_deref(), Some(r"x^2"));
+        assert_eq!(
+            crate::png::decode(&first).unwrap().pixel(0, 0),
+            Some((230, 230, 230, 255))
+        );
+        // The plain picture after the formula is byte-for-byte untouched.
+        assert!(patched.contains(SAMPLE));
     }
 
     #[test]

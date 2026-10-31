@@ -660,6 +660,9 @@ pub struct Settings {
     /// Preferences > two quick spaces type ". ".
     #[serde(default = "default_true")]
     pub double_space_period: bool,
+    /// View > same-page word autocomplete (default on).
+    #[serde(default = "default_true")]
+    pub autocomplete: bool,
     /// View > Line Numbers.
     #[serde(default = "default_true")]
     pub line_numbers: bool,
@@ -854,6 +857,7 @@ impl Default for Settings {
             folders_first: true,
             sounds: false,
             double_space_period: true,
+            autocomplete: true,
             line_numbers: true,
             background: Background::Plain,
             caret_style: CaretStyle::Line,

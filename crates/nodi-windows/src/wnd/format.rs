@@ -92,6 +92,31 @@ pub fn face_name(format: &CharFormat2W) -> String {
     String::from_utf16_lossy(&format.sz_face_name[..end])
 }
 
+/// Character format of a literal list marker (deeper bullets, checkboxes).
+/// Markers must always use the body face and size: when a marker is inserted
+/// after a heading, inline code or a pasted run it used to inherit that run's
+/// font, which made nested bullets jump to a different typeface.
+fn marker_format() -> CharFormat2W {
+    let mut format = CharFormat2W {
+        dw_mask: CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT,
+        y_height: body_size(),
+        ..CharFormat2W::default()
+    };
+    face(&mut format, &body_font());
+    format
+}
+
+/// Applies [`marker_format`] to `start..start + length`.
+fn format_marker(editor: HWND, start: i32, length: i32) {
+    if length <= 0 {
+        return;
+    }
+    let (from, to) = editor::selection(editor);
+    editor::set_selection(editor, start, start + length);
+    editor::set_selection_format(editor, &marker_format());
+    editor::set_selection(editor, from, to);
+}
+
 /// True when the caret sits in Consolas text (inline code or a code block).
 pub fn in_code(editor: HWND) -> bool {
     let format = editor::selection_format(editor);
@@ -743,6 +768,7 @@ fn apply_list_level_impl(editor: HWND, kind: ListKind, level: usize) {
             new_len = units(&marker);
             editor::set_selection(editor, start, start);
             editor::replace_selection(editor, &marker, true);
+            format_marker(editor, start, new_len);
         }
         new_from = shifted(new_from, start, end, old_len, new_len);
         new_to = shifted(new_to, start, end, old_len, new_len);
@@ -798,7 +824,9 @@ pub fn new_literal_item(editor: HWND) -> bool {
     let new_start = editor::paragraph_start(editor, from + 1);
     editor::set_selection(editor, new_start, new_start);
     editor::replace_selection(editor, &marker, true);
-    let caret = new_start + units(&marker);
+    let marker_len = units(&marker);
+    format_marker(editor, new_start, marker_len);
+    let caret = new_start + marker_len;
     editor::set_selection(editor, caret, caret);
     true
 }
@@ -872,6 +900,7 @@ pub fn toggle_check_at(editor: HWND, pos: i32) -> bool {
     let glyph = units(&marker[..marker.len() - 1]);
     editor::set_selection(editor, start, start + glyph);
     editor::replace_selection(editor, next, true);
+    format_marker(editor, start, glyph);
     editor::set_selection(editor, from, to);
     true
 }

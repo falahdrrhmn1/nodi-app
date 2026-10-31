@@ -131,6 +131,9 @@ pub struct App {
 
     pub toolbar_visible: bool,
     pub status_visible: bool,
+    /// View > Notes Explorer visibility. The sidebar width is retained while
+    /// hidden so toggling it does not disturb the user's layout.
+    pub explorer_visible: bool,
     pub sidebar_width: i32,
     pub splitter_drag: bool,
     pub restored_window: bool,
@@ -217,6 +220,7 @@ impl App {
             gutter: ptr::null_mut(),
             toolbar_visible: true,
             status_visible: true,
+            explorer_visible: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             splitter_drag: false,
             restored_window: false,
@@ -415,6 +419,7 @@ impl App {
             .cloned()
             .collect();
         menu::set_checked(self, menu::IDM_VIEW_WORD_WRAP, self.word_wrap);
+        menu::set_checked(self, menu::IDM_VIEW_EXPLORER, self.explorer_visible);
         menu::sync_settings(self);
         menu::refresh_recent(self);
         if let Some(rect) = session.window {
@@ -855,6 +860,10 @@ impl App {
             }
         }
         let _ = loaded;
+
+        // Table shading is baked into the row parameters; repaint it for the
+        // current theme (and for notes created in a different theme).
+        table::retheme(editor, self.palette.table_bg(), self.palette.table_border());
 
         // Rich Edit drops EM_SETZOOM when new content is streamed in, so the
         // preferred zoom has to be applied again after the note is loaded.
@@ -2442,7 +2451,13 @@ pub fn insert_table(app: &mut App) {
         dialogs::error(app.hwnd, "Enter at least 1 row and 1 to 63 columns.");
         return;
     }
-    match table::insert(editor, rows, cols) {
+    match table::insert(
+        editor,
+        rows,
+        cols,
+        app.palette.table_bg(),
+        app.palette.table_border(),
+    ) {
         Ok(()) => app.mark_dirty(editor),
         Err(message) => dialogs::error(app.hwnd, &message),
     }

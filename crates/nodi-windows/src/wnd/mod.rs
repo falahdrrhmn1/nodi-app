@@ -473,8 +473,13 @@ pub fn layout(app: &mut App) {
         let max_by_fraction = width * 60 / 100;
         let max_by_editor = width - SPLITTER_WIDTH - app.scale(160);
         let max_sidebar = max_by_fraction.min(max_by_editor).max(min_sidebar);
-        let sidebar = app.sidebar_width.clamp(min_sidebar, max_sidebar);
-        app.sidebar_width = sidebar;
+        let sidebar = if app.explorer_visible {
+            let value = app.sidebar_width.clamp(min_sidebar, max_sidebar);
+            app.sidebar_width = value;
+            value
+        } else {
+            0
+        };
 
         // The content area moves as one batch, so dragging the splitter does
         // not show the tree, tabs and editor at different widths in between.
@@ -499,8 +504,28 @@ pub fn layout(app: &mut App) {
             tree_height,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
+        ShowWindow(
+            app.sidebar_title,
+            if app.explorer_visible {
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW
+            } else {
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE
+            },
+        );
+        ShowWindow(
+            app.tree_view,
+            if app.explorer_visible {
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW
+            } else {
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE
+            },
+        );
 
-        let right_x = sidebar + SPLITTER_WIDTH;
+        let right_x = if app.explorer_visible {
+            sidebar + SPLITTER_WIDTH
+        } else {
+            0
+        };
         let right_width = (width - right_x).max(0);
         let tab_height = tabs::measure_height(app).min(content_height);
         batch.pos(

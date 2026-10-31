@@ -908,7 +908,13 @@ fn run(app: &mut App, line: &str) -> String {
             Err(err) => err.to_string(),
         },
         ("table", Some(window)) => match parse_range(rest) {
-            Some((rows, cols)) => match table::insert(window, rows as usize, cols as usize) {
+            Some((rows, cols)) => match table::insert(
+                window,
+                rows as usize,
+                cols as usize,
+                app.palette.table_bg(),
+                app.palette.table_border(),
+            ) {
                 Ok(()) => {
                     app.mark_dirty(window);
                     "ok".to_owned()
@@ -917,16 +923,18 @@ fn run(app: &mut App, line: &str) -> String {
             },
             None => "usage: table rows cols".to_owned(),
         },
-        ("formula", Some(window)) => match formula::render(rest) {
-            Ok(rendered) => match formula::insert_rendered(window, &rendered, rest) {
-                Ok(()) => {
-                    app.mark_dirty(window);
-                    "ok".to_owned()
-                }
-                Err(message) => message,
-            },
-            Err(message) => format!("error: {message}"),
-        },
+        ("formula", Some(window)) => {
+            match formula::render_coloured(rest, app.palette.editor_text) {
+                Ok(rendered) => match formula::insert_rendered(window, &rendered, rest) {
+                    Ok(()) => {
+                        app.mark_dirty(window);
+                        "ok".to_owned()
+                    }
+                    Err(message) => message,
+                },
+                Err(message) => format!("error: {message}"),
+            }
+        }
         ("formula-source", Some(window)) => formula::selected_latex(window).unwrap_or_default(),
         ("row-below", Some(window)) => match table::insert_row(window, true) {
             Ok(()) => "ok".to_owned(),

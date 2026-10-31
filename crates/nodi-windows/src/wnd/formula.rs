@@ -144,8 +144,14 @@ pub struct Rendered {
     pub ascent: i32,
 }
 
-/// Parses, lays out and renders `latex`.
+/// Parses, lays out and renders `latex` in the default (black) colour.
+#[allow(dead_code)]
 pub fn render(latex: &str) -> Result<Rendered, String> {
+    render_coloured(latex, 0)
+}
+
+/// Parses, lays out and renders `latex` in `colour` (COLORREF `0x00bbggrr`).
+pub fn render_coloured(latex: &str, colour: u32) -> Result<Rendered, String> {
     let tree = math::parse(latex).map_err(|error| error.to_string())?;
     // SAFETY: a private memory DC; every GDI object created here is released
     // before returning.
@@ -156,7 +162,7 @@ pub fn render(latex: &str) -> Result<Rendered, String> {
         }
         let metrics = GdiMetrics::new(dc);
         let laid = math::layout(&tree, &metrics, EM_PX * SCALE);
-        let result = draw(dc, &metrics, &laid, latex);
+        let result = draw(dc, &metrics, &laid, latex, colour);
         drop(metrics);
         DeleteDC(dc);
         result
@@ -168,6 +174,7 @@ unsafe fn draw(
     metrics: &GdiMetrics,
     laid: &Layout,
     latex: &str,
+    colour: u32,
 ) -> Result<Rendered, String> {
     let pad = (3.0 * SCALE).ceil();
     let width = (laid.width + pad * 2.0).ceil().max(1.0) as i32;
@@ -256,20 +263,23 @@ unsafe fn draw(
     }
     GdiFlush();
 
-    // White-on-black coverage → black with alpha (transparent background).
+    // White background + black glyphs → a coverage mask, then paint the glyphs
+    // in the theme's text colour with the same alpha (transparent background).
     let pixels = std::slice::from_raw_parts(bits as *const u8, pixel_count * 4);
-    let mut gray_alpha = Vec::with_capacity(pixel_count * 2);
+    let red = (colour & 0xFF) as u8;
+    let green = ((colour >> 8) & 0xFF) as u8;
+    let blue = ((colour >> 16) & 0xFF) as u8;
+    let mut rgba = Vec::with_capacity(pixel_count * 4);
     for pixel in pixels.as_chunks::<4>().0 {
         let lightness = (u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2])) / 3;
-        gray_alpha.push(0);
-        gray_alpha.push(255 - lightness as u8);
+        rgba.extend_from_slice(&[red, green, blue, 255 - lightness as u8]);
     }
 
     SelectObject(dc, previous_bitmap);
     DeleteObject(bitmap as HGDIOBJ);
     DeleteObject(black as HGDIOBJ);
 
-    let png = math::encode_png(width as u32, height as u32, &gray_alpha, latex);
+    let png = math::encode_png_rgba(width as u32, height as u32, &rgba, latex);
     let himetric = |device: f32| ((device / SCALE) * 2540.0 / 96.0).round() as i32;
     Ok(Rendered {
         png,
@@ -380,7 +390,7 @@ pub fn insert_rendered(editor: HWND, rendered: &Rendered, latex: &str) -> Result
 /// (`markdown_in::FORMULA_START` … `FORMULA_END`) with a rendered formula.
 /// LaTeX that cannot be rendered stays as inline-code text. Returns how many
 /// were rendered and the LaTeX of those kept as text.
-pub fn render_pasted(editor: HWND) -> (usize, Vec<String>) {
+pub fn render_pasted(editor: HWND, colour: u32) -> (usize, Vec<String>) {
     let start_mark = nodi_core::markdown_in::FORMULA_START as u16;
     let end_mark = nodi_core::markdown_in::FORMULA_END as u16;
     let mut rendered_count = 0;
@@ -403,7 +413,7 @@ pub fn render_pasted(editor: HWND) -> (usize, Vec<String>) {
         let latex = String::from_utf16_lossy(&raw[start + 1..end]);
         let (from, to) = (start as i32, end as i32 + 1);
         editor::set_selection(editor, from, to);
-        let done = render(&latex)
+        let done = render_coloured(&latex, colour)
             .and_then(|picture| insert_rendered(editor, &picture, &latex))
             .is_ok();
         if done {
@@ -435,6 +445,7 @@ pub fn insert_or_edit(app: &mut App) {
     let (from, to) = editor::selection(editor);
     let found = formula_at(editor, from);
     let existing = found.as_ref().map(|found| found.latex.clone());
+    let colour = app.palette.editor_text;
     let mut latex = existing.clone().unwrap_or_default();
     loop {
         let title = if existing.is_some() {
@@ -457,7 +468,7 @@ pub fn insert_or_edit(app: &mut App) {
         if latex.is_empty() {
             return;
         }
-        match render(&latex) {
+        match render_coloured(&latex, colour) {
             Ok(rendered) => {
                 // Editing replaces the whole old formula (link + picture).
                 match &found {

@@ -63,7 +63,7 @@ pub const SIZE_COMBO_ID: u16 = 1202;
 const TEXT_COLOURS: [(&str, u32); 10] = [
     ("Black", 0x0000_0000),
     ("Dark grey", 0x0044_4444),
-    ("Red", 0x0025_2525),
+    ("Red", 0x0035_39E5),
     ("Orange", 0x002A_6BEC),
     ("Yellow", 0x0000_C8F0),
     ("Green", 0x0034_8A2D),
@@ -105,6 +105,7 @@ fn tip(command: u16) -> &'static str {
         IDM_FORMAT_H2 => "Heading 2 (Ctrl+Alt+2)",
         IDM_FORMAT_BULLETS => "Bulleted list (Ctrl+Shift+8)",
         IDM_FORMAT_NUMBERS => "Numbered list (Ctrl+Shift+7)",
+        IDM_FORMAT_CHECKLIST => "Checklist (Ctrl+Shift+9)",
         IDM_TOOLBAR_COLOR => "Text colour — pick from the palette",
         IDM_TOOLBAR_HIGHLIGHT => "Highlight — pick from the palette (Ctrl+Shift+H = yellow)",
         IDM_FORMAT_LEFT => "Align left (Ctrl+L)",
@@ -278,7 +279,7 @@ fn create_main(app: &App) -> HWND {
 /// Format bar: style/font/size combos, colour palettes, alignment, lists and
 /// the insert commands.
 fn create_format(app: &App) -> HWND {
-    const LABELS: [&str; 17] = [
+    const LABELS: [&str; 18] = [
         "B",
         "I",
         "U",
@@ -291,6 +292,7 @@ fn create_format(app: &App) -> HWND {
         "Justify",
         "\u{2022}",
         "1.",
+        "\u{2611}",
         "Img",
         "Table",
         "Link",
@@ -314,12 +316,13 @@ fn create_format(app: &App) -> HWND {
         buttons.separator(0, 0);
         buttons.text(10, IDM_FORMAT_BULLETS, 0, false);
         buttons.text(11, IDM_FORMAT_NUMBERS, 0, false);
+        buttons.text(12, IDM_FORMAT_CHECKLIST, 0, false);
         buttons.separator(0, 0);
-        buttons.text(12, IDM_INSERT_IMAGE, 0, false);
-        buttons.text(13, IDM_INSERT_TABLE, 0, false);
-        buttons.text(14, IDM_INSERT_LINK, 0, false);
-        buttons.text(15, IDM_INSERT_CODE_BLOCK, 0, false);
-        buttons.text(16, IDM_INSERT_FORMULA, 0, false);
+        buttons.text(13, IDM_INSERT_IMAGE, 0, false);
+        buttons.text(14, IDM_INSERT_TABLE, 0, false);
+        buttons.text(15, IDM_INSERT_LINK, 0, false);
+        buttons.text(16, IDM_INSERT_CODE_BLOCK, 0, false);
+        buttons.text(17, IDM_INSERT_FORMULA, 0, false);
     })
 }
 
@@ -1234,7 +1237,11 @@ pub fn show_palette(app: &mut App, highlight: bool) {
 /// `lparam` must be the `NMTOOLBARW` pointer of a `TBN_DROPDOWN`.
 pub unsafe fn on_dropdown(app: &mut App, lparam: isize) {
     let info = &*(lparam as *const windows_sys::Win32::UI::Controls::NMTOOLBARW);
-    let command = info.tbButton.idCommand as u16;
+    let command = if info.iItem != 0 {
+        info.iItem as u16
+    } else {
+        info.tbButton.idCommand as u16
+    };
     if command == IDM_TOOLBAR_COLOR {
         show_palette(app, false);
     } else if command == IDM_TOOLBAR_HIGHLIGHT {

@@ -419,6 +419,26 @@ impl Palette {
         // SAFETY: creates an owned GDI brush; the caller owns it.
         unsafe { CreateSolidBrush(self.window_bg) }
     }
+
+    /// Cell background for Rich Edit tables: white on light themes, a slightly
+    /// raised shade of the page on dark ones (never a glaring white block).
+    pub fn table_bg(&self) -> u32 {
+        if self.dark {
+            lighten(self.editor_bg, 14)
+        } else {
+            rgb(255, 255, 255)
+        }
+    }
+
+    /// Table borders: clearly visible on both light and dark pages without
+    /// becoming a bright grid.
+    pub fn table_border(&self) -> u32 {
+        if self.dark {
+            lighten(self.editor_bg, 58)
+        } else {
+            rgb(160, 160, 160)
+        }
+    }
 }
 
 impl Default for Palette {
@@ -436,6 +456,9 @@ pub fn theme_bytes(palette: &Palette, rtf: &[u8]) -> Vec<u8> {
     // versions or imported from Markdown).
     let gap = nodi_core::image::page_break_png_coloured(rgb_tuple(palette.gutter_bg));
     let text = nodi_core::rtf::replace_page_breaks(&text, &gap);
+    // Formula pictures are grey + alpha masks: repaint them in the text colour
+    // so they stay readable in dark and high-contrast themes as well.
+    let text = nodi_core::rtf::replace_formula_pictures(&text, rgb_tuple(palette.editor_text));
     match (palette.auto_sentinel, palette.black_sentinel) {
         (Some(auto), Some(black)) => apply_theme_colors(&text, auto, black).into_bytes(),
         _ => text.into_bytes(),
@@ -444,24 +467,28 @@ pub fn theme_bytes(palette: &Palette, rtf: &[u8]) -> Vec<u8> {
 
 /// RTF as it must be stored on disk (sentinels folded back to auto/black).
 pub fn fold_bytes(palette: &Palette, rtf: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(rtf);
+    // Formulas are stored black and repainted on display, like automatic text.
+    let text = nodi_core::rtf::replace_formula_pictures(&text, (0, 0, 0));
     match (palette.auto_sentinel, palette.black_sentinel) {
-        (Some(auto), Some(black)) => {
-            let text = String::from_utf8_lossy(rtf);
-            fold_theme_colors(&text, auto, black).into_bytes()
-        }
-        _ => rtf.to_vec(),
+        (Some(auto), Some(black)) => fold_theme_colors(&text, auto, black).into_bytes(),
+        _ => text.into_bytes(),
     }
 }
 
 /// Reloads one editor from its stored RTF (`stream_out_rtf` already folded the
 /// old palette's display colours) in `new`'s display colours, keeping the
 /// caret, selection and first visible line.
-fn retint_editor(editor: HWND, stored: &[u8], new: &Palette) {
+fn retint_editor(editor: HWND, stored: &[u8], new: &Palette, zoom: i32) {
     let themed = theme_bytes(new, stored);
     let (from, to) = editor::selection(editor);
     let line = editor::first_visible_line(editor);
     editor::set_change_events(editor, false);
     editor::load_rtf(editor, &themed);
+    crate::wnd::table::retheme(editor, new.table_bg(), new.table_border());
+    // `EM_STREAMIN` resets the zoom to 100%; restore the user's level so a
+    // theme switch does not require Ctrl+0 (or a manual zoom) afterwards.
+    editor::set_zoom_percent(editor, zoom);
     editor::set_selection(editor, from, to);
     editor::set_change_events(editor, true);
     editor::scroll_to_line(editor, line);
@@ -480,7 +507,11 @@ pub unsafe fn fill(hdc: HDC, rect: &windows_sys::Win32::Foundation::RECT, colour
 pub fn apply(app: &mut App) {
     let old = app.palette;
     let new = Palette::from_settings(&app.settings);
-    if old.sentinels() != new.sentinels() || old.gutter_bg != new.gutter_bg {
+    if old.sentinels() != new.sentinels()
+        || old.gutter_bg != new.gutter_bg
+        || old.table_bg() != new.table_bg()
+        || old.table_border() != new.table_border()
+    {
         // Read every editor while the old display colours are installed, so
         // they fold back correctly, then reload in the new ones. The page gap
         // follows the line-number colour, so it is repainted too.
@@ -491,7 +522,7 @@ pub fn apply(app: &mut App) {
             .collect();
         new.install_display_colours();
         for (window, rtf) in &stored {
-            retint_editor(*window, rtf, &new);
+            retint_editor(*window, rtf, &new, app.zoom);
         }
     }
     new.install_display_colours();

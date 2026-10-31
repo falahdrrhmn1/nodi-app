@@ -101,6 +101,29 @@ pub fn latex_from_png(png: &[u8]) -> Option<String> {
     None
 }
 
+/// Returns `png` repainted in `rgb`, keeping its alpha mask and LaTeX source.
+///
+/// Formula pictures are stored as a grey coverage mask with an alpha channel,
+/// so a dark theme can repaint the glyphs without re-laying out the LaTeX.
+/// Returns `None` when `png` is not a Nodi formula picture or cannot be
+/// decoded.
+pub fn recolour_png(png: &[u8], rgb: (u8, u8, u8)) -> Option<Vec<u8>> {
+    let latex = latex_from_png(png)?;
+    let decoded = crate::png::decode(png).ok()?;
+    let mut pixels = decoded.pixels;
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel[0] = rgb.0;
+        pixel[1] = rgb.1;
+        pixel[2] = rgb.2;
+    }
+    Some(encode_png_rgba(
+        decoded.width,
+        decoded.height,
+        &pixels,
+        &latex,
+    ))
+}
+
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend_from_slice(&(data.len() as u32).to_be_bytes());
     let start = png.len();
@@ -135,6 +158,17 @@ mod tests {
         assert_eq!((info.width, info.height), (2, 2));
         // IEND chunk CRC is the well-known constant.
         assert!(png.ends_with(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82]));
+    }
+
+    #[test]
+    fn recolour_keeps_alpha_and_latex() {
+        let pixels = vec![0u8, 128];
+        let png = encode_png(1, 1, &pixels, r"x^2");
+        let painted = recolour_png(&png, (230, 230, 230)).unwrap();
+        assert_eq!(latex_from_png(&painted).as_deref(), Some(r"x^2"));
+        let decoded = crate::png::decode(&painted).unwrap();
+        assert_eq!(decoded.pixel(0, 0), Some((230, 230, 230, 128)));
+        assert!(recolour_png(b"not a png", (1, 2, 3)).is_none());
     }
 
     #[test]

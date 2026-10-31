@@ -85,6 +85,26 @@ pub unsafe fn paint(editor: HWND, dpi: i32) -> bool {
     let key_brush = CreateSolidBrush(key_colour(editor_bg));
     FillRect(content, &rect, key_brush);
     DeleteObject(key_brush as HGDIOBJ);
+    // The first `WM_PRINTCLIENT` after a note is streamed in can come back
+    // blank (Rich Edit has not laid the text out for printing yet). Asking a
+    // second time, after a throwaway paint, makes the control print the real
+    // page; otherwise a restored tab shows only the background pattern until
+    // the user clicks it.
+    let prime = CreateCompatibleDC(dc);
+    let prime_bitmap = CreateCompatibleBitmap(dc, width, height);
+    let old_prime = SelectObject(prime, prime_bitmap as HGDIOBJ);
+    SendMessageW(
+        editor,
+        WM_PRINTCLIENT,
+        prime as usize,
+        PRF_CLIENT | PRF_ERASEBKGND,
+    );
+    SelectObject(prime, old_prime);
+    DeleteObject(prime_bitmap as HGDIOBJ);
+    DeleteDC(prime);
+    let key_brush = CreateSolidBrush(key_colour(editor_bg));
+    FillRect(content, &rect, key_brush);
+    DeleteObject(key_brush as HGDIOBJ);
     SendMessageW(
         editor,
         WM_PRINTCLIENT,

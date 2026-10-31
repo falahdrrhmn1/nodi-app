@@ -97,6 +97,8 @@ pub const IDM_VIEW_ZOOM_IN: u16 = 135;
 pub const IDM_VIEW_ZOOM_OUT: u16 = 136;
 pub const IDM_VIEW_ZOOM_RESET: u16 = 137;
 pub const IDM_VIEW_ZOOM_SET: u16 = 147;
+pub const IDM_VIEW_EXPLORER: u16 = 148;
+pub const IDM_VIEW_AUTOCOMPLETE: u16 = 149;
 pub const IDM_VIEW_MARKDOWN: u16 = 138;
 pub const IDM_VIEW_SPELL: u16 = 139;
 pub const IDM_VIEW_OUTLINE: u16 = 142;
@@ -393,6 +395,8 @@ pub fn create_menu() -> HMENU {
         let view = popup(&[
             Item::Checked(IDM_VIEW_TOOLBAR, "&Toolbar"),
             Item::Checked(IDM_VIEW_STATUS, "&Status Bar"),
+            Item::Checked(IDM_VIEW_EXPLORER, "Notes E&xplorer\tCtrl+Shift+E"),
+            Item::Checked(IDM_VIEW_AUTOCOMPLETE, "Same-page &Autocomplete\tCtrl+Space"),
             Item::Checked(IDM_VIEW_WORD_WRAP, "&Word Wrap"),
             Item::Sep,
             Item::Cmd(IDM_VIEW_ZOOM_IN, "Zoom &In\tCtrl+="),
@@ -709,6 +713,8 @@ pub fn sync_settings(app: &App) {
     check_item(app, IDM_VIEW_SPELL, app.settings.spell_check);
     check_item(app, IDM_VIEW_CTRL_SCROLL, app.settings.ctrl_arrow_scroll);
     crate::wnd::editkeys::set_ctrl_arrow_scroll(app.settings.ctrl_arrow_scroll);
+    crate::wnd::editkeys::set_autocomplete(app.settings.autocomplete);
+    check_item(app, IDM_VIEW_AUTOCOMPLETE, app.settings.autocomplete);
     let background = app.settings.background;
     check_item(app, IDM_BG_PLAIN, background == Background::Plain);
     check_item(app, IDM_BG_LINES, background == Background::Lines);
@@ -829,6 +835,7 @@ pub fn create_accel() -> HACCEL {
         accel(ctrl, key(b'0'), IDM_VIEW_ZOOM_RESET),
         accel(ctrl_shift, key(b'M'), IDM_VIEW_MARKDOWN),
         accel(ctrl_alt, key(b'O'), IDM_VIEW_OUTLINE),
+        accel(ctrl_shift, key(b'E'), IDM_VIEW_EXPLORER),
         accel(0, VK_F2, IDM_NOTES_RENAME),
         accel(FALT, VK_UP, IDM_NOTES_MOVE_UP),
         accel(FALT, VK_DOWN, IDM_NOTES_MOVE_DOWN),
@@ -1012,6 +1019,17 @@ pub fn on_command(app: &mut App, id: u16) {
             app.status_visible = !app.status_visible;
             check_item(app, id, app.status_visible);
             crate::wnd::layout(app);
+        }
+        IDM_VIEW_EXPLORER => {
+            app.explorer_visible = !app.explorer_visible;
+            check_item(app, id, app.explorer_visible);
+            crate::wnd::layout(app);
+        }
+        IDM_VIEW_AUTOCOMPLETE => {
+            app.settings.autocomplete = !app.settings.autocomplete;
+            app.save_settings();
+            crate::wnd::editkeys::set_autocomplete(app.settings.autocomplete);
+            check_item(app, id, app.settings.autocomplete);
         }
         IDM_VIEW_WORD_WRAP => {
             app.word_wrap = !app.word_wrap;
