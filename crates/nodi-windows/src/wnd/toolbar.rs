@@ -47,6 +47,9 @@ const COMBO_FONT_WIDTH: i32 = 118;
 const COMBO_SIZE_WIDTH: i32 = 50;
 const COMBO_GAP: i32 = 6;
 const COMBO_EDGE: i32 = 2;
+/// Width of the font combo's drop list, in 96-DPI pixels. Wider than the closed
+/// box so long family names are not cut off.
+const COMBO_DROP_WIDTH: i32 = 240;
 
 /// Internal palette command ids (never reach `menu::on_command`).
 const PALETTE_BASE: u16 = 3200;
@@ -328,13 +331,23 @@ fn create_format(app: &App) -> HWND {
 
 fn create_combo(app: &App, parent: HWND, id: u16, style: u32) -> HWND {
     let class = win::wide("COMBOBOX");
+    // `CBS_NOINTEGRALHEIGHT` is essential: without it a combo drops a whole
+    // number of items and, worse, always shows at least 30 of them
+    // (`CB_SETMINVISIBLE` defaults to 30), so the box ignored the height set in
+    // `relayout` and covered the whole screen. With the flag the drop list is
+    // exactly the height we ask for.
     // SAFETY: constant class name, live parent, no pointer arguments.
     let combo = unsafe {
         CreateWindowExW(
             0,
             class.as_ptr(),
             ptr::null(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | style,
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | WS_VSCROLL
+                | style
+                | windows_sys::Win32::UI::WindowsAndMessaging::CBS_NOINTEGRALHEIGHT as u32,
             0,
             0,
             10,
@@ -602,6 +615,19 @@ pub fn relayout(app: &mut App) {
     place(app.font_combo, font_left, font_width);
     let size_left = font_left + font_width + gap;
     place(app.size_combo, size_left, size_width);
+    // Font family names are wider than the closed box, so widen the drop list
+    // (scaled, so it survives a DPI change or a monitor move).
+    if !app.font_combo.is_null() {
+        // SAFETY: our own combo; the message only updates the dropped width.
+        unsafe {
+            SendMessageW(
+                app.font_combo,
+                windows_sys::Win32::UI::WindowsAndMessaging::CB_SETDROPPEDWIDTH,
+                app.scale(COMBO_DROP_WIDTH) as usize,
+                0,
+            );
+        }
+    }
 }
 
 /// Width needed by the widest style name (`Heading 1`…`Heading 4`) plus the
