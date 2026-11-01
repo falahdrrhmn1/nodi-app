@@ -108,7 +108,7 @@ pub fn insert(
     // below the code block first, into its own paragraph: without that empty
     // paragraph Rich Edit runs the two tables together into one, so a table
     // inserted under a code block could never be told apart from it again.
-    if crate::wnd::format::in_code(editor) {
+    if crate::wnd::format::in_code_block(editor) {
         if let Ok(here) = here(editor) {
             let after = here.row.end + 2;
             editor::set_selection(editor, after, after);
@@ -482,9 +482,36 @@ fn set_cells(editor: HWND, here: &Here, cells: Vec<CellParms>, index: usize) -> 
     hresult(result, "change the columns")
 }
 
+/// True when `row` belongs to a code block: it carries the `nodi-copy:` header
+/// itself, or the row directly above it does. A code block is two adjacent rows
+/// (header + code) of the same table.
+fn row_in_code_block(units: &[u16], all: &[Row], row: Row) -> bool {
+    if has_copy_link(units, row) {
+        return true;
+    }
+    all.iter()
+        .find(|candidate| candidate.depth == row.depth && candidate.end + 2 == row.start)
+        .is_some_and(|header| has_copy_link(units, *header))
+}
+
 /// True when the caret is inside any table row.
 pub fn caret_in_table(editor: HWND) -> bool {
     editor::in_table(editor)
+}
+
+/// True when the caret is inside a code block. Code-block text uses the note's
+/// default font now, so it cannot be recognised by its face: it is a two-row
+/// table whose first row is the `nodi-copy:` header.
+pub fn caret_in_code_block(editor: HWND) -> bool {
+    // Cheapest check first: outside a table there can be no code block, so the
+    // per-keystroke callers avoid scanning the whole document.
+    if !editor::in_table(editor) {
+        return false;
+    }
+    let units = document(editor);
+    let all = rows(&units);
+    let (caret, _) = editor::selection(editor);
+    row_at(&all, caret).is_some_and(|row| row_in_code_block(&units, &all, row))
 }
 
 #[cfg(test)]
@@ -524,5 +551,19 @@ mod tests {
         assert_eq!(all.len(), 2);
         let b = units.iter().position(|unit| *unit == 'b' as u16).unwrap() as i32;
         assert_eq!(row_at(&all, b).unwrap().depth, 1);
+    }
+
+    #[test]
+    fn code_block_is_header_row_then_code_row() {
+        // A code block: header row (label + `nodi-copy:` link) above the code
+        // row, then an ordinary table below it.
+        let units = text("|R|codeC{nodi-copy:}C|E|R|print(1)C|E|R|xCyC|E");
+        let all = rows(&units);
+        assert_eq!(all.len(), 3);
+        // The header and the row right below it are the block...
+        assert!(row_in_code_block(&units, &all, all[0]));
+        assert!(row_in_code_block(&units, &all, all[1]));
+        // ...the row after that is an ordinary table row.
+        assert!(!row_in_code_block(&units, &all, all[2]));
     }
 }

@@ -1024,7 +1024,9 @@ fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
     out.push_str(&links::format_copy_link());
     out.push_str("\"}}{\\fldrslt{\\ul Copy}}}}\\cell\\row");
 
-    // Code row: automatic text colour so it never becomes dark-on-dark.
+    // Code row: automatic text colour and the note's default font (the same
+    // font the block's text uses in the editor), so it never becomes
+    // dark-on-dark and matches the surrounding text.
     let body = code.trim_end_matches(['\r', '\n']);
     let mut cell = String::new();
     for (index, line) in body.split('\n').enumerate() {
@@ -1040,7 +1042,7 @@ fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
     out.push_str(&format!(
         "\\trowd\\trgaph108\\trleft0\\clcbpat1\\clbrdrt{border}\\clbrdrl{border}\
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}\
-         \\pard\\intbl\\f1\\fs20\\cf0{tabs} {cell}\\cell\\row\n\
+         \\pard\\intbl\\f0\\fs{body_size}\\cf0{tabs} {cell}\\cell\\row\n\
          \\pard\\f0\\fs{body_size}\\cf0\\par\n"
     ));
 }

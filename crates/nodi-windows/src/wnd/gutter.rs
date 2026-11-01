@@ -9,11 +9,11 @@
 use std::cell::RefCell;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect,
-    SelectObject, SetBkMode, SetTextColor, DT_RIGHT, DT_SINGLELINE, DT_TOP, HGDIOBJ, PAINTSTRUCT,
-    TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
+    GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    DT_RIGHT, DT_SINGLELINE, DT_TOP, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -129,6 +129,40 @@ pub fn create(app: &App) -> HWND {
     }
 }
 
+/// The font the strip draws with: the note's default font, falling back to the
+/// chrome font before the strip's own font exists.
+fn font(app: &App) -> HGDIOBJ {
+    if app.gutter_font.is_null() {
+        app.ui_font as HGDIOBJ
+    } else {
+        app.gutter_font as HGDIOBJ
+    }
+}
+
+/// Width of one digit in the strip's font, or a sane fallback.
+fn digit_width(app: &App) -> i32 {
+    // SAFETY: the DC is released below and the font belongs to the app.
+    unsafe {
+        let dc = GetDC(app.gutter);
+        if dc.is_null() {
+            return app.scale(8);
+        }
+        let old = SelectObject(dc, font(app));
+        let mut size = SIZE { cx: 0, cy: 0 };
+        let sample: Vec<u16> = "0".encode_utf16().collect();
+        let ok = GetTextExtentPoint32W(dc, sample.as_ptr(), sample.len() as i32, &mut size);
+        if !old.is_null() {
+            SelectObject(dc, old);
+        }
+        ReleaseDC(app.gutter, dc);
+        if ok != 0 && size.cx > 0 {
+            size.cx
+        } else {
+            app.scale(8)
+        }
+    }
+}
+
 /// Width the strip needs for the active note (0 when switched off).
 pub fn width(app: &App) -> i32 {
     if !app.settings.line_numbers || app.gutter.is_null() {
@@ -136,7 +170,7 @@ pub fn width(app: &App) -> i32 {
     }
     let lines = app.active_editor().map_or(1, line_count);
     let digits = lines.max(1).to_string().len().max(2) as i32;
-    app.scale(10 + digits * 8)
+    app.scale(6) + digits * digit_width(app) + app.scale(6)
 }
 
 /// Repaints the strip (a note was opened, typed into or scrolled).
@@ -194,7 +228,7 @@ unsafe fn paint(app: &App, hwnd: HWND) {
     FillRect(dc, &rect, brush);
     DeleteObject(brush as HGDIOBJ);
     if let Some(window) = app.active_editor() {
-        let old = SelectObject(dc, app.ui_font as HGDIOBJ);
+        let old = SelectObject(dc, font(app));
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, palette.gutter_text);
         let starts = starts(window);

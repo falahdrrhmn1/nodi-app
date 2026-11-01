@@ -118,10 +118,26 @@ fn format_marker(editor: HWND, start: i32, length: i32) {
     editor::set_selection(editor, from, to);
 }
 
-/// True when the caret sits in Consolas text (inline code or a code block).
-pub fn in_code(editor: HWND) -> bool {
+/// True when the caret sits in Consolas text, i.e. inline code. Code *blocks*
+/// use the note's default font (so they match the text around them), so they
+/// are recognised by structure in [`in_code_block`] instead.
+pub fn in_inline_code(editor: HWND) -> bool {
     let format = editor::selection_format(editor);
     format.dw_mask & CFM_FACE != 0 && face_name(&format) == CODE_FONT
+}
+
+/// True when the caret is inside a code block: a two-row table whose first row
+/// carries the `nodi-copy:` header (see [`crate::wnd::table`]). Code blocks are
+/// ordinary tables structurally, so this is how they are told apart now that
+/// their text uses the note's default font rather than a fixed code face.
+pub fn in_code_block(editor: HWND) -> bool {
+    crate::wnd::table::caret_in_code_block(editor)
+}
+
+/// True in inline code or inside a code block — anything typed there must stay
+/// literal (no `". "` shortcut, no list/tab handling).
+pub fn in_code(editor: HWND) -> bool {
+    in_code_block(editor) || in_inline_code(editor)
 }
 
 thread_local! {
@@ -1343,7 +1359,7 @@ pub fn align(editor: HWND, alignment: u16) {
 /// Inline code: Consolas on a light grey background. Toggles off when the
 /// selection already is code.
 pub fn toggle_inline_code(editor: HWND) {
-    let to_code = !in_code(editor);
+    let to_code = !in_inline_code(editor);
     let mut format = CharFormat2W {
         dw_mask: CFM_FACE | CFM_SIZE | CFM_BACKCOLOR,
         ..CharFormat2W::default()
@@ -1838,7 +1854,8 @@ pub fn code_tab_stops_rtf() -> String {
 
 /// Inserts plain text at the selection. Inside a table cell (a code block)
 /// a tab typed through `EM_REPLACESEL` acts like the Tab key and jumps to the
-/// next cell or adds a row, so the text goes in as RTF in the code font.
+/// next cell or adds a row, so the text goes in as RTF in the note's default
+/// font (the same font the block's own text uses).
 pub fn insert_text(editor: HWND, text: &str) {
     if !editor::in_table(editor) || !text.contains('\t') {
         editor::replace_selection(editor, text, true);
@@ -1855,8 +1872,9 @@ pub fn insert_text(editor: HWND, text: &str) {
             continue;
         }
         let rtf = format!(
-            "{{\\rtf1\\ansi\\uc1{{\\fonttbl{{\\f0\\fmodern {CODE_FONT};}}}}\\f0\\fs{} {}}}",
-            CODE_SIZE / 10,
+            "{{\\rtf1\\ansi\\uc1{{\\fonttbl{{\\f0\\fnil {};}}}}\\f0\\fs{} {}}}",
+            body_font(),
+            body_size() / 10,
             rtf_escape(line)
         );
         editor::insert_rtf(editor, rtf.as_bytes());
@@ -1919,15 +1937,16 @@ pub fn prepare_block(editor: HWND) -> i32 {
 }
 
 /// Insert > Code Block: a two-row, bordered table — a header strip with the
-/// language label and a Copy link, then the Consolas code cell. Plain
-/// paragraph shading is not rendered by Rich Edit; table cells are, so the
+/// language label and a Copy link, then the code cell. The code text uses the
+/// note's default font (Preferences > Default font), like the text around it.
+/// Plain paragraph shading is not rendered by Rich Edit; table cells are, so the
 /// rows are the box. The selected text (if any) becomes the code.
 pub fn insert_code_block(editor: HWND) {
     insert_code(editor, "", false);
 }
 
 /// Insert > Output Block (Ctrl+Shift+O): the same structure with a dark
-/// background, light monospace text and the label `output`.
+/// background, light text and the label `output`.
 pub fn insert_output_block(editor: HWND) {
     insert_code(editor, "", true);
 }
@@ -2002,10 +2021,7 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
     let edge = 2;
     let border = format!("\\brdrs\\brdrw10\\brdrcf{edge}");
     let mut rtf = String::from("{\\rtf1\\ansi\\uc1\\deff0");
-    rtf.push_str(&format!(
-        "{{\\fonttbl{{\\f0\\fnil {};}}{{\\f1\\fmodern {CODE_FONT};}}}}",
-        body_font()
-    ));
+    rtf.push_str(&format!("{{\\fonttbl{{\\f0\\fnil {};}}}}", body_font()));
     rtf.push_str(&code_colours());
 
     // Header row: two cells so Copy is always inside the block. The label cell
@@ -2039,7 +2055,8 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}"
     ));
     rtf.push_str(&format!(
-        "\\pard\\intbl\\f1\\fs20{text_colour}{} ",
+        "\\pard\\intbl\\f0\\fs{}{text_colour}{} ",
+        body_size() / 10,
         code_tab_stops_rtf()
     ));
     rtf.push_str(&rtf_escape(code.trim_end_matches('\r')));

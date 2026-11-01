@@ -40,7 +40,7 @@ pub fn show_editor_menu(app: &mut App, editor: HWND, screen: Option<POINT>) {
 
     let formula = image_is_formula(editor);
     let picture = !formula && image::pick_picture(editor).is_some();
-    let in_table = table::caret_in_table(editor) && !crate::wnd::format::in_code(editor);
+    let in_table = table::caret_in_table(editor) && !crate::wnd::format::in_code_block(editor);
     let link_target = link_under_caret(editor);
 
     let mut items = vec![

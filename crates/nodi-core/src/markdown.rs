@@ -819,7 +819,11 @@ impl Writer {
 
     fn table(&mut self, rows: &[Vec<Vec<Paragraph>>]) -> String {
         // A code block is one or two rows: a header with the language label
-        // and Copy link (one or two cells) above a single code cell.
+        // and Copy link (one or two cells) above a single code cell. The code
+        // text itself follows Preferences > Default font now, so the header's
+        // `nodi-copy:` link — not a monospace face — marks the block; the face
+        // still catches older blocks typed in Consolas and headerless cells.
+        let copy_header = rows.len() == 2 && row_has_copy_link(&rows[0]);
         let body_is_single_cell = rows.last().is_some_and(|row| row.len() == 1);
         let header_fits = rows.len() == 1 || rows[0].len() <= 2;
         if (1..=2).contains(&rows.len()) && body_is_single_cell && header_fits {
@@ -836,7 +840,7 @@ impl Writer {
                 })
             });
             let all_code = all_code && any_code;
-            if all_code {
+            if all_code || copy_header {
                 let code: Vec<String> = cell
                     .iter()
                     .map(|paragraph| {
@@ -884,6 +888,17 @@ impl Writer {
         }
         lines.join("\n")
     }
+}
+
+/// True when a table row carries a code block's `nodi-copy:` link.
+fn row_has_copy_link(row: &[Vec<Paragraph>]) -> bool {
+    row.iter().any(|cell| {
+        cell.iter().any(|paragraph| {
+            paragraph.inlines.iter().any(|inline| {
+                matches!(inline, Inline::Text(_, _, Some(target)) if crate::links::is_copy_link(target))
+            })
+        })
+    })
 }
 
 /// Strips the editable heading marker (`## `) from a heading's text.

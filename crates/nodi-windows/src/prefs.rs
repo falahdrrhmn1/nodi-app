@@ -110,6 +110,7 @@ impl App {
         let mirror = flag(8);
 
         self.apply_body_font();
+        crate::app::refresh_gutter_font(self);
         dialogs::set_sounds(self.settings.sounds);
         for tab in &self.tabs {
             editor::set_beeps(tab.editor, self.settings.sounds);

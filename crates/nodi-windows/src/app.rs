@@ -113,6 +113,9 @@ pub struct App {
     pub dpi: u32,
     pub ui_font: HFONT,
     pub bold_font: HFONT,
+    /// Font of the line-number strip: the note's default font (Preferences >
+    /// Default font), so the numbers match the text they label.
+    pub gutter_font: HFONT,
     pub hcursor_we: HCURSOR,
 
     pub toolbar: HWND,
@@ -204,6 +207,7 @@ impl App {
             dpi: 96,
             ui_font: ptr::null_mut(),
             bold_font: ptr::null_mut(),
+            gutter_font: ptr::null_mut(),
             // SAFETY: `IDC_SIZEWE` is a predefined system cursor; the call
             // takes no pointers we own and returns a shared handle.
             hcursor_we: unsafe { LoadCursorW(ptr::null_mut(), IDC_SIZEWE) },
@@ -2096,20 +2100,35 @@ pub fn recreate_fonts(app: &mut App) {
     let (face, size) = crate::wnd::theme::ui_font();
     let ui = unsafe { make_ui_font(app.dpi, false, &face, size) };
     let bold = unsafe { make_ui_font(app.dpi, true, &face, size) };
+    let gutter = unsafe { make_gutter_font(app.dpi) };
     let old_ui = std::mem::replace(&mut app.ui_font, ui);
     let old_bold = std::mem::replace(&mut app.bold_font, bold);
+    let old_gutter = std::mem::replace(&mut app.gutter_font, gutter);
 
     apply_fonts(app);
 
     delete_font(old_ui);
     delete_font(old_bold);
+    delete_font(old_gutter);
+}
+
+/// Recreates just the line-number font: the default note font changed in
+/// Preferences, so the numbers must follow it. Re-lays out so the strip can
+/// re-measure its width.
+pub fn refresh_gutter_font(app: &mut App) {
+    let font = unsafe { make_gutter_font(app.dpi) };
+    let old = std::mem::replace(&mut app.gutter_font, font);
+    delete_font(old);
+    crate::wnd::layout(app);
 }
 
 pub fn destroy_fonts(app: &mut App) {
     let ui = std::mem::replace(&mut app.ui_font, ptr::null_mut());
     let bold = std::mem::replace(&mut app.bold_font, ptr::null_mut());
+    let gutter = std::mem::replace(&mut app.gutter_font, ptr::null_mut());
     delete_font(ui);
     delete_font(bold);
+    delete_font(gutter);
     if app.images != 0 {
         // SAFETY: the image list belongs to the tree we created.
         unsafe {
@@ -2201,6 +2220,27 @@ fn set_face(buffer: &mut [u16; 32], name: &str) {
     for (slot, unit) in buffer.iter_mut().zip(name.encode_utf16()) {
         *slot = unit;
     }
+}
+
+/// Font for the line-number strip: the note's default font at its default size
+/// (Preferences > Default font), scaled for the current DPI, so the numbers
+/// read like the text they label.
+unsafe fn make_gutter_font(dpi: u32) -> HFONT {
+    let mut logfont: LOGFONTW = std::mem::zeroed();
+    // `body_size()` is in half-points and a font height is points times the DPI,
+    // so half_points * dpi / (2 * 72).
+    let half_points = nodi_core::markdown_in::body_size().max(8);
+    logfont.lfHeight = -win::mul_div(half_points, dpi as i32, 144);
+    if logfont.lfHeight == 0 {
+        logfont.lfHeight = -win::mul_div(22, dpi as i32, 144);
+    }
+    logfont.lfWeight = FW_NORMAL as i32;
+    logfont.lfCharSet = DEFAULT_CHARSET;
+    set_face(
+        &mut logfont.lfFaceName,
+        &nodi_core::markdown_in::body_font(),
+    );
+    CreateFontIndirectW(&logfont)
 }
 
 /// `EN_CHANGE` notification from an editor.

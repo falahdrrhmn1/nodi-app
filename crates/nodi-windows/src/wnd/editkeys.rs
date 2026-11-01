@@ -644,7 +644,7 @@ pub fn newline_keep_indent(editor: HWND) -> bool {
     if editor::in_table(editor) {
         // Ordinary table cells keep Rich Edit's native Enter (next row); a
         // code block is a one-cell table and must get a paragraph inside it.
-        if !format::in_code(editor) {
+        if !format::in_code_block(editor) {
             return false;
         }
         return code_newline(editor);
@@ -739,7 +739,7 @@ fn backspace_key(editor: HWND) -> bool {
 
 /// Tab / Shift+Tab. Returns false to let Rich Edit insert a plain tab.
 pub fn tab_key(editor: HWND, outdent: bool) -> bool {
-    let in_code_block = editor::in_table(editor) && format::in_code(editor);
+    let in_code_block = format::in_code_block(editor);
     if editor::in_table(editor) && !in_code_block {
         return false;
     }
