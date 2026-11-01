@@ -617,6 +617,21 @@ impl Writer {
     }
 
     fn paragraph(&mut self, paragraph: &Paragraph) -> String {
+        // A titled separator is ordinary text made of box-drawing glyphs so the
+        // title stays editable (Rich Edit cannot draw a line through text).
+        // Export it as the Markdown form the user typed: `--- Judul ---` or
+        // `---- Judul ----`.
+        let plain: String = paragraph
+            .inlines
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(text, _, _) => Some(text.as_str()),
+                Inline::Picture(_) | Inline::Math(_) | Inline::Rule(_) => None,
+            })
+            .collect();
+        if let Some(rule) = titled_rule_markdown(&plain) {
+            return rule;
+        }
         if let Some(level) = Self::heading_level(paragraph) {
             let text: String = paragraph
                 .inlines
@@ -880,6 +895,32 @@ fn strip_heading_marker(text: &str) -> &str {
     match text.char_indices().nth(hashes) {
         Some((index, ' ')) => &text[index + 1..],
         _ => text,
+    }
+}
+
+/// Turns a box-drawing separator (`──── Judul ────`, left/right-aligned too)
+/// back into its Markdown form. Text without a rule glyph returns `None`, so
+/// ordinary prose is untouched.
+fn titled_rule_markdown(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let glyph = if trimmed.contains('═') {
+        '═'
+    } else if trimmed.contains('─') {
+        '─'
+    } else {
+        return None;
+    };
+    let dashes = if glyph == '═' { "----" } else { "---" };
+    if trimmed.chars().any(|ch| ch != glyph && ch != ' ') {
+        let title = trimmed
+            .trim_matches(|ch: char| ch == glyph || ch == ' ')
+            .trim();
+        if title.is_empty() {
+            return Some(dashes.to_owned());
+        }
+        Some(format!("{dashes} {title} {dashes}"))
+    } else {
+        Some(dashes.to_owned())
     }
 }
 

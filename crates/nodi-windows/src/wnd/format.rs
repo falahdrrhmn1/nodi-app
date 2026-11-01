@@ -5,16 +5,17 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::mem::size_of;
 
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{HWND, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetDC, GetDeviceCaps, ReleaseDC, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL, LOGFONTW, LOGPIXELSX,
+    GetDC, GetDeviceCaps, GetTextExtentPoint32W, ReleaseDC, SelectObject, DEFAULT_CHARSET, FW_BOLD,
+    FW_NORMAL, HFONT, LOGFONTW, LOGPIXELSX,
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{
     ChooseColorW, ChooseFontW, CC_FULLOPEN, CC_RGBINIT, CF_EFFECTS, CF_INITTOLOGFONTSTRUCT,
     CF_SCREENFONTS, CHOOSECOLORW, CHOOSEFONTW,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
-use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, SendMessageW};
 
 use crate::win;
 use crate::wnd::editor::{
@@ -1184,6 +1185,8 @@ fn insert_flat_picture(editor: HWND, png: &[u8], height_twips: i64, label: &str)
     }
     editor::set_selection(editor, from + 1, from + 1);
     editor::replace_selection(editor, "\r", true);
+    // Do not inherit a centre/right alignment from the separator paragraph.
+    align_paragraph(editor, PFA_LEFT);
 }
 
 /// Insert > Separator (Ctrl+Shift+-).
@@ -1205,9 +1208,29 @@ pub fn separator_from_marker(editor: HWND) -> bool {
     let end = editor::paragraph_end(editor, from);
     let text = editor::text_range(editor, start, end);
     let marker = text.trim();
+    let dash_count = marker.chars().filter(|ch| *ch == '-').count();
+    // A line of dashes only: `---` is a separator, `----` (or longer) a page
+    // break. This also covers the case where the title of a titled separator
+    // was deleted, e.g. `------` or `---  ---`.
+    if !marker.is_empty()
+        && marker.chars().all(|ch| ch == '-' || ch.is_whitespace())
+        && marker.chars().any(|ch| ch == '-')
+    {
+        if from < start {
+            return false;
+        }
+        let page = dash_count >= 4;
+        editor::set_selection(editor, start, end);
+        editor::replace_selection(editor, "", true);
+        editor::set_selection(editor, start, start);
+        insert_plain_rule(editor, page);
+        return true;
+    }
     // Editable titled separators. Unlike picture separators, the title stays
     // ordinary Rich Edit text, so it can be recoloured, highlighted, aligned,
-    // or deleted without needing to decode an embedded image.
+    // or deleted without needing to decode an embedded image. The line is made
+    // from box-drawing glyphs, which sit at the vertical centre of the text:
+    // `────────  Judul  ────────` and `════════  Judul  ════════`.
     for dash_count in [4usize, 3usize] {
         let prefix = "-".repeat(dash_count);
         if marker.len() >= dash_count * 2
@@ -1215,25 +1238,21 @@ pub fn separator_from_marker(editor: HWND) -> bool {
             && marker.ends_with(&prefix)
         {
             let title = marker[dash_count..marker.len() - dash_count].trim();
-            if !title.is_empty() {
+            return if title.is_empty() {
                 editor::set_selection(editor, start, end);
-                editor::replace_selection(editor, marker, true);
-                editor::set_selection(editor, start, end);
-                align(editor, PFA_CENTER);
-                return true;
-            }
+                editor::replace_selection(editor, "", true);
+                editor::set_selection(editor, start, start);
+                insert_plain_rule(editor, dash_count == 4);
+                true
+            } else {
+                insert_titled_rule(editor, title, dash_count == 4, PFA_CENTER, 100)
+            };
         }
     }
-    // `---` is a separator, `----` (or longer) a page break.
-    let page = marker.len() >= 4 && marker.chars().all(|ch| ch == '-');
-    if (marker != "---" && !page) || from < start {
-        return false;
-    }
-    // Remove the marker first, then insert at a collapsed caret: replacing a
-    // multi-character selection with the field makes Rich Edit move it.
-    editor::set_selection(editor, start, end);
-    editor::replace_selection(editor, "", true);
-    editor::set_selection(editor, start, start);
+    false
+}
+
+fn insert_plain_rule(editor: HWND, page: bool) {
     if page {
         let band = crate::wnd::theme::page_band_rgb();
         insert_flat_picture(
@@ -1245,7 +1264,6 @@ pub fn separator_from_marker(editor: HWND) -> bool {
     } else {
         insert_separator_impl(editor);
     }
-    true
 }
 
 /// Toggles a list of `kind` (toolbar, Format menu): off when the caret item
@@ -1568,6 +1586,222 @@ pub fn editor_dpi(editor: HWND) -> i32 {
     } else {
         dpi
     }
+}
+
+const WM_GETFONT: u32 = 0x0031;
+
+/// Width of `text` in twips with the editor's current body font. Used to fill
+/// a titled separator exactly to the page width instead of guessing a dash
+/// count (which changed with the font, the DPI and the zoom).
+fn text_width_twips(editor: HWND, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    // SAFETY: the DC and the selected font are released before returning; the
+    // text buffer outlives the call.
+    unsafe {
+        let dc = GetDC(editor);
+        if dc.is_null() {
+            return (wide.len() as i32) * body_size() / 2;
+        }
+        let font = SendMessageW(editor, WM_GETFONT, 0, 0) as HFONT;
+        let previous = if !font.is_null() {
+            SelectObject(dc, font)
+        } else {
+            std::ptr::null_mut()
+        };
+        let mut size: SIZE = std::mem::zeroed();
+        GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut size);
+        if !previous.is_null() {
+            SelectObject(dc, previous);
+        }
+        ReleaseDC(editor, dc);
+        win::mul_div(size.cx, 1440, editor_dpi(editor))
+    }
+}
+
+/// The single-line glyph used by a titled separator (`═` for a page break) and
+/// the matching plain separator when its title is deleted.
+fn rule_glyph(page: bool) -> char {
+    if page {
+        '═'
+    } else {
+        '─'
+    }
+}
+
+/// Builds `── title ──` (or a left/right-aligned version) to `percent` of the
+/// editor width. The box-drawing glyph sits at the vertical centre of the
+/// line, unlike a paragraph border, so the text really is inside the rule.
+pub fn titled_rule_text(editor: HWND, title: &str, page: bool, align: u16, percent: i32) -> String {
+    let glyph = rule_glyph(page);
+    let total = full_width_twips(editor);
+    let target = (total * percent.clamp(25, 100) / 100).max(1500);
+    // Rich Edit substitutes a fallback face for the box-drawing glyphs and it
+    // is about 1.8x wider than the same character measured from the body font.
+    // Measuring it directly avoids overflowing the right margin (the run of
+    // glyphs is one unbreakable word, so Rich Edit would simply clip it).
+    let glyph_width = (text_width_twips(editor, &glyph.to_string()).max(40) * 9) / 5;
+    let title = title.trim();
+    if title.is_empty() {
+        let count = (target / glyph_width).max(1) as usize;
+        return glyph.to_string().repeat(count);
+    }
+    let title_width = text_width_twips(editor, title);
+    let space_width = text_width_twips(editor, " ").max(20);
+    let gap = if align == PFA_CENTER {
+        space_width * 2
+    } else {
+        space_width
+    };
+    let remaining = (target - title_width - gap).max(glyph_width * 2);
+    let (left, right) = match align {
+        PFA_LEFT => (0, (remaining / glyph_width).max(1)),
+        PFA_RIGHT => ((remaining / glyph_width).max(1), 0),
+        _ => {
+            let half = (remaining / 2 / glyph_width).max(1);
+            (half, half)
+        }
+    };
+    let left_dashes = glyph.to_string().repeat(left as usize);
+    let right_dashes = glyph.to_string().repeat(right as usize);
+    match align {
+        PFA_LEFT => format!("{title} {right_dashes}"),
+        PFA_RIGHT => format!("{left_dashes} {title}"),
+        _ => format!("{left_dashes} {title} {right_dashes}"),
+    }
+}
+
+/// Body character format for generated text: automatic colour, body face and
+/// size. The separator then follows light, dark and high-contrast themes and
+/// can still be recoloured or highlighted like any other text.
+fn body_format() -> CharFormat2W {
+    let mut format = CharFormat2W {
+        dw_mask: CFM_FACE | CFM_SIZE | CFM_COLOR,
+        dw_effects: CFE_AUTOCOLOR,
+        y_height: body_size(),
+        ..CharFormat2W::default()
+    };
+    face(&mut format, &body_font());
+    format
+}
+
+/// Replaces `start..end` with a titled separator and leaves the caret in the
+/// paragraph after it. With no title the result is a plain rule (the visual
+/// equivalent of `---` / `----`), so deleting the title really turns it back
+/// into an ordinary separator.
+pub fn insert_titled_rule(editor: HWND, title: &str, page: bool, align: u16, percent: i32) -> bool {
+    let line = titled_rule_text(editor, title, page, align, percent);
+    if line.is_empty() {
+        return false;
+    }
+    let (from, to) = editor::selection(editor);
+    let start = if from != to {
+        from
+    } else {
+        editor::paragraph_start(editor, from)
+    };
+    let end = if from != to {
+        to
+    } else {
+        editor::paragraph_end(editor, from)
+    };
+    plain_paragraph(editor);
+    editor::set_selection(editor, start, end);
+    editor::replace_selection(editor, &line, true);
+    let line_end = start + line.encode_utf16().count() as i32;
+    editor::set_selection(editor, start, line_end);
+    editor::set_selection_format(editor, &body_format());
+    align_paragraph(editor, align);
+    editor::set_selection(editor, line_end, line_end);
+    editor::replace_selection(editor, "\r", true);
+    editor::set_selection(editor, line_end + 1, line_end + 1);
+    // The new paragraph must not inherit the line's alignment (typing after a
+    // centred separator used to stay centred).
+    align_paragraph(editor, PFA_LEFT);
+    editor::set_selection(editor, line_end + 1, line_end + 1);
+    true
+}
+
+/// Reads a titled separator at the caret: (title, page, alignment, length %).
+/// Used by the Insert > Titled Separator dialog to edit an existing line.
+pub fn titled_rule_parts(editor: HWND) -> Option<(String, bool, u16, i32)> {
+    let (from, _) = editor::selection(editor);
+    let start = editor::paragraph_start(editor, from);
+    let end = editor::paragraph_end(editor, from);
+    let text = editor::text_range(editor, start, end);
+    let page = text.contains('═');
+    let glyph = if page {
+        '═'
+    } else if text.contains('─') {
+        '─'
+    } else {
+        return None;
+    };
+    let left = text.chars().take_while(|ch| *ch == glyph).count();
+    let right = text.chars().rev().take_while(|ch| *ch == glyph).count();
+    let title = text
+        .trim_matches(|ch: char| ch == glyph || ch == ' ')
+        .trim()
+        .to_owned();
+    let align = if left > 0 && right > 0 {
+        PFA_CENTER
+    } else if left > 0 {
+        PFA_RIGHT
+    } else {
+        PFA_LEFT
+    };
+    let glyph_width = (text_width_twips(editor, &glyph.to_string()).max(40) * 9) / 5;
+    let percent =
+        ((left + right) as i32 * glyph_width * 100 / full_width_twips(editor)).clamp(25, 100);
+    Some((title, page, align, percent))
+}
+
+fn align_paragraph(editor: HWND, alignment: u16) {
+    let (from, to) = editor::selection(editor);
+    let start = editor::paragraph_start(editor, from);
+    let end = editor::paragraph_end(editor, to);
+    editor::set_selection(editor, start, end);
+    editor::set_para_format(
+        editor,
+        &ParaFormat2 {
+            dw_mask: PFM_ALIGNMENT,
+            w_alignment: alignment,
+            ..ParaFormat2::default()
+        },
+    );
+    editor::set_selection(editor, from, to);
+}
+
+/// Enter on a paragraph made only of separator glyphs (`───` or `═══`, after
+/// its title was deleted) turns it into the real picture separator/page break.
+pub fn rule_from_line(editor: HWND) -> bool {
+    let (from, _) = editor::selection(editor);
+    let start = editor::paragraph_start(editor, from);
+    let end = editor::paragraph_end(editor, from);
+    let text = editor::text_range(editor, start, end);
+    let trimmed: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let page = trimmed.chars().count() >= 2 && trimmed.chars().all(|ch| ch == '═');
+    let rule = trimmed.chars().count() >= 2 && trimmed.chars().all(|ch| ch == '─');
+    if !page && !rule {
+        return false;
+    }
+    editor::set_selection(editor, start, end);
+    editor::replace_selection(editor, "", true);
+    editor::set_selection(editor, start, start);
+    if page {
+        let band = crate::wnd::theme::page_band_rgb();
+        insert_flat_picture(
+            editor,
+            &nodi_core::image::page_break_png_coloured(band),
+            600,
+            "page break",
+        );
+    } else {
+        insert_separator_impl(editor);
+    }
+    true
 }
 
 /// Every paragraph of the document gets [`TAB_STOP_TWIPS`] tab stops, so a tab

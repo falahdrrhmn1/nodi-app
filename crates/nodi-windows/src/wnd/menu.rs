@@ -170,6 +170,7 @@ pub const IDM_INSERT_FORMULA: u16 = 206;
 pub const IDM_INSERT_SEPARATOR: u16 = 207;
 pub const IDM_INSERT_OUTPUT_BLOCK: u16 = 208;
 pub const IDM_INSERT_PAGE_BREAK: u16 = 209;
+pub const IDM_INSERT_TITLED_SEPARATOR: u16 = 236;
 // Batch 6.
 pub const IDM_FORMAT_CHECKLIST: u16 = 226;
 pub const IDM_FORMAT_RESTART_NUM: u16 = 227;
@@ -449,6 +450,7 @@ pub fn create_menu() -> HMENU {
             Item::Cmd(IDM_INSERT_FORMULA, "&Formula...\tAlt+="),
             Item::Cmd(IDM_INSERT_SEPARATOR, "&Separator\tCtrl+Shift+-"),
             Item::Cmd(IDM_INSERT_PAGE_BREAK, "&Page Break (new page)\tCtrl+Enter"),
+            Item::Cmd(IDM_INSERT_TITLED_SEPARATOR, "Titled Se&parator..."),
             Item::Sep,
             Item::Cmd(IDM_INSERT_DATETIME, "&Date and Time\tF5"),
         ]);
@@ -999,6 +1001,60 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_INSERT_FORMULA => app::insert_formula(app),
         IDM_INSERT_SEPARATOR => with_editor(app, format::insert_separator),
         IDM_INSERT_PAGE_BREAK => with_editor(app, format::insert_page_break),
+        IDM_INSERT_TITLED_SEPARATOR => {
+            let owner = app.hwnd;
+            with_editor(app, |editor| {
+                let (from, to) = editor::selection(editor);
+                let selected = if from != to {
+                    editor::text_range(editor, from, to)
+                } else {
+                    String::new()
+                };
+                let current = format::titled_rule_parts(editor);
+                let (title, page, align, percent) = match current {
+                    Some((title, page, align, percent)) if selected.trim().is_empty() => {
+                        (title, page, align, percent)
+                    }
+                    _ => (selected, false, format::PFA_CENTER, 100),
+                };
+                let alignment = match align {
+                    format::PFA_LEFT => "left",
+                    format::PFA_RIGHT => "right",
+                    _ => "center",
+                };
+                let form = crate::wnd::form::Form::new("Titled Separator")
+                    .note(
+                        "The title is ordinary text inside the rule: it can be edited, \
+                         recoloured or highlighted afterwards. Delete it to turn the line \
+                         back into a plain separator (Enter then makes it a picture rule).",
+                    )
+                    .field(crate::wnd::form::Field::new("Title:", title))
+                    .field(crate::wnd::form::Field::new(
+                        "Alignment (left/center/right):",
+                        alignment,
+                    ))
+                    .field(crate::wnd::form::Field::new(
+                        "Line length (% of the width):",
+                        percent.to_string(),
+                    ))
+                    .checkbox("Page break (double line)", page);
+                let Some(values) = form.show(owner) else {
+                    return;
+                };
+                let align = match values[1].trim().to_ascii_lowercase().as_str() {
+                    "left" => format::PFA_LEFT,
+                    "right" => format::PFA_RIGHT,
+                    _ => format::PFA_CENTER,
+                };
+                let percent = values[2]
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap_or(100)
+                    .clamp(25, 100);
+                let page = values.get(3).is_some_and(|value| value == "1");
+                format::insert_titled_rule(editor, values[0].trim(), page, align, percent);
+            });
+        }
         IDM_INSERT_DATETIME => with_editor(app, |editor| {
             editor::replace_selection(editor, &app::local_date_time(), true);
         }),

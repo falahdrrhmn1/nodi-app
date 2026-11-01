@@ -92,6 +92,13 @@ enum Block {
     Table(Vec<Vec<Vec<Run>>>),
     Rule,
     PageBreak,
+    /// `--- Judul ---` / `---- Judul ----`: a horizontal rule with editable
+    /// text in the middle. Stored as box-drawing text in the editor; `page`
+    /// uses the double glyph so it can be turned into a page break.
+    TitledRule {
+        title: String,
+        page: bool,
+    },
 }
 
 /// Converts Markdown to an RTF document. `width_twips` is the editor's text
@@ -369,6 +376,11 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
             index += 1;
             continue;
         }
+        if let Some((title, page)) = titled_rule(trimmed) {
+            blocks.push(Block::TitledRule { title, page });
+            index += 1;
+            continue;
+        }
         if is_table_row(line) && index + 1 < lines.len() && is_table_delimiter(lines[index + 1]) {
             let mut rows: Vec<Vec<Vec<Run>>> = Vec::new();
             rows.push(table_cells(line));
@@ -518,6 +530,23 @@ fn is_rule(line: &str) -> bool {
         return false;
     }
     compact.chars().all(|ch| ch == first)
+}
+
+/// `--- Judul ---` (separator) and `---- Judul ----` (page-break styled).
+fn titled_rule(line: &str) -> Option<(String, bool)> {
+    let trimmed = line.trim();
+    for (dashes, page) in [("----", true), ("---", false)] {
+        if trimmed.len() <= dashes.len() * 2 {
+            continue;
+        }
+        if trimmed.starts_with(dashes) && trimmed.ends_with(dashes) {
+            let title = trimmed[dashes.len()..trimmed.len() - dashes.len()].trim();
+            if !title.is_empty() {
+                return Some((title.to_owned(), page));
+            }
+        }
+    }
+    None
 }
 
 /// `- text`, `* text`, `+ text`, `1. text`, `1) text` with its nesting level.
@@ -890,7 +919,28 @@ fn push_block(out: &mut String, block: &Block, width: i32) {
         Block::Table(rows) => push_table(out, rows, width),
         Block::Rule => push_rule(out, width),
         Block::PageBreak => push_page_break(out, width),
+        Block::TitledRule { title, page } => push_titled_rule(out, title, *page, width),
     }
+}
+
+/// Pasted `--- Judul ---` becomes the same box-drawing line the editor
+/// generates, so the title stays editable. The glyph count is an estimate:
+/// the Windows side remeasures when the text is inserted, and exact width is
+/// not important for a pasted rule.
+fn push_titled_rule(out: &mut String, title: &str, page: bool, width: i32) {
+    let body = body_size();
+    let glyph = if page { '\u{2550}' } else { '\u{2500}' };
+    let glyph_width = (body * 11 / 10).max(40);
+    let title_width = (title.chars().count() as i32) * body / 2;
+    let remaining = (width - title_width - body).max(glyph_width * 2);
+    let each = (remaining / 2 / glyph_width).max(1);
+    out.push_str(&format!("\\pard\\sa0\\sb0\\f0\\fs{body}\\cf0 "));
+    escape(out, &glyph.to_string().repeat(each as usize));
+    out.push(' ');
+    escape(out, title);
+    out.push(' ');
+    escape(out, &glyph.to_string().repeat(each as usize));
+    out.push_str("\\par\n");
 }
 
 fn push_runs(out: &mut String, runs: &[Run], bold: bool, base_size: i32) {

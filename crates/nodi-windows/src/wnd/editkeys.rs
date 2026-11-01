@@ -624,6 +624,11 @@ pub fn newline_keep_indent(editor: HWND) -> bool {
     if format::separator_from_marker(editor) {
         return true;
     }
+    // A titled separator whose title was deleted is now only `───`/`═══`;
+    // Enter turns it into the plain rule or page break.
+    if format::rule_from_line(editor) {
+        return true;
+    }
     if format::list_kind(editor).is_some() {
         if format::end_list(editor) {
             return true;
