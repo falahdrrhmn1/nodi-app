@@ -1709,6 +1709,8 @@ fn insert_code(editor: HWND, language: &str, output: bool) {
     let width = full_width_twips(editor);
     let rtf = code_block_rtf(language, &code, width, output);
     if editor::insert_rtf(editor, rtf.as_bytes()) {
+        let (background, border) = crate::wnd::theme::table_colours();
+        crate::wnd::table::retheme(editor, background, border);
         if let Some(start) = code_start_after(&editor::raw_text(editor), at.max(0) as usize) {
             let caret = start as i32 + code.trim_end_matches('\r').encode_utf16().count() as i32;
             editor::set_selection(editor, caret, caret);
@@ -1743,20 +1745,27 @@ fn code_colours() -> String {
 }
 
 /// RTF for a code block: header row (label + `nodi-copy:` link) and code row.
+///
+/// The header is two cells (label, Copy) rather than one cell with a tab stop:
+/// a tab stop beyond the editor width pushed Copy off-screen as soon as the
+/// note was wrapped or the window was narrower than at insertion time. The
+/// code text uses the automatic colour so it follows light, dark and
+/// high-contrast themes; only the block backgrounds are explicit and the table
+/// pass in `table::retheme` keeps them in step with the theme. A final
+/// paragraph closes the block, otherwise a table inserted right below it would
+/// be merged into the same table by Rich Edit.
 fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> String {
-    let (code_back, _border, header_back, label_colour, link_colour, text_colour) = if output {
-        (6, 7, 8, 9, 11, "\\cf10")
-    } else {
-        // #1F1F1F: readable on the light grey code cell and clearly darker
-        // than the grey label.
-        (1, 2, 3, 4, 5, "\\cf12")
-    };
+    // Both code and output blocks follow the theme: the body, label and Copy
+    // link use the automatic colour so they stay readable on light, dark and
+    // high-contrast palettes. Only the block backgrounds are explicit; the
+    // table retheme pass keeps them in step with the theme.
+    let (code_back, header_back, text_colour) = (1, 3, "\\cf0");
     let label = match language.trim() {
         "" if output => "output",
         "" => "code",
         other => other,
     };
-    let edge = if output { 7 } else { 2 };
+    let edge = 2;
     let border = format!("\\brdrs\\brdrw10\\brdrcf{edge}");
     let mut rtf = String::from("{\\rtf1\\ansi\\uc1\\deff0");
     rtf.push_str(&format!(
@@ -1765,22 +1774,29 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
     ));
     rtf.push_str(&code_colours());
 
-    // Header row: label on the left, Copy at the right tab stop.
+    // Header row: two cells so Copy is always inside the block. The label cell
+    // gets a third of the width (capped), Copy the rest, right aligned.
+    let copy_cell = 1400.min((width / 2).max(600));
+    let label_cell = (width - copy_cell).max(600);
     rtf.push_str("\\trowd\\trgaph108\\trleft0");
+    rtf.push_str(&format!(
+        "\\clcbpat{header_back}\\clbrdrt{border}\\clbrdrl{border}\
+         \\clbrdrb{border}\\clbrdrr{border}\\cellx{label_cell}"
+    ));
     rtf.push_str(&format!(
         "\\clcbpat{header_back}\\clbrdrt{border}\\clbrdrl{border}\
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}"
     ));
-    rtf.push_str(&format!(
-        "\\pard\\intbl\\tqr\\tx{}\\f1\\fs16{{\\cf{label_colour} ",
-        (width - 200).max(0)
-    ));
+    rtf.push_str("\\pard\\intbl\\f0\\fs16");
+    rtf.push_str("{\\cf0 ");
     rtf.push_str(&rtf_escape(label));
-    rtf.push_str("}\\cf0\\tab{\\field{\\*\\fldinst{HYPERLINK \"");
+    rtf.push_str("}\\cell");
+    rtf.push_str("\\pard\\intbl\\qr\\f0\\fs16");
+    rtf.push_str("{\\cf0");
+    rtf.push_str("{\\field{\\*\\fldinst{HYPERLINK \"");
     rtf.push_str(&nodi_core::links::format_copy_link());
-    rtf.push_str("\"}}{\\fldrslt{\\ul\\cf");
-    rtf.push_str(&link_colour.to_string());
-    rtf.push_str(" Copy}}}\\cell\\row");
+    rtf.push_str("\"}}{\\fldrslt{\\ul Copy}}}}");
+    rtf.push_str("\\cell\\row");
 
     // Code row.
     rtf.push_str("\\trowd\\trgaph108\\trleft0");
@@ -1793,7 +1809,9 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
         code_tab_stops_rtf()
     ));
     rtf.push_str(&rtf_escape(code.trim_end_matches('\r')));
-    rtf.push_str("\\cell\\row}");
+    rtf.push_str("\\cell\\row");
+    // Keep whatever follows the code block out of its table.
+    rtf.push_str(&format!("\\pard\\f0\\fs{}\\cf0\\par}}", body_size()));
     rtf
 }
 

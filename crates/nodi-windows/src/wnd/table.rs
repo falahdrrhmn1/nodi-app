@@ -103,6 +103,18 @@ pub fn insert(
 ) -> Result<(), String> {
     let rows = rows.clamp(1, 255);
     let cols = cols.clamp(1, MAX_CELLS);
+    // Inserting from inside a code block would nest the table in the code
+    // cell and make the two impossible to separate again. Put the caret just
+    // below the code block first, into its own paragraph: without that empty
+    // paragraph Rich Edit runs the two tables together into one, so a table
+    // inserted under a code block could never be told apart from it again.
+    if crate::wnd::format::in_code(editor) {
+        if let Ok(here) = here(editor) {
+            let after = here.row.end + 2;
+            editor::set_selection(editor, after, after);
+            editor::replace_selection(editor, "\r", true);
+        }
+    }
     let at = crate::wnd::format::prepare_block(editor);
     // The caret may inherit an explicit colour (e.g. the grey label of a pasted
     // code block). New cells must use the automatic text colour instead.
@@ -126,22 +138,84 @@ pub fn insert(
     Ok(())
 }
 
+fn channel(colour: u32, shift: u32) -> u8 {
+    ((colour >> shift) & 0xFF) as u8
+}
+
+fn brighten(colour: u32, amount: u8) -> u32 {
+    let channel = |shift: u32| channel(colour, shift).saturating_add(amount) as u32;
+    channel(0) | channel(8) << 8 | channel(16) << 16
+}
+
+fn dark_background(colour: u32) -> bool {
+    let sum = u32::from(channel(colour, 0))
+        + u32::from(channel(colour, 8))
+        + u32::from(channel(colour, 16));
+    sum < 3 * 120
+}
+
+fn has_copy_link(units: &[u16], row: Row) -> bool {
+    let start = row.start.max(0) as usize;
+    let end = (row.end.max(0) as usize).min(units.len().saturating_sub(1));
+    if start > end {
+        return false;
+    }
+    let needle: Vec<u16> = "nodi-copy:".encode_utf16().collect();
+    units[start..=end]
+        .windows(needle.len())
+        .any(|window| window == needle.as_slice())
+}
+
 /// Repaints the cells and borders of every table in `editor` for the current
 /// theme. Rich Edit stores table shading in the row parameters, so existing
 /// notes need this pass after a theme switch as well as after loading.
+///
+/// Code blocks are two adjacent rows whose header carries the `nodi-copy:`
+/// link. They get their own, slightly different shades so a code block is
+/// recognisable as code instead of looking like an ordinary table (and so a
+/// table inserted directly below it cannot visually merge with it).
 pub fn retheme(editor: HWND, background: u32, border: u32) {
     let units = document(editor);
     let all_rows = rows(&units);
+    let dark = dark_background(background);
+    let code_border = if dark {
+        brighten(background, 26)
+    } else {
+        0x00D0_D7DE
+    };
+    let code_header = if dark {
+        brighten(background, 10)
+    } else {
+        0x00EB_EEF1
+    };
+    let code_body = if dark {
+        brighten(background, 3)
+    } else {
+        0x00F6_F8FA
+    };
+    let saved = editor::selection(editor);
+    // Only the row immediately after a code header is its body row.
+    let mut code_after: Option<(i32, usize)> = None;
     for row in all_rows {
+        let header = has_copy_link(&units, row);
+        let body =
+            code_after.is_some_and(|(end, depth)| row.depth == depth && row.start == end + 2);
+        let (fill, edge) = if header {
+            (code_header, code_border)
+        } else if body {
+            (code_body, code_border)
+        } else {
+            (background, border)
+        };
         let Some((mut params, mut cells)) = get_params(editor, row) else {
             continue;
         };
         for cell in &mut cells {
-            cell.cr_back_pat = background;
-            cell.cr_brdr_left = border;
-            cell.cr_brdr_top = border;
-            cell.cr_brdr_right = border;
-            cell.cr_brdr_bottom = border;
+            cell.cr_back_pat = fill;
+            cell.cr_brdr_left = edge;
+            cell.cr_brdr_top = edge;
+            cell.cr_brdr_right = edge;
+            cell.cr_brdr_bottom = edge;
         }
         params.cb_row = size_of::<RowParms>() as u8;
         params.cb_cell = size_of::<CellParms>() as u8;
@@ -158,7 +232,20 @@ pub fn retheme(editor: HWND, background: u32, border: u32) {
                 cells.as_ptr() as isize,
             );
         }
+        if header || body {
+            // Older code blocks (and blocks imported from Markdown) stored a
+            // fixed dark text colour. Repaint their text as automatic so it is
+            // readable whatever the background becomes.
+            editor::set_selection(editor, row.start + 1, row.end);
+            crate::wnd::format::set_text_color(editor, None);
+        }
+        code_after = if header {
+            Some((row.end, row.depth))
+        } else {
+            None
+        };
     }
+    editor::set_selection(editor, saved.0, saved.1);
 }
 
 fn hresult(value: isize, what: &str) -> Result<(), String> {

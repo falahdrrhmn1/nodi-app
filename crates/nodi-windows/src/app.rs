@@ -367,6 +367,7 @@ impl App {
         }
         self.palette = theme::Palette::from_settings(&self.settings);
         self.palette.install_display_colours();
+        theme::set_table_colours(self.palette.table_bg(), self.palette.table_border());
 
         // Writer thread: results are posted back as boxed `SaveResult`s. The
         // window handle travels as `isize` so the closure stays `Send`.

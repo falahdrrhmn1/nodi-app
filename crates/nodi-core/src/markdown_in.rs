@@ -957,22 +957,24 @@ fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
         other => other,
     };
     let border = "\\brdrs\\brdrw10\\brdrcf2";
-    // Header row: language label on the left, Copy link at the right. The
-    // colour is scoped to the label group so it cannot leak into the code row
-    // or into whatever follows the block (that used to turn table cells grey).
+    // Header row: two cells (label, Copy) so Copy stays inside the block at any
+    // window width or wrap state. Text is automatic so it follows the theme;
+    // the cell colours are retinted by `table::retheme` after insertion.
+    let copy_cell = 1400.min((width / 2).max(600));
+    let label_cell = (width - copy_cell).max(600);
     out.push_str(&format!(
         "\\trowd\\trgaph108\\trleft0\\clcbpat3\\clbrdrt{border}\\clbrdrl{border}\
+         \\clbrdrb{border}\\clbrdrr{border}\\cellx{label_cell}\
+         \\clcbpat3\\clbrdrt{border}\\clbrdrl{border}\
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}\
-         \\pard\\intbl\\tqr\\tx{}\\f1\\fs16{{\\cf4 ",
-        (width - 200).max(0)
+         \\pard\\intbl\\f0\\fs16{{\\cf0 "
     ));
     escape(out, label);
-    out.push_str("}\\cf0\\tab{\\field{\\*\\fldinst{HYPERLINK \"");
+    out.push_str("}\\cell\\pard\\intbl\\qr\\f0\\fs16{\\cf0{\\field{\\*\\fldinst{HYPERLINK \"");
     out.push_str(&links::format_copy_link());
-    out.push_str("\"}}{\\fldrslt{\\ul\\cf5 Copy}}}\\cell\\row");
+    out.push_str("\"}}{\\fldrslt{\\ul Copy}}}}\\cell\\row");
 
-    // Code row: an explicit dark colour (light theme) so it never inherits the
-    // grey label colour from the row above.
+    // Code row: automatic text colour so it never becomes dark-on-dark.
     let body = code.trim_end_matches(['\r', '\n']);
     let mut cell = String::new();
     for (index, line) in body.split('\n').enumerate() {
@@ -988,7 +990,7 @@ fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
     out.push_str(&format!(
         "\\trowd\\trgaph108\\trleft0\\clcbpat1\\clbrdrt{border}\\clbrdrl{border}\
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{width}\
-         \\pard\\intbl\\f1\\fs20\\cf12{tabs} {cell}\\cell\\row\n\
+         \\pard\\intbl\\f1\\fs20\\cf0{tabs} {cell}\\cell\\row\n\
          \\pard\\f0\\fs{body_size}\\cf0\\par\n"
     ));
 }

@@ -83,6 +83,20 @@ fn rgb_tuple(colour: u32) -> (u8, u8, u8) {
 thread_local! {
     /// Line-number background of the active theme, used for new page gaps.
     static PAGE_BAND: Cell<u32> = const { Cell::new(0x0052_5252) };
+    /// Table colours of the active theme, used by new tables and code blocks
+    /// (they are inserted outside `App`'s borrow in a few places).
+    static TABLE_COLOURS: Cell<(u32, u32)> =
+        const { Cell::new((0x00FF_FFFF, 0x00A0_A0A0)) };
+}
+
+/// Remembers the table colours for blocks inserted from now on.
+pub fn set_table_colours(background: u32, border: u32) {
+    TABLE_COLOURS.with(|cell| cell.set((background, border)));
+}
+
+/// Table background and border of the active theme.
+pub fn table_colours() -> (u32, u32) {
+    TABLE_COLOURS.with(Cell::get)
 }
 
 /// Remembers the line-number colour for page breaks inserted from now on.
@@ -528,6 +542,7 @@ pub fn apply(app: &mut App) {
     new.install_display_colours();
     app.palette = new;
     set_page_band(new.gutter_bg);
+    set_table_colours(new.table_bg(), new.table_border());
 
     let spec = active_spec(&app.settings);
     let font = (spec.ui_font.clone(), spec.ui_size);

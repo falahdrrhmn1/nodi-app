@@ -714,6 +714,10 @@ impl Writer {
             .iter()
             .flat_map(|paragraph| paragraph.inlines.iter())
             .filter_map(|inline| match inline {
+                // The Copy link lives in the same cell (one-cell headers) or
+                // in the second header cell (two-cell headers); it is not part
+                // of the language label.
+                Inline::Text(_, _, Some(target)) if crate::links::is_copy_link(target) => None,
                 Inline::Text(text, _, _) => Some(text.as_str()),
                 Inline::Picture(_) | Inline::Math(_) | Inline::Rule(_) => None,
             })
@@ -799,10 +803,11 @@ impl Writer {
     }
 
     fn table(&mut self, rows: &[Vec<Vec<Paragraph>>]) -> String {
-        // A one-cell table whose text is all code: a code block. Newer blocks
-        // have a header row holding the language label and a Copy link.
-        let single_column = rows.iter().all(|row| row.len() == 1);
-        if (1..=2).contains(&rows.len()) && single_column {
+        // A code block is one or two rows: a header with the language label
+        // and Copy link (one or two cells) above a single code cell.
+        let body_is_single_cell = rows.last().is_some_and(|row| row.len() == 1);
+        let header_fits = rows.len() == 1 || rows[0].len() <= 2;
+        if (1..=2).contains(&rows.len()) && body_is_single_cell && header_fits {
             let cell = &rows[rows.len() - 1][0];
             let all_code = cell.iter().all(|paragraph| {
                 paragraph.inlines.iter().all(|inline| match inline {
