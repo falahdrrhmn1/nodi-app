@@ -487,6 +487,89 @@ fn run(app: &mut App, line: &str) -> String {
             }
             u8::from(app.settings.markdown_mirror).to_string()
         }
+        ("autocomplete", _) => {
+            match rest.trim() {
+                "on" => app.settings.autocomplete = true,
+                "off" => app.settings.autocomplete = false,
+                _ => {}
+            }
+            crate::wnd::editkeys::set_autocomplete(app.settings.autocomplete);
+            u8::from(app.settings.autocomplete).to_string()
+        }
+        ("autocomplete-items", _) => crate::wnd::autocomplete::items().join("|"),
+        ("autocomplete-visible", _) => u8::from(crate::wnd::autocomplete::visible()).to_string(),
+        ("shortcuts", _) => app
+            .settings
+            .text_shortcuts
+            .iter()
+            .map(|shortcut| {
+                format!(
+                    "{}->{} [{}]",
+                    shortcut.trigger, shortcut.replacement, shortcut.scope
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
+        ("shortcut", _) => {
+            // shortcut add trigger|replacement|scope
+            let payload = rest.trim();
+            let Some(payload) = payload.strip_prefix("add ") else {
+                return "usage: shortcut add trigger|replacement|scope".to_owned();
+            };
+            let mut parts = payload.splitn(3, '|');
+            let trigger = parts.next().unwrap_or("").trim().to_owned();
+            let replacement = parts.next().unwrap_or("").to_owned();
+            let scope = parts.next().unwrap_or("page").trim().to_owned();
+            let note = app.tabs.first().map(|tab| tab.note.clone());
+            let folder = note
+                .as_ref()
+                .and_then(|id| app.tree.get(id))
+                .and_then(|node| node.parent.clone());
+            if trigger.is_empty() {
+                return "empty trigger".to_owned();
+            }
+            app.settings
+                .text_shortcuts
+                .push(nodi_core::storage::TextShortcut {
+                    trigger,
+                    replacement,
+                    scope: scope.clone(),
+                    note: (scope != "all").then(|| note.clone()).flatten(),
+                    folder: (scope == "folder").then(|| folder.clone()).flatten(),
+                });
+            app.save_settings();
+            "ok".to_owned()
+        }
+        ("titled", Some(window)) => {
+            // titled title|page|align|percent
+            let mut parts = rest.splitn(4, '|');
+            let title = parts.next().unwrap_or("");
+            let page = parts.next().unwrap_or("0") == "1";
+            let align = match parts.next().unwrap_or("center").trim() {
+                "left" => crate::wnd::format::PFA_LEFT,
+                "right" => crate::wnd::format::PFA_RIGHT,
+                _ => crate::wnd::format::PFA_CENTER,
+            };
+            let percent: i32 = parts.next().unwrap_or("100").trim().parse().unwrap_or(100);
+            u8::from(crate::wnd::format::insert_titled_rule(
+                window, title, page, align, percent,
+            ))
+            .to_string()
+        }
+        ("titledparts", Some(window)) => match crate::wnd::format::titled_rule_parts(window) {
+            Some((title, page, align, percent)) => {
+                let align = match align {
+                    crate::wnd::format::PFA_LEFT => "left",
+                    crate::wnd::format::PFA_RIGHT => "right",
+                    _ => "center",
+                };
+                format!("{title}|{}|{}|{}", u8::from(page), align, percent)
+            }
+            None => "none".to_owned(),
+        },
+        ("rulesep", Some(window)) => {
+            u8::from(crate::wnd::format::rule_from_line(window)).to_string()
+        }
         ("outline", Some(window)) => outline::headings(&editor::plain_text(window))
             .iter()
             .map(|entry| format!("{}|{}|{}", entry.level, entry.offset, entry.label.trim()))

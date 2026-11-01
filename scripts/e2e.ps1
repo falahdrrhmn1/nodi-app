@@ -2232,8 +2232,79 @@ Test-Case 'BS' 'mass content survives close / reopen: text, list, checklist, tab
     ''
 }
 
-# --------------------------------------------------------------------- report
+Test-Case 'BT' 'same-page autocomplete suggests, accepts with Tab and turns off' {
+    $data = New-DataDir 'BT'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'keys ConvNeXtV2-Tiny adalah model' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys Conv' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'autocomplete-visible') -eq '1') 'the suggestion list is not shown'
+    $items = Invoke-Nodi $nodi 'autocomplete-items'
+    Assert ($items -match 'ConvNeXtV2-Tiny') "suggestions: $items"
+    Invoke-Nodi $nodi 'tab' | Out-Null
+    $text = Invoke-Nodi $nodi 'text'
+    Assert (([regex]::Matches($text, 'ConvNeXtV2-Tiny')).Count -eq 2) "Tab did not accept the suggestion: $text"
+    Assert (-not $text.Contains("ConvNeXtV2-Tiny`t")) 'the accepted word also inserted a Tab'
+    Invoke-Nodi $nodi 'autocomplete off' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys Conv' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'autocomplete-visible') -eq '0') 'the list is shown while switched off'
+    Stop-Nodi $nodi
+    ''
+}
 
+Test-Case 'BU' 'text shortcuts expand on Enter, are scoped and persist' {
+    $data = New-DataDir 'BU'
+    $nodi = Start-Nodi $data
+    Assert ((Invoke-Nodi $nodi 'shortcut add cnv|ConvNeXtV2-Tiny|page') -eq 'ok') 'the shortcut was not added'
+    Assert ((Invoke-Nodi $nodi 'shortcuts') -match 'cnv->ConvNeXtV2-Tiny \[page\]') 'the shortcut was stored wrong'
+    Invoke-Nodi $nodi 'type cnv' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    $text = Invoke-Nodi $nodi 'text'
+    Assert ($text.Contains('ConvNeXtV2-Tiny')) "the shortcut did not expand: $text"
+    Stop-Nodi $nodi
+    $settings = Get-Content -Raw (Join-Path $data 'settings.json') | ConvertFrom-Json
+    Assert (@($settings.text_shortcuts).Count -eq 1) 'the shortcut was not saved'
+    Assert ($settings.text_shortcuts[0].scope -eq 'page') "scope lost: $($settings.text_shortcuts[0].scope)"
+    Assert ($settings.text_shortcuts[0].replacement -eq 'ConvNeXtV2-Tiny') 'replacement lost'
+    ''
+}
+
+Test-Case 'BV' 'titled separator: text line, markdown, bare rule becomes a picture' {
+    $data = New-DataDir 'BV'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'type Atas' | Out-Null
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'titled Bab 1|0|center|80') -eq '1') 'titled separator insert failed'
+    Invoke-Nodi $nodi 'type Bawah' | Out-Null
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Assert ($markdown -match '--- Bab 1 ---') "titled separator markdown: $markdown"
+    # A bare line of rule glyphs (what is left after the title is deleted)
+    # turns into the real picture separator on Enter.
+    Invoke-Nodi $nodi 'enter' | Out-Null
+    Invoke-Nodi $nodi 'keys ────' | Out-Null
+    Assert ((Invoke-Nodi $nodi 'rulesep') -eq '1') 'the bare rule was not converted'
+    Assert ((Invoke-Nodi $nodi 'pictures') -eq '1') 'the separator picture is missing'
+    Stop-Nodi $nodi
+    ''
+}
+
+Test-Case 'BW' 'a table below a code block stays a separate table' {
+    $data = New-DataDir 'BW'
+    $nodi = Start-Nodi $data
+    Invoke-Nodi $nodi 'cmd 205' | Out-Null                 # Insert > Code Block
+    Invoke-Nodi $nodi 'keys fn main() {}' | Out-Null
+    Invoke-Nodi $nodi 'table 2 2' | Out-Null
+    Assert ((Count-Unit $nodi 'FFF9') -eq 4) "rows: expected 4 (2 code + 2 table), got $(Count-Unit $nodi 'FFF9')"
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    $fence = [string]::new([char]96, 3)
+    Assert ($markdown.Contains("$fence`nfn main() {}`n$fence")) "the code block did not export as a fence:`n$markdown"
+    Assert ($markdown -match '\|  \|  \|\r?\n\| --- \| --- \|') "the table did not export separately:`n$markdown"
+    Stop-Nodi $nodi
+    ''
+}
+
+# --------------------------------------------------------------------- report
 $failed = 0
 foreach ($entry in $results.GetEnumerator()) {
     "{0,-60} {1}" -f $entry.Key, $entry.Value
