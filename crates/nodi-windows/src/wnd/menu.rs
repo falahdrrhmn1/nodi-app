@@ -1230,10 +1230,32 @@ pub(crate) fn with_editor(
     toolbar::sync_format(app);
 }
 
-/// Tools > Text Shortcuts: add or remove the scoped text expansions that
-/// `editkeys::expand_shortcut` uses on Enter. The form shows the existing
-/// shortcuts and edits one at a time (trigger + replacement + scope), which
-/// keeps the dialog simple while still covering create/update/delete.
+/// Names the notes/folders a scoped shortcut applies to, so the dialog can say
+/// where each one is used.
+fn shortcut_where(app: &App, shortcut: &TextShortcut) -> String {
+    let title = |id: &Option<nodi_core::id::NoteId>| {
+        id.as_ref()
+            .and_then(|id| app.tree.get(id))
+            .map(|node| node.title.clone())
+    };
+    match shortcut.scope.as_str() {
+        "all" => "all notes".to_owned(),
+        "folder" => match title(&shortcut.folder) {
+            Some(name) => format!("folder: {name}"),
+            None => "folder: (gone)".to_owned(),
+        },
+        _ => match title(&shortcut.note) {
+            Some(name) => format!("page: {name}"),
+            None => "page: (gone)".to_owned(),
+        },
+    }
+}
+
+/// Tools > Text Shortcuts: the scoped text expansions that
+/// `editkeys::expand_shortcut` uses on Enter. The form lists every shortcut
+/// with the notes it applies to (so an unused one can be picked out and
+/// deleted) and edits one at a time: trigger, replacement and a `Where`
+/// drop-down naming this page, this folder or every note.
 fn text_shortcuts(app: &mut App) {
     let owner = app.hwnd;
     let Some(editor) = app.active_editor() else {
@@ -1245,37 +1267,56 @@ fn text_shortcuts(app: &mut App) {
     };
     let note = app.tabs[index].note.clone();
     let folder = app.tree.get(&note).and_then(|node| node.parent.clone());
-    let listing = if app.settings.text_shortcuts.is_empty() {
-        "(no shortcuts yet)".to_owned()
-    } else {
-        app.settings
-            .text_shortcuts
-            .iter()
-            .enumerate()
-            .map(|(number, shortcut)| {
-                format!(
-                    "{}. {} -> {}  [{}]",
-                    number + 1,
-                    shortcut.trigger,
-                    shortcut.replacement,
-                    shortcut.scope
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let note_name = app
+        .tree
+        .get(&note)
+        .map(|node| node.title.clone())
+        .unwrap_or_else(|| "this note".to_owned());
+    let folder_name = folder
+        .as_ref()
+        .and_then(|id| app.tree.get(id))
+        .map(|node| node.title.clone())
+        .unwrap_or_else(|| "(no folder)".to_owned());
+
+    // The list of shortcuts already defined, each labelled with the notes it
+    // applies to so an unused one can be picked out and deleted.
+    let listing: Vec<String> = app
+        .settings
+        .text_shortcuts
+        .iter()
+        .map(|shortcut| {
+            format!(
+                "{}  ->  {}   [{}]",
+                shortcut.trigger,
+                shortcut.replacement,
+                shortcut_where(app, shortcut)
+            )
+        })
+        .collect();
+    let page_target = format!("This page: {note_name}");
+    let folder_target = format!("This folder: {folder_name}");
+    let all_target = "All notes".to_owned();
+    let targets = [
+        page_target.clone(),
+        folder_target.clone(),
+        all_target.clone(),
+    ];
+
     let form = crate::wnd::form::Form::new("Text Shortcuts")
         .wide(560)
-        .note(&format!(
+        .note(
             "Type a trigger (for example cnv) and its replacement, then Save. \
-             Delete removes the shortcut with that trigger and scope.\n\nExisting:\n{listing}"
+             Where decides which notes expand it. Delete removes the shortcut \
+             selected above, so one you no longer use can be cleared.",
+        )
+        .field(crate::wnd::form::Field::list(
+            "Existing shortcuts:",
+            &listing,
+            6,
         ))
         .field(crate::wnd::form::Field::new("Trigger:", ""))
         .field(crate::wnd::form::Field::new("Replacement:", ""))
-        .field(crate::wnd::form::Field::new(
-            "Scope (page/all/folder):",
-            "page",
-        ))
+        .field(crate::wnd::form::Field::dropdown("Where:", &targets, ""))
         .button(1, "Save")
         .button(2, "Delete")
         .button(0, "Cancel");
@@ -1283,47 +1324,52 @@ fn text_shortcuts(app: &mut App) {
     let Some(values) = values else {
         return;
     };
-    let trigger = values[0].trim().to_owned();
-    let replacement = values.get(1).cloned().unwrap_or_default();
-    let scope = match values.get(2).map(|value| value.trim().to_ascii_lowercase()) {
-        Some(value) if value == "all" => "all",
-        Some(value) if value == "folder" => "folder",
-        _ => "page",
-    }
-    .to_owned();
-    if trigger.is_empty() {
-        dialogs::error(owner, "The trigger cannot be empty.");
-        return;
-    }
+
+    let (scope, target) = if values.get(3) == Some(&all_target) {
+        ("all".to_owned(), (None, None))
+    } else if values.get(3) == Some(&folder_target) {
+        ("folder".to_owned(), (None, folder.clone()))
+    } else {
+        ("page".to_owned(), (Some(note.clone()), None))
+    };
+
     match choice {
         Some(1) => {
-            app.settings
-                .text_shortcuts
-                .retain(|shortcut| !shortcut.trigger.eq_ignore_ascii_case(&trigger));
+            let trigger = values
+                .get(1)
+                .map_or_else(String::new, |value| value.trim().to_owned());
+            if trigger.is_empty() {
+                dialogs::error(owner, "The trigger cannot be empty.");
+                return;
+            }
+            let replacement = values.get(2).cloned().unwrap_or_default();
+            // One entry per trigger and scope: saving again redefines it
+            // instead of piling up duplicates (other scopes are left alone).
+            app.settings.text_shortcuts.retain(|shortcut| {
+                !(shortcut.trigger.eq_ignore_ascii_case(&trigger) && shortcut.scope == scope)
+            });
             app.settings.text_shortcuts.push(TextShortcut {
                 trigger,
                 replacement,
                 scope: scope.clone(),
-                note: (scope != "all").then(|| note.clone()),
-                folder: if scope == "folder" {
-                    folder.clone()
-                } else {
-                    None
-                },
+                note: target.0,
+                folder: target.1,
             });
             app.save_settings();
             status::set_message(app, "Text shortcut saved");
         }
         Some(2) => {
-            let before = app.settings.text_shortcuts.len();
-            app.settings.text_shortcuts.retain(|shortcut| {
-                !(shortcut.trigger.eq_ignore_ascii_case(&trigger) && shortcut.scope == scope)
-            });
-            if app.settings.text_shortcuts.len() == before {
-                dialogs::error(owner, "No shortcut with that trigger and scope.");
-            } else {
-                app.save_settings();
-                status::set_message(app, "Text shortcut deleted");
+            let selected = values
+                .first()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|index| *index < app.settings.text_shortcuts.len());
+            match selected {
+                Some(index) => {
+                    app.settings.text_shortcuts.remove(index);
+                    app.save_settings();
+                    status::set_message(app, "Text shortcut deleted");
+                }
+                None => dialogs::error(owner, "Pick a shortcut in the list first."),
             }
         }
         _ => {}
