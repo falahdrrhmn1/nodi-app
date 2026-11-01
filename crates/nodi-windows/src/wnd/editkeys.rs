@@ -29,11 +29,11 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostMessageW, SendMessageW, WM_CHAR, WM_COMMAND, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PASTE,
-    WM_SETFOCUS, WM_SIZE, WM_VSCROLL,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PASTE, WM_SETFOCUS, WM_SIZE, WM_VSCROLL,
 };
 
-use crate::wnd::{editor, format, image, link};
+use crate::wnd::{autocomplete, editor, format, image, link};
 
 const SUBCLASS_ID: usize = 0x4E4F_4445; // 'NODE'
 
@@ -337,6 +337,12 @@ unsafe fn subclass_inner(
     match msg {
         WM_CHAR => {
             let ch = wparam as u32;
+            // Drop the character Windows translated from the Tab or Enter that
+            // the autocomplete list just accepted (so it does not also insert
+            // a tab or split the paragraph).
+            if autocomplete::take_swallow() && (ch == 0x09 || ch == 0x0D) {
+                return 0;
+            }
             if ch == 0x16 && SWALLOW_SYN.with(|flag| flag.replace(false)) {
                 return 0;
             }
@@ -378,6 +384,13 @@ unsafe fn subclass_inner(
         }
         WM_KEYDOWN => {
             let key = wparam as u16;
+            // Up/Down/Enter/Tab/Esc while the autocomplete list is open.
+            if !ctrl && !alt && !shift && autocomplete::handle_key(hwnd, key) {
+                return 0;
+            }
+            if matches!(key, VK_BACK | VK_LEFT | VK_RIGHT) {
+                autocomplete::dismiss();
+            }
             if ctrl && !shift && !alt && key == VK_SPACE && complete_word(hwnd) {
                 return 0;
             }
@@ -482,6 +495,7 @@ unsafe fn subclass_inner(
             }
         }
         WM_LBUTTONDOWN if !ctrl && !shift => {
+            autocomplete::dismiss();
             // A click on a checklist box ticks it and leaves the caret alone.
             let x = (lparam & 0xFFFF) as i16 as i32;
             let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
@@ -495,6 +509,7 @@ unsafe fn subclass_inner(
             }
         }
         WM_LBUTTONDBLCLK => {
+            autocomplete::dismiss();
             // Double-clicking a formula opens it for editing; a picture opens
             // the Image Size dialog.
             let result = DefSubclassProc(hwnd, msg, wparam, lparam);
@@ -515,9 +530,23 @@ unsafe fn subclass_inner(
             }
             return result;
         }
+        WM_KILLFOCUS => {
+            autocomplete::dismiss();
+        }
         _ => {}
     }
-    DefSubclassProc(hwnd, msg, wparam, lparam)
+    let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+    // After a printable character, refresh the same-page suggestions. Space and
+    // punctuation end the word, so the list is hidden then.
+    if msg == WM_CHAR {
+        let ch = wparam as u32;
+        if ch >= 0x20 {
+            autocomplete::update(hwnd, frame as HWND, AUTOCOMPLETE.with(Cell::get));
+        } else if ch != 0x08 && ch != 0x09 {
+            autocomplete::dismiss();
+        }
+    }
+    result
 }
 
 /// Turns a typed Markdown marker into formatting when the space is pressed.
