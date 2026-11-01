@@ -2044,8 +2044,11 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
     ));
     rtf.push_str(&rtf_escape(code.trim_end_matches('\r')));
     rtf.push_str("\\cell\\row");
-    // Keep whatever follows the code block out of its table.
-    rtf.push_str(&format!("\\pard\\f0\\fs{}\\cf0\\par}}", body_size()));
+    // Keep whatever follows the code block out of its table. `\fs` takes
+    // half-points, while `body_size()` is twips — using the twips value here
+    // made the paragraph below the block 110 pt, so anything typed there
+    // ballooned after the code block (most obvious on 150% displays).
+    rtf.push_str(&format!("\\pard\\f0\\fs{}\\cf0\\par}}", body_size() / 10));
     rtf
 }
 
