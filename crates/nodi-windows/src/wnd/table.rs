@@ -362,8 +362,15 @@ struct Here {
 fn here(editor: HWND) -> Result<Here, String> {
     let units = document(editor);
     let all_rows = rows(&units);
-    let (caret, _) = editor::selection(editor);
-    let row = row_at(&all_rows, caret).ok_or("The caret is not inside a table.")?;
+    // Use the start of the selection, not the moving end: selecting a whole
+    // cell (or the last column) often leaves the end just past the row marker,
+    // where `row_at` used to lose the table and the command failed.
+    let (from, to) = editor::selection(editor);
+    let start = from.min(to);
+    let row = row_at(&all_rows, start)
+        .or_else(|| row_at(&all_rows, start - 1))
+        .ok_or("The caret is not inside a table.")?;
+    let caret = start.clamp(row.start + 1, row.end - 1);
     let cell = cell_index(&units, row, caret);
     let (params, cells) =
         get_params(editor, row).ok_or("Rich Edit did not report the table layout.")?;
