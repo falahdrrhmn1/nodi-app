@@ -31,6 +31,7 @@ use windows_sys::Win32::UI::Controls::{
     SetWindowTheme, CDDS_ITEMPOSTPAINT, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_CHECKED, CDIS_HOT,
     CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, NMHDR,
     NMTBCUSTOMDRAW, NM_CUSTOMDRAW, TBCDRF_NOBACKGROUND, TBCDRF_NOEDGES, TBCDRF_USECDCOLORS,
+    TB_GETTOOLTIPS, TCM_GETTOOLTIPS, TTM_SETTIPBKCOLOR, TTM_SETTIPTEXTCOLOR,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_GETFONT};
 
@@ -552,6 +553,7 @@ pub fn apply(app: &mut App) {
         crate::wnd::layout(app);
     }
     set_dark_menus(new.dark);
+    apply_tooltips(app);
 
     if !app.background_brush.is_null() {
         // SAFETY: we created this brush and replace it below.
@@ -694,8 +696,10 @@ pub unsafe fn on_notify(app: &App, header: &NMHDR, lparam: LPARAM) -> Option<LRE
         }
         CDDS_ITEMPREPAINT => {
             draw.clrText = app.palette.window_text;
+            draw.clrTextHighlight = app.palette.window_text;
             draw.clrBtnFace = app.palette.window_bg;
             draw.clrBtnHighlight = app.palette.border;
+            draw.clrHighlightHotTrack = lighten(app.palette.window_bg, 40);
             draw.clrMark = app.palette.accent;
             // `CDRF_NEWFONT` makes the toolbar draw with the font selected in
             // the DC, which must be its own font: the DC's default font is
@@ -705,10 +709,24 @@ pub unsafe fn on_notify(app: &App, header: &NMHDR, lparam: LPARAM) -> Option<LRE
                 SelectObject(draw.nmcd.hdc, font as HGDIOBJ);
             }
             let mut flags = CDRF_NEWFONT | TBCDRF_USECDCOLORS | TBCDRF_NOEDGES;
-            if draw.nmcd.uItemState & CDIS_CHECKED != 0 && !draw.nmcd.hdc.is_null() {
-                // A checked button (word wrap) is shown in the accent colour;
-                // the default light-blue check fill hides light text.
-                fill(draw.nmcd.hdc, &draw.nmcd.rc, app.palette.accent);
+            let hot = draw.nmcd.uItemState & (CDIS_HOT | CDIS_SELECTED) != 0;
+            let checked = draw.nmcd.uItemState & CDIS_CHECKED != 0;
+            if (hot || checked) && !draw.nmcd.hdc.is_null() {
+                // The native hot gradient and check fill are light blues, so
+                // the light button text vanished on them. Paint the state in
+                // the theme's own colours, with a bar for a toggle (the accent
+                // can itself be a light colour in a dark theme).
+                let bg = if hot {
+                    lighten(app.palette.window_bg, 40)
+                } else {
+                    lighten(app.palette.window_bg, 26)
+                };
+                fill(draw.nmcd.hdc, &draw.nmcd.rc, bg);
+                if checked {
+                    let mut bar = draw.nmcd.rc;
+                    bar.top = bar.bottom - 2;
+                    fill(draw.nmcd.hdc, &bar, app.palette.accent);
+                }
                 flags |= TBCDRF_NOBACKGROUND;
             }
             flags
@@ -850,6 +868,40 @@ fn set_dark_menus(dark: bool) {
             // 2 = ForceDark, 3 = ForceLight.
             set(if dark { 2 } else { 3 });
             flush();
+        }
+    }
+}
+
+/// Recolours the tooltips the toolbars and the tab strip own. With visual
+/// styles the tooltip is painted by the theme, and under
+/// `SetPreferredAppMode` (dark) it came out dark on dark: hovering a button
+/// showed a tip nobody could read. Dropping the style and setting the colours
+/// from the palette keeps them legible in every theme.
+fn apply_tooltips(app: &App) {
+    let empty = win::wide("");
+    for (window, message) in [
+        (app.toolbar, TB_GETTOOLTIPS),
+        (app.formatbar, TB_GETTOOLTIPS),
+        (app.tabctrl, TCM_GETTOOLTIPS),
+    ] {
+        if window.is_null() {
+            continue;
+        }
+        // SAFETY: plain control messages on our own controls; the tooltip
+        // handle, if any, belongs to this process too.
+        unsafe {
+            let tip = SendMessageW(window, message, 0, 0) as HWND;
+            if tip.is_null() {
+                continue;
+            }
+            SetWindowTheme(tip, empty.as_ptr(), empty.as_ptr());
+            SendMessageW(tip, TTM_SETTIPBKCOLOR, app.palette.window_bg as usize, 0);
+            SendMessageW(
+                tip,
+                TTM_SETTIPTEXTCOLOR,
+                app.palette.window_text as usize,
+                0,
+            );
         }
     }
 }
