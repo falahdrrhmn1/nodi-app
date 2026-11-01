@@ -13,9 +13,11 @@ WYSIWYG — Ctrl+B makes text bold instead of inserting `**text**`.
   insertion line, Trash with restore, 8 built-in icons, Move to…, Go to Note by
   title, internal note links that survive renames.
 - **Editor**: bold/italic/underline/strikethrough, headings 1–4, bulleted and
-  numbered lists, alignment, font, size, colour, highlight, inline code, real
-  tables, pictures (insert, paste a screenshot, resize, crop), formulas
-  (LaTeX rendered in place and editable again), undo/redo, zoom.
+  numbered lists, alignment, font, size, colour, highlight, inline code, code
+  and output blocks (**Ctrl+Shift+C** / **Ctrl+Shift+O**: a header with a Copy
+  link that stays visible at the left of the block, then the code in the note's
+  own font), real tables, pictures (insert, paste a screenshot, resize, crop),
+  formulas (LaTeX rendered in place and editable again), undo/redo, zoom.
 - **Markdown-style typing**: `- `, `1. `, `[ ] `, `# `…`#### `, `---` +
   Enter (separator), `----` + Enter (page break); Tab indents the paragraph or
   nests a list item at any depth, Enter keeps the indentation. Numbered lists
@@ -30,7 +32,13 @@ WYSIWYG — Ctrl+B makes text bold instead of inserting `**text**`.
 - **Find Notes** (Ctrl+Shift+F) searches note and folder titles and the text
   of every note, with the folder path and a bit of text around each hit.
 - **Tabs** with a × close button and a + that opens a new note (**Ctrl+T**).
-  A new note is titled by its first line until you rename it.
+  A new note is named by its first line (a few words only) until you rename it;
+  hover a tab to see the whole title.
+- **Text shortcuts** (Tools > Text Shortcuts...): type a trigger and press Enter
+  to expand it into longer text. A shortcut can apply to this note, to the
+  folder it is in or to every note, and the dialog lists the ones that already
+  exist — with the page or folder each belongs to — so an old one can be seen
+  and deleted.
 - **Ctrl+Z in the Notes Explorer** undoes a move to the Trash, a move or a
   rename (it asks first).
 - **Paste from ChatGPT or a web page** keeps headings, lists, task lists,
@@ -62,11 +70,14 @@ WYSIWYG — Ctrl+B makes text bold instead of inserting `**text**`.
   Tokyo Night, Catppuccin Mocha, High Contrast). The title bar, menus,
   toolbars, tree, tabs and status bar follow the theme. The Theme Editor sets
   every colour and the chrome font, previews live and saves **your own
-  themes**; copy a theme as text and paste it on another PC.
-- **View**: line numbers next to the text (as in Notepad++), a background
-  pattern (lines, grid, dots — drawn on screen only), sort order.
-- **Tools > Preferences**: default font and size for new notes, sounds (off
-  by default: no beeps, silent message boxes), two quick spaces → `. `.
+  themes**; copy a theme as text and paste it on another PC. Toolbar hover and
+  every tooltip follow the theme, so the dark presets stay readable.
+- **View**: line numbers next to the text (as in Notepad++), drawn in the same
+  default font as the note; a background pattern (lines, grid, dots — drawn on
+  screen only), sort order.
+- **Tools > Preferences**: default font and size for new notes (the line
+  numbers follow that font too), sounds (off by default: no beeps, silent
+  message boxes), two quick spaces → `. `.
 - Lines, words and characters (and the selection's) in the status bar;
   Ctrl+Up/Down scroll the view.
 - **AI Markdown mirror** — see below.

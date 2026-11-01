@@ -18,8 +18,14 @@ crates/nodi-core      pure Rust, no Win32 — reusable for a future Android app
   search.rs           title search, full-text search over .txt sidecars
   links.rs            nodi://note/<id> and nodi-math:<LaTeX> links
   image.rs            PNG/JPEG/GIF/BMP header sniffing, clipboard DIB → BMP
-  rtf.rs              targeted RTF patches (picture size, picture blob)
+  png.rs              minimal PNG decoder for note icons chosen from a file
+  rtf.rs              targeted RTF patches (picture size, picture blob, theme
+                      colour sentinels)
   markdown.rs         note RTF → Markdown (+ list of what could not be kept)
+  markdown_in.rs      Markdown → RTF (pasting; the default-font handoff)
+  html_in.rs          clipboard CF_HTML → Markdown → RTF (browser paste)
+  import.rs           .md/.txt/.rtf import (encoding sniffing, folder structure)
+  mirror.rs           the AI Markdown mirror (paths, front matter, INDEX.md)
   math/parse.rs       LaTeX subset → syntax tree (with error positions)
   math/layout.rs      TeX-like box layout; font metrics injected via a trait
   math/mod.rs         grey+alpha PNG encoder (miniz_oxide)
@@ -28,20 +34,26 @@ crates/nodi-windows   Win32 shell, binary nodi.exe
   main.rs, app.rs     App state: tabs, save state machine, session, commands
   testhook.rs         WM_COPYDATA remote control for scripts/e2e.ps1
                       (only when NODI_TEST_HOOKS=1 at startup)
+  win.rs              small Win32 helpers (system DPI, mul_div, strings)
   wnd/mod.rs          frame window, layout, splitter, message loop
   wnd/menu.rs         menus, accelerators, SHORTCUTS list, command dispatch
+  wnd/theme.rs        palette, dark title bar / menus, tooltip colours
   wnd/toolbar.rs      toolbar + tooltips
   wnd/tree.rs         Notes Explorer TreeView, icons, drag & drop, context menu
   wnd/tabs.rs         tab control
   wnd/status.rs       status bar (message | save state | Ln/Col | UTF-8 | mode)
   wnd/editor.rs       Rich Edit wrapper (streams, raw text, formats, zoom…)
-  wnd/editkeys.rs     editor subclass: auto-indent, Tab/Shift+Tab, paste
+  wnd/editkeys.rs     editor subclass: auto-indent, Tab/Shift+Tab, paste,
+                      text shortcuts
+  wnd/autocomplete.rs same-page word autocomplete popup
+  wnd/caret.rs        caret shapes (line / thick / block / underline)
   wnd/format.rs       headings, lists, alignment, code, highlight, colour, font
   wnd/table.rs        tables: insert, rows, columns
   wnd/image.rs        pictures: insert, paste, resize, save
   wnd/formula.rs      formula rendering (GDI, Cambria Math) and editing
   wnd/link.rs         hyperlinks, link safety policy
   wnd/find.rs         Find/Replace (common dialogs), search all notes
+  wnd/outline.rs      View > Outline (headings popup)
   wnd/context.rs      right-click menu inside a note
   wnd/form.rs         small DPI-aware modal form used by several dialogs
   wnd/dialogs.rs      message boxes, icon picker, trash, note picker, file dialogs
@@ -50,6 +62,7 @@ crates/nodi-windows   Win32 shell, binary nodi.exe
   wnd/gutter.rs       line-number strip (paragraph numbers, cached starts)
   wnd/pattern.rs      background lines / grid / dots (key-colour MaskBlt)
   wnd/net.rs          WinHTTP download for pictures in pasted web pages
+  wnd/import.rs       import/export workers (File menu, drop, right-click)
   explorer.rs         multi-selection, lock, sort, refresh, import source
   prefs.rs            Tools > Preferences
   themes.rs           theme presets menu, Theme Editor, copy/paste themes
@@ -111,7 +124,11 @@ At startup a mirror file newer than its note is trusted as it is.
   positions; `EM_GETTEXTEX` with `GT_RAWTEXT` keeps positions aligned.
 - Pictures report as U+FFFC in raw text and as a space in plain text.
 - Paragraph shading/borders are not rendered; table cell shading is — a code
-  block is therefore a one-cell grey, bordered Consolas table.
+  block is therefore a small table: a header row with two cells (the language
+  label and a `nodi-copy:` Copy link) over one wide code cell, and a closing
+  paragraph so a table inserted right below is not merged into it. The code and
+  the label follow the note's own default font, and the link is drawn at the
+  left of the block so a long line cannot push it out of view.
 - Enter is handled by Rich Edit on `WM_KEYDOWN` (the `WM_CHAR` CR is ignored);
   Tab on `WM_CHAR`. Auto-indent hooks Enter at `WM_KEYDOWN`.
 - In a table cell, a tab inserted through `EM_REPLACESEL` acts like the Tab key
@@ -134,6 +151,20 @@ At startup a mirror file newer than its note is trusted as it is.
 - Rich Edit forces `\ul` and the link colour on a field result, so the
   separator is a plain, very flat picture recognised by its shape
   (`image::is_rule_picture`), not a `nodi-hr:` link (older notes still work).
+- `SPI_GETNONCLIENTMETRICS` already reports `lfMessageFont.lfHeight` in the
+  system DPI (-18 at 150 %): scaling it by `dpi/96` again asked for a font half
+  as large again, which cut dialog labels in half and made the chrome look
+  oversized. `win::system_dpi()` is the reference for every such height.
+- `EM_GETTEXTEX` hands back the instruction text of a field as hidden text, so a
+  code block's Copy link reached the plain text, the search sidecar and the
+  automatic note title as `HYPERLINK "nodi-copy:"Copy`; `GT_NOHIDDENTEXT`
+  (`0x0000_0008`) keeps it out.
+- Dark mode (`SetPreferredAppMode`) does not colour a `tooltips_class32`
+  window, so every toolbar tip stayed dark on dark. `theme::apply_tooltips`
+  fetches each bar's tooltip (`TB_GETTOOLTIPS` / `TCM_GETTOOLTIPS`) and sets
+  `TTM_SETTIPBKCOLOR` / `TTM_SETTIPTEXTCOLOR` from the palette. The tab strip's
+  tip also carries the whole note title, because a tab label is cut to 28
+  characters before an ellipsis.
 
 ## Lists (batch 6)
 
@@ -149,14 +180,38 @@ which Rich Edit keeps. `editor::load_rtf` renumbers every loaded note that has
 numbered paragraphs. Deeper bullets and checklist boxes (`☐`/`☑`) are a
 literal glyph + tab with a hanging indent.
 
+## Dialogs and DPI
+
+`wnd/form.rs` builds every Nodi form: labels are measured and wrapped
+(`wrap_lines`, `label_height`) and a row is as tall as its label and its input
+put together, so nothing is clipped at 100 %, 125 % or 150 %; a wide form gives
+the input the whole width. A field can be an edit box, a drop-down
+(`CBS_DROPDOWNLIST` with `CBS_HASSTRINGS`) or a list box. The fonts come from
+`SPI_GETNONCLIENTMETRICS` scaled against `win::system_dpi()`. The older
+hand-built dialogs (icon picker, Trash, note picker) do not use it yet.
+
+## Text shortcuts (rev 3)
+
+`settings.text_shortcuts` holds `{trigger, replacement, scope, note, folder}`
+entries. `wnd/editkeys.rs::expand_shortcut` runs on a plain Enter while nothing
+is selected: the word just before the caret has to equal a trigger whose scope
+matches — `all`, the note's folder, or the note itself — and that word is then
+replaced. Tools > Text Shortcuts... lists what exists (`[page: <title>]`,
+`[folder: <name>]`, `[all notes]`), offers the scope as a drop-down that names
+the real page or folder, and deletes the entry selected in the list; saving an
+existing (trigger, scope) pair replaces it. The trigger is matched
+case-sensitively when expanding.
+
 ## Themes (batch 6)
 
 A theme is a full colour set (`ThemeSpec`): note, window, tree, tabs,
 accent, borders, line numbers, background pattern, plus the chrome font.
 The menu bar is painted through the `WM_UAHDRAWMENU*` messages (as Notepad++
 does), pop-up menus use uxtheme's `SetPreferredAppMode`, the title bar DWM's
-dark-mode attribute. The note's own colours never change (see the display
-sentinels above).
+dark-mode attribute. Toolbar and tab tooltips take their background and text
+colour from the palette, and a hot or checked format-bar item is painted in the
+palette's colours instead of the system's light-blue defaults. The note's own
+colours never change (see the display sentinels above).
 
 ## Markdown
 

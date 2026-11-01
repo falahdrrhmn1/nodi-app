@@ -1,7 +1,8 @@
 # Nodi Mark III — Status
 
-Measured on the development laptop (Windows 11, 8 GB RAM, 125 % display
-scaling), release build, 2026-10-22.
+Measured on the development laptop (Windows 11, 8 GB RAM), release build,
+2026-10-22. The numbers below were taken at 125 % display scaling; Nodi is
+tested and used at 100 %, 125 % and 150 %.
 
 ## Test results
 
@@ -72,6 +73,15 @@ same handlers as the menus.
 | batch 6 — heavy note | `stress-heavy.ps1`: 3000 paragraphs, 15 pictures, 15 page breaks, numbered lists, checklists, tables (150 000 characters); killed 0–40 ms after Ctrl+S, mostly during `Saving...` | **PASS**: 10 + 8 kills, every reopen the new or the previous complete version, 0 damaged. Found on the way: Enter in a numbered list of such a note took > 10 s (renumbering the whole note, a status-bar update per paragraph) → only the list around the caret is renumbered, without selection notifications (note built in 8–11 s instead of timing out) |
 | batch 6 — low memory | the heavy-note run with a second process holding 1.5 GB (≈ 970 MB of 7.7 GB left) | **PASS**: 8 kills, 0 damaged |
 | batch 6 — mixed content | heading, nested numbers, checklist, page break, picture, table: identical Markdown and text after close (no Ctrl+S) and reopen | **PASS** (e2e BS) |
+| rev 3 — same-page autocomplete | the popup suggests words of the current note, Tab accepts, View > Same-page Autocomplete turns it off | **PASS** (e2e BT) |
+| rev 3 — text shortcuts | a trigger expands on Enter, is scoped to note / folder / all notes and persists | **PASS** (e2e BU) |
+| rev 3 — titled separator | a text line, a Markdown heading and a bare rule become one titled block | **PASS** (e2e BV) |
+| rev 3 — table below a code block | a table inserted right below a code block stays a separate table | **PASS** (e2e BW) |
+| rev 3 — dialogs at 150 % | Text Shortcuts, Insert Table, Link and Formula show no clipped label (100 / 125 / 150 %) | **PASS** (screenshots) |
+| rev 3 — dark tooltips | background/text read `#252526`/`#cccccc` in the dark theme, `#f0f0f0`/`#1f1f1f` in light (`TTM_GETTIPBKCOLOR`/`TTM_GETTIPTEXTCOLOR`); a hot or checked format-bar item stays readable | **PASS** (probe + screenshots) |
+| rev 3 — tab titles | an automatic title takes at most six words / 40 characters, the tab paints 28 + `…`, the tooltip carries the whole title | **PASS** (screenshots) |
+| rev 3 — line-number font | the gutter follows Preferences > Default font (probe with `Courier New 16`) | **PASS** (screenshot) |
+| rev 3 — code block Copy / wrap | the Copy link sits at the left of the block and stays visible without scrolling; the word-wrap toggle is an ↩ icon in both themes | **PASS** (e2e AB, screenshots) |
 
 Unit and integration tests: `cargo test` — all pass (nodi-core: tree,
 storage, autosave, backup, Markdown mirror, search, links, image, RTF and theme
@@ -88,14 +98,16 @@ the visual drag feedback (insertion line / row highlight / hover-expand /
 auto-scroll are driven by `WM_MOUSEMOVE`, while e2e AF tests the same model
 move through a hook), right-click menus, the common dialogs
 (open/save/folder/colour/font/find) and the “Move to...” picker. Real keyboard
-input is covered by e2e R, which sends keystrokes through `SendKeys` to the
-foreground window.
+input is covered by e2e R, Y and AN, which send keystrokes through `SendKeys`
+to the foreground window; those cases compare letters, so **turn Caps Lock
+off** before running the suite — with it on, `Kunci asli` arrives as
+`kUNCI ASLI` and three cases fail without anything being wrong in the app.
 
 ## Measurements (release build)
 
 | Metric | Result |
 |---|---|
-| `nodi.exe` size | 800 KB (single file, no DLLs to ship) |
+| `nodi.exe` size | 1.5 MB / 1492 KB (single file, no DLLs to ship; rev 3, 2026-11-02) |
 | Startup to idle window | 117 ms best, ~150–370 ms typical |
 | RAM idle (one empty note) | 23.5 MB working set, 4.8 MB private |
 | RAM with 10 open notes (text + 640×360 picture + formula each) | 40.9 MB working set, 20.8 MB private |
@@ -146,11 +158,13 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   code blocks use 480 twips. Double-clicking a picture opens Image > Size….
 - Code blocks keep Notepad++-style Enter/Tab: Enter copies the indentation,
   Tab inserts a tab, Shift+Tab removes one indent level.
-- Code blocks: two-row table with a language header and a **Copy** link (plain
-  click copies the code), grey bordered body, Consolas, code-editor Enter/Tab;
-  the header label becomes the Markdown fence info string. **Insert > Output
-  Block** (Ctrl+Shift+O) makes the same block with a dark body and the
-  `output` label.
+- Code blocks: two-row table with a language header and a **Copy** link at its
+  left (a plain click copies the code, and it stays visible however long the
+  code line is), grey bordered body in the note's own default font,
+  code-editor Enter/Tab; the header label becomes the Markdown fence info
+  string. **Insert > Output Block** (Ctrl+Shift+O) makes the same block with a
+  dark body and the `output` label. The word-wrap toggle in the main toolbar is
+  an ↩ icon.
 - Paste: RTF keeps its native formatting; HTML from a browser (CF_HTML) is
   converted through a small tag scanner; plain text that looks like Markdown
   (two signals or a fence) becomes headings, lists, code tables, GFM tables,
@@ -170,7 +184,15 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   policy below.
 - Tabs: × on every tab, + after the last one, Ctrl+T, right-click menu,
   middle-click. A new note is titled by its first line (headings and bullets
-  stripped) until it is renamed by hand.
+  stripped, at most six words / 40 characters) until it is renamed by hand; the
+  tab paints 28 characters + `…` and its tooltip shows the whole title.
+- **Text shortcuts** (Tools > Text Shortcuts...): a trigger word expands on
+  Enter into longer text. Each shortcut applies to one note, to its folder or to
+  every note; the dialog lists what already exists and deletes what is no longer
+  wanted.
+- **Line numbers** (View > Line numbers): a gutter like Notepad++'s, one number
+  per paragraph, click to select the line — drawn in the same default font as
+  the note (Preferences > Default font).
 - Notes Explorer undo: Ctrl+Z with the tree focused takes back the last move to
   the Trash (with its sub-notes, at the same place), move or rename, after a
   confirmation (20 steps, this session).
@@ -200,11 +222,11 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
   expanded folders, zoom, word wrap.
 - Markdown: read-only Markdown view and export (`.md` + picture folder),
   lossy features listed.
-- **Themes**: View > Theme > Light / Dark / Custom... (background, text and
-  accent colours). Applies to all tabs immediately and persists. The editor,
-  tree, tabs, format bar, status bar and title bar follow the theme; menus and
-  the icon toolbar stay light (Windows has no supported dark menus, and the
-  standard toolbar glyphs are black). Notes keep their real colours on disk.
+- **Themes**: Light, Dark and Custom colours (View > Theme) plus 15 presets
+  (Themes..., batch 6). Applies to all tabs immediately and persists. The
+  editor, tree, tabs, format bar, toolbars, menu bar, pop-up menus, tooltips,
+  status bar and title bar follow the theme. Notes keep their real colours on
+  disk.
 - **AI Markdown mirror** (Tools > Keep Markdown Mirror for AI Agents, on by
   default; Tools > Rebuild AI Markdown Mirror): `data\markdown\` holds every
   note as `.md` with front matter, plus `INDEX.md` and `index.json`. Point an
@@ -219,6 +241,42 @@ Targets from the spec: startup ≈ 1 s → met; idle RAM < 100 MB → met.
 
 ### Batch 6 (2026-10-29)
 See `docs/tasks/rev2-batch6.md` (requests) and `rev2-batch6-REPORT.md`.
+
+### Rev 3 (2026-11-02)
+
+Requests: `saran dan revisi v3.docx` + chat (as for batch 6). All of it is in
+the release build; each fix is its own commit.
+
+- **Dialogs at 100 / 125 / 150 %**: the UI font is scaled against the system DPI
+  instead of a hard 96, so it is no longer scaled twice at 150 %; form labels are
+  measured and wrapped and a row is as tall as its label and its input, so
+  "Scope (page/all/folder):" and the Insert Table / Link / Formula labels are
+  not cut in half. A form field can now be a drop-down or a list box.
+- **Dark theme**: a hot or checked format-bar item is painted in the palette's
+  colours (the system's light-blue fill made the light label invisible), and the
+  toolbars' and tab strip's tooltips get explicit colours, so a tip is readable
+  in every theme.
+- **Tab titles**: an automatic title is capped at six words / 40 characters, the
+  tab paints 28 characters + `…` and its tooltip shows the whole title. A note
+  that opens with a code block is titled by its first line of code, not `code`.
+- **Line numbers**: the gutter is re-fonted as soon as the settings are loaded,
+  so it follows Preferences > Default font in every theme.
+- **Code blocks**: the Copy link moved to the left of the block, where a long
+  code line cannot push it out of sight, and the word-wrap toggle is an ↩ icon
+  instead of the word "Wrap". `editor::plain_text` no longer carries a field's
+  instruction text, so `HYPERLINK "nodi-copy:"Copy` cannot leak into the plain
+  text, the search index or an automatic title.
+- **Text Shortcuts**: the dialog lists every existing shortcut with its place
+  (`[page: <title>]`, `[folder: <name>]`, `[all notes]`), the scope is a
+  drop-down that names the real page or folder, and an entry can be deleted.
+
+Verification: `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test` clean; `scripts\e2e.ps1` **70 passed, 0 failed**; the shipped
+`dist\Nodi\nodi.exe` also passes the code-block Copy, line-number, default-font,
+text-shortcut and table-below-code cases. The line-number font was checked with
+a probe that writes `body_font: "Courier New"` into `settings.json` before
+startup, the tooltip colours with `TTM_GETTIP*` on the bars' own tooltip
+windows.
 
 ### Not done yet / limitations
 - **Colour emoji**: Windows' Rich Edit control draws emoji in colour only in

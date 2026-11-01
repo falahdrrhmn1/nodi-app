@@ -21,6 +21,7 @@ in the app comes from `SHORTCUTS` in `crates/nodi-windows/src/wnd/menu.rs`.
 | Alt+Up / Alt+Down | Move note up / down among its siblings |
 | Drag & drop in the tree | Move before / after (insertion line) or inside (highlighted row, last child); near the top/bottom edge auto-scrolls, hovering a collapsed node expands it, **Esc** cancels |
 | Enter (in the tree) | Open the selected note |
+| Typing the first line | Names the note after it (a few words only) unless you rename it |
 
 ## Editing (Notepad++ style)
 
@@ -69,7 +70,8 @@ that heading).
 The format bar (below the main toolbar) has **style** (Normal, Heading 1–4),
 **font name** and **font size** (8–72 pt) lists that show the formatting at the
 caret, plus text colour and highlight palettes, the four alignments, lists and
-the insert commands.
+the insert commands. The main toolbar's **↩** button toggles word wrap; its
+tooltip names the command.
 
 | Keys | Action |
 |---|---|
@@ -110,11 +112,20 @@ the insert commands.
 | Ctrl+= / Ctrl+- / Ctrl+0 | Zoom in / out / reset (or Ctrl+mouse wheel) |
 | Ctrl+Shift+M | Show the note as Markdown (read-only) |
 | Ctrl+Alt+O | Outline: list the note's headings and jump to one |
+| ↩ in the main toolbar, or View > Word Wrap | Wrap long lines to the window width (off: scroll sideways) |
 | F1 | Keyboard shortcut list |
+
+## Tools
+
+| Keys | Action |
+|---|---|
+| Enter after a trigger | Expands a **text shortcut**: the word just before the caret has to match a trigger that applies to this note, its folder or every note (Tools > Text Shortcuts...) |
 
 ## Mouse
 
 - Each tab has a × (close); the + after the last tab opens a new note.
+- Hovering a tab shows the whole note title; the tab itself shows the first few
+  words.
 - Right-click a tab: Close, Close Others, Close All, Copy Internal Link,
   Reveal in Tree. Middle-click a tab closes it.
 - Drag files from Explorer onto the window: `.md` / `.txt` / `.rtf` files and
