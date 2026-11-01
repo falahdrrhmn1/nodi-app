@@ -365,6 +365,9 @@ impl App {
         // editor, so the very first paint is already themed.
         self.settings = data.load_settings();
         self.apply_body_font();
+        // The chrome (and its fonts) was built during WM_CREATE, before the
+        // settings existed, so the line-number font still had the default face.
+        crate::app::refresh_gutter_font(self);
         let chosen = self.settings.markdown_dir.trim();
         if !chosen.is_empty() {
             data.set_markdown_dir(Some(std::path::PathBuf::from(chosen)));
