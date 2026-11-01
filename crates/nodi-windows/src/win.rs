@@ -54,3 +54,26 @@ pub fn mul_div(value: i32, numerator: i32, denominator: i32) -> i32 {
     }
     ((value as i64 * numerator as i64) / denominator as i64) as i32
 }
+
+/// `LOGPIXELSY`: the vertical DPI of a device context.
+const LOGPIXELSY: i32 = 90;
+
+/// DPI that the system metrics (`SPI_GETNONCLIENTMETRICS`, menus, dialogs) are
+/// already scaled for.
+///
+/// A font height that comes from those metrics is in *this* DPI, not 96: on a
+/// 150% display `lfMessageFont.lfHeight` is already -18. Scaling that again
+/// with `dpi / 96` gave a 27px dialog font, which is why field labels were
+/// cut off and the whole chrome looked oversized. Scale from here instead.
+pub fn system_dpi() -> i32 {
+    // SAFETY: the screen DC is released straight away.
+    unsafe {
+        let dc = windows_sys::Win32::Graphics::Gdi::GetDC(std::ptr::null_mut());
+        if dc.is_null() {
+            return 96;
+        }
+        let dpi = windows_sys::Win32::Graphics::Gdi::GetDeviceCaps(dc, LOGPIXELSY);
+        windows_sys::Win32::Graphics::Gdi::ReleaseDC(std::ptr::null_mut(), dc);
+        dpi.max(48)
+    }
+}

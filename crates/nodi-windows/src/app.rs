@@ -2199,7 +2199,7 @@ unsafe fn make_ui_font(dpi: u32, bold: bool, face: &str, size: u32) -> HFONT {
         fallback
     };
 
-    logfont.lfHeight = win::mul_div(logfont.lfHeight, dpi as i32, 96);
+    logfont.lfHeight = win::mul_div(logfont.lfHeight, dpi as i32, win::system_dpi());
     if logfont.lfHeight == 0 {
         logfont.lfHeight = -win::mul_div(12, dpi as i32, 96);
     }
