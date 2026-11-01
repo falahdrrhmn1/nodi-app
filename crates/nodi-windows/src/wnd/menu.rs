@@ -5,7 +5,7 @@
 use std::ptr;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use nodi_core::storage::{Background, CaretStyle};
+use nodi_core::storage::{Background, CaretStyle, TextShortcut};
 use nodi_core::tree::SortOrder;
 use nodi_core::NodeKind;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -179,6 +179,7 @@ pub const IDM_VIEW_REFRESH: u16 = 145;
 pub const IDM_VIEW_LINE_NUMBERS: u16 = 146;
 pub const IDM_TOOLS_RESTORE_FOLDER: u16 = 187;
 pub const IDM_TOOLS_PREFERENCES: u16 = 188;
+pub const IDM_TOOLS_TEXT_SHORTCUTS: u16 = 189;
 pub const IDM_NOTES_LOCK: u16 = 260;
 pub const IDM_NOTES_UNLOCK: u16 = 261;
 pub const IDM_NOTES_EXPORT: u16 = 262;
@@ -556,6 +557,7 @@ pub fn create_menu() -> HMENU {
             Item::Sep,
             Item::Cmd(IDM_TOOLS_OPEN_DATA, "&Open Data Folder"),
             Item::Sep,
+            Item::Cmd(IDM_TOOLS_TEXT_SHORTCUTS, "Text S&hortcuts..."),
             Item::Cmd(IDM_TOOLS_PREFERENCES, "&Preferences..."),
         ]);
         attach(bar, tools, "&Tools");
@@ -898,6 +900,7 @@ pub fn on_command(app: &mut App, id: u16) {
         IDM_INSERT_DATETIME if app.tree_has_focus() => app.refresh_from_disk(),
         IDM_TOOLS_RESTORE_FOLDER => app.restore_from_folder_ui(),
         IDM_TOOLS_PREFERENCES => app.show_preferences(),
+        IDM_TOOLS_TEXT_SHORTCUTS => text_shortcuts(app),
         IDM_FORMAT_CHECKLIST => with_editor(app, |editor| {
             format::toggle_list(editor, format::ListKind::Check);
         }),
@@ -1225,6 +1228,106 @@ pub(crate) fn with_editor(
         windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(editor);
     }
     toolbar::sync_format(app);
+}
+
+/// Tools > Text Shortcuts: add or remove the scoped text expansions that
+/// `editkeys::expand_shortcut` uses on Enter. The form shows the existing
+/// shortcuts and edits one at a time (trigger + replacement + scope), which
+/// keeps the dialog simple while still covering create/update/delete.
+fn text_shortcuts(app: &mut App) {
+    let owner = app.hwnd;
+    let Some(editor) = app.active_editor() else {
+        status::set_message(app, "No note open");
+        return;
+    };
+    let Some(index) = app.tab_index(editor) else {
+        return;
+    };
+    let note = app.tabs[index].note.clone();
+    let folder = app.tree.get(&note).and_then(|node| node.parent.clone());
+    let listing = if app.settings.text_shortcuts.is_empty() {
+        "(no shortcuts yet)".to_owned()
+    } else {
+        app.settings
+            .text_shortcuts
+            .iter()
+            .enumerate()
+            .map(|(number, shortcut)| {
+                format!(
+                    "{}. {} -> {}  [{}]",
+                    number + 1,
+                    shortcut.trigger,
+                    shortcut.replacement,
+                    shortcut.scope
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let form = crate::wnd::form::Form::new("Text Shortcuts")
+        .wide(560)
+        .note(&format!(
+            "Type a trigger (for example cnv) and its replacement, then Save. \
+             Delete removes the shortcut with that trigger and scope.\n\nExisting:\n{listing}"
+        ))
+        .field(crate::wnd::form::Field::new("Trigger:", ""))
+        .field(crate::wnd::form::Field::new("Replacement:", ""))
+        .field(crate::wnd::form::Field::new(
+            "Scope (page/all/folder):",
+            "page",
+        ))
+        .button(1, "Save")
+        .button(2, "Delete")
+        .button(0, "Cancel");
+    let (values, choice) = form.show_buttons(owner);
+    let Some(values) = values else {
+        return;
+    };
+    let trigger = values[0].trim().to_owned();
+    let replacement = values.get(1).cloned().unwrap_or_default();
+    let scope = match values.get(2).map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == "all" => "all",
+        Some(value) if value == "folder" => "folder",
+        _ => "page",
+    }
+    .to_owned();
+    if trigger.is_empty() {
+        dialogs::error(owner, "The trigger cannot be empty.");
+        return;
+    }
+    match choice {
+        Some(1) => {
+            app.settings
+                .text_shortcuts
+                .retain(|shortcut| !shortcut.trigger.eq_ignore_ascii_case(&trigger));
+            app.settings.text_shortcuts.push(TextShortcut {
+                trigger,
+                replacement,
+                scope: scope.clone(),
+                note: (scope != "all").then(|| note.clone()),
+                folder: if scope == "folder" {
+                    folder.clone()
+                } else {
+                    None
+                },
+            });
+            app.save_settings();
+            status::set_message(app, "Text shortcut saved");
+        }
+        Some(2) => {
+            let before = app.settings.text_shortcuts.len();
+            app.settings.text_shortcuts.retain(|shortcut| {
+                !(shortcut.trigger.eq_ignore_ascii_case(&trigger) && shortcut.scope == scope)
+            });
+            if app.settings.text_shortcuts.len() == before {
+                dialogs::error(owner, "No shortcut with that trigger and scope.");
+            } else {
+                app.save_settings();
+                status::set_message(app, "Text shortcut deleted");
+            }
+        }
+        _ => {}
+    }
 }
 
 fn editor_result(

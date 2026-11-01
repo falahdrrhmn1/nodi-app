@@ -144,6 +144,13 @@ impl Form {
         // reclaimed after the modal loop ends.
         unsafe { run(owner, self).0 }
     }
+
+    /// Like [`Self::show`] but also reports which custom button was pressed
+    /// (own buttons set both the values and the chosen id).
+    pub fn show_buttons(self, owner: HWND) -> (Option<Vec<String>>, Option<i32>) {
+        // SAFETY: as in `show`.
+        unsafe { run(owner, self) }
+    }
 }
 
 struct State {
