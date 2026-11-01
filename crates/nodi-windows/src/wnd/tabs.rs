@@ -90,8 +90,24 @@ pub fn measure_height(app: &App) -> i32 {
     header.max(app.scale(24))
 }
 
+/// Longest label drawn in the tab strip, in characters. Beyond that a title
+/// is cut with `…`: one long note must not push every other tab out of sight.
+const TAB_LABEL_MAX: usize = 28;
+
+/// Shortens a title for the tab strip only; the tree and the window caption
+/// keep the full name.
+fn tab_label(title: &str) -> String {
+    let mut chars = title.chars();
+    let head: String = chars.by_ref().take(TAB_LABEL_MAX).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 pub fn insert(app: &App, index: usize, title: &str) {
-    let mut text = win::wide(title);
+    let mut text = win::wide(&tab_label(title));
     let mut item = item(&mut text);
     // SAFETY: `item` and `text` live for the duration of the call.
     unsafe {
@@ -105,7 +121,7 @@ pub fn insert(app: &App, index: usize, title: &str) {
 }
 
 pub fn set_title(app: &App, index: usize, title: &str) {
-    let mut text = win::wide(title);
+    let mut text = win::wide(&tab_label(title));
     let mut item = item(&mut text);
     // SAFETY: `item` and `text` live for the duration of the call.
     unsafe {

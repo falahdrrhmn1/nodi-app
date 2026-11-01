@@ -86,6 +86,12 @@ const SF_RTF: usize = 0x0002;
 /// `CP_UTF16` used by `EM_GETTEXTEX` for the plain-text sidecar.
 const CP_UTF16: u32 = 1200;
 
+/// `GT_NOHIDDENTEXT` for `EM_GETTEXTEX`: leaves out a field's instruction
+/// text. A code block's Copy link is a `HYPERLINK` field, and the sidecar
+/// (and so the automatic note title and the search index) used to carry
+/// `HYPERLINK "nodi-copy:"Copy` instead of the words on screen.
+const GT_NOHIDDENTEXT: u32 = 0x0000_0008;
+
 const TM_RICHTEXT: usize = 0x0002;
 const TO_ADVANCEDTYPOGRAPHY: usize = 0x0001;
 const EC_LEFTMARGIN: usize = 0x0001;
@@ -481,7 +487,7 @@ pub fn plain_text(editor: HWND) -> String {
     let mut buffer = vec![0u8; capacity * 2];
     let mut request = GetTextEx {
         cb: (capacity * 2) as u32,
-        flags: 0,
+        flags: GT_NOHIDDENTEXT,
         codepage: CP_UTF16,
         lp_default_char: ptr::null(),
         lp_used_def_char: ptr::null_mut(),

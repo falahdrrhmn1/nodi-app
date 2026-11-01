@@ -175,11 +175,17 @@ impl TreeUndo {
 }
 
 /// Longest automatic title, in characters.
-pub const AUTO_TITLE_MAX: usize = 60;
+pub const AUTO_TITLE_MAX: usize = 40;
+
+/// Longest automatic title, in words. A page name only has to be
+/// recognisable; a long one filled the whole tab strip and the tree row.
+pub const AUTO_TITLE_WORDS: usize = 6;
 
 /// Title for a note whose title follows its text: the first non-empty
 /// paragraph without its heading `#`s or list bullet, whitespace collapsed,
-/// at most [`AUTO_TITLE_MAX`] characters; `New Note` when there is no text.
+/// at most [`AUTO_TITLE_WORDS`] words and [`AUTO_TITLE_MAX`] characters;
+/// `New Note` when there is no text. The header row of a code block names the
+/// block rather than the note, so it is skipped.
 pub fn auto_title(text: &str) -> String {
     for line in text.split(['\r', '\n', '\u{000B}']) {
         let cleaned: String = line
@@ -195,11 +201,21 @@ pub fn auto_title(text: &str) -> String {
                 }
             }
         }
+        // A code block's header row reads `code<TAB>Copy`; it names the block,
+        // not the note, so the title follows the line of code below it.
+        if rest.ends_with("\tCopy") {
+            continue;
+        }
         let words: Vec<&str> = rest.split_whitespace().collect();
         if words.is_empty() {
             continue;
         }
-        let joined = words.join(" ");
+        let joined = words
+            .iter()
+            .take(AUTO_TITLE_WORDS)
+            .copied()
+            .collect::<Vec<&str>>()
+            .join(" ");
         return joined
             .chars()
             .take(AUTO_TITLE_MAX)

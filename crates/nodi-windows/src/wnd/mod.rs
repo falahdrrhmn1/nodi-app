@@ -872,7 +872,7 @@ pub unsafe extern "system" fn wndproc(
                     // SAFETY: a `TBN_DROPDOWN` carries an `NMTOOLBARW`.
                     toolbar::on_dropdown(app, lparam);
                 } else if header.code == toolbar::TTN_GETDISPINFOW {
-                    toolbar::tooltip(lparam);
+                    toolbar::tooltip(app, header.hwndFrom, lparam);
                 }
             }
             0

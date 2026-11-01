@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::Controls::{
     TBSTATE_CHECKED, TBSTATE_ENABLED, TBSTYLE_EX_DRAWDDARROWS, TBSTYLE_EX_MIXEDBUTTONS,
     TBSTYLE_FLAT, TBSTYLE_LIST, TBSTYLE_TOOLTIPS, TB_ADDBUTTONSW, TB_ADDSTRINGW, TB_AUTOSIZE,
     TB_BUTTONSTRUCTSIZE, TB_GETRECT, TB_LOADIMAGES, TB_SETEXTENDEDSTYLE, TB_SETSTATE,
-    TOOLBARCLASSNAMEW,
+    TCM_GETTOOLTIPS, TOOLBARCLASSNAMEW,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -126,13 +126,34 @@ fn tip(command: u16) -> &'static str {
     }
 }
 
-/// Fills an `NMTTDISPINFOW` for a toolbar button.
+/// Tooltip handle of `window`, or null when it has none.
+fn tooltip_of(window: HWND, message: u32) -> HWND {
+    if window.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: a plain control message on one of our own controls.
+    unsafe { SendMessageW(window, message, 0, 0) as HWND }
+}
+
+/// Fills an `NMTTDISPINFOW` for a toolbar button — or, when the tab strip asked,
+/// names the note the pointer is over. The tab labels are cut short to keep the
+/// strip usable, so the tip has to carry the full title.
 ///
 /// # Safety
 /// `lparam` must be the `NMTTDISPINFOW` pointer of a `TTN_GETDISPINFOW`.
-pub unsafe fn tooltip(lparam: isize) {
+pub unsafe fn tooltip(app: &App, from: HWND, lparam: isize) {
     let info = &mut *(lparam as *mut NMTTDISPINFOW);
-    let text = tip(info.hdr.idFrom as u16);
+    let tab_tip = tooltip_of(app.tabctrl, TCM_GETTOOLTIPS);
+    let text = if !from.is_null() && (from == app.tabctrl || from == tab_tip) {
+        let mut point = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut point);
+        crate::wnd::tabs::index_at(app, point)
+            .and_then(|index| app.tabs.get(index))
+            .map(|tab| tab.title.clone())
+            .unwrap_or_default()
+    } else {
+        tip(info.hdr.idFrom as u16).to_owned()
+    };
     info.szText = [0; 80];
     for (slot, unit) in info.szText.iter_mut().zip(text.encode_utf16().take(79)) {
         *slot = unit;

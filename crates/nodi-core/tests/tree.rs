@@ -284,7 +284,16 @@ fn auto_title_takes_the_first_line_without_markers() {
     assert_eq!(auto_title("- a   b\tc"), "a b c");
     assert_eq!(auto_title("\u{FFFC}\r"), "New Note");
     assert_eq!(auto_title(""), "New Note");
-    assert_eq!(auto_title(&"x".repeat(100)).chars().count(), 60);
+    assert_eq!(auto_title(&"x".repeat(100)).chars().count(), 40);
+    // A title stopped after a few words: one long sentence must not fill the
+    // tab strip or the tree row.
+    assert_eq!(
+        auto_title("one two three four five six seven eight"),
+        "one two three four five six"
+    );
+    // A note that opens with a code block is titled by its first line of code,
+    // not by the block's `code<TAB>Copy` header.
+    assert_eq!(auto_title("code\tCopy\rfn main() {\r}"), "fn main() {");
 }
 
 #[test]
