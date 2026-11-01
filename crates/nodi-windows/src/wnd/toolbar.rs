@@ -40,6 +40,10 @@ const HINST_COMMCTRL: isize = -1;
 /// `TTN_GETDISPINFOW` (`TTN_FIRST - 10`).
 pub const TTN_GETDISPINFOW: u32 = 0u32.wrapping_sub(530);
 
+/// Label of the word-wrap toggle: an arrow turning back, so the button reads
+/// as an icon next to the toolbar bitmaps. The tooltip still names the command.
+pub const WRAP_GLYPH: &str = "\u{21A9}";
+
 /// The separator that reserves room for the three comboboxes.
 const COMBO_SEP_ID: u16 = 1999;
 /// Width reserved for the combos, in 96-DPI pixels (style + font + size).
@@ -282,7 +286,11 @@ fn create_bar(app: &App, labels: &[&str], fill: impl FnOnce(&mut Buttons)) -> HW
 
 /// Main toolbar: file/edit commands, word wrap and find.
 fn create_main(app: &App) -> HWND {
-    const LABELS: [&str; 1] = ["Wrap"];
+    // The word-wrap toggle is an icon button like its neighbours; the label
+    // used to be the word "Wrap", which read as a stray word in the toolbar.
+    // The tooltip still spells the command out (`theme::on_notify` paints the
+    // same glyph on a dark bar).
+    const LABELS: [&str; 1] = [WRAP_GLYPH];
     create_bar(app, &LABELS, |buttons| {
         buttons.icon(STD_FILENEW, IDM_FILE_NEW);
         buttons.icon(STD_FILESAVE, IDM_FILE_SAVE);

@@ -673,7 +673,7 @@ pub unsafe fn on_notify(app: &App, header: &NMHDR, lparam: LPARAM) -> Option<LRE
                 if let Some(glyph) = toolbar_glyph(command) {
                     draw_toolbar_glyph(app, draw, glyph);
                 } else if command == crate::wnd::menu::IDM_VIEW_WORD_WRAP {
-                    draw_toolbar_text(app, draw, "Wrap");
+                    draw_toolbar_text(app, draw, crate::wnd::toolbar::WRAP_GLYPH);
                 } else if command == 0 {
                     // Separator: a one-pixel rule in the theme's border colour.
                     let mut line = draw.nmcd.rc;

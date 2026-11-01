@@ -2024,10 +2024,11 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
     rtf.push_str(&format!("{{\\fonttbl{{\\f0\\fnil {};}}}}", body_font()));
     rtf.push_str(&code_colours());
 
-    // Header row: two cells so Copy is always inside the block. The label cell
-    // gets a third of the width (capped), Copy the rest, right aligned.
-    let copy_cell = 1400.min((width / 2).max(600));
-    let label_cell = (width - copy_cell).max(600);
+    // Header row: the label in a narrow left cell, the Copy link at the start
+    // of the rest. Copy used to be right-aligned at the block's far edge, so a
+    // long code line that widened the table pushed it out of sight and the
+    // only way to copy was to scroll right first.
+    let label_cell = 1500.min((width / 3).max(600));
     rtf.push_str("\\trowd\\trgaph108\\trleft0");
     rtf.push_str(&format!(
         "\\clcbpat{header_back}\\clbrdrt{border}\\clbrdrl{border}\
@@ -2041,7 +2042,7 @@ fn code_block_rtf(language: &str, code: &str, width: i32, output: bool) -> Strin
     rtf.push_str("{\\cf0 ");
     rtf.push_str(&rtf_escape(label));
     rtf.push_str("}\\cell");
-    rtf.push_str("\\pard\\intbl\\qr\\f0\\fs16");
+    rtf.push_str("\\pard\\intbl\\ql\\f0\\fs16");
     rtf.push_str("{\\cf0");
     rtf.push_str("{\\field{\\*\\fldinst{HYPERLINK \"");
     rtf.push_str(&nodi_core::links::format_copy_link());
