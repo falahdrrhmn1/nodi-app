@@ -13,12 +13,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW,
     IsWindow, LoadCursorW, RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowTextW,
-    SystemParametersInfoW, TranslateMessage, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW,
-    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GWLP_USERDATA, IDCANCEL,
-    IDC_ARROW, IDOK, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
-    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    SystemParametersInfoW, TranslateMessage, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CBS_DROPDOWNLIST,
+    CBS_HASSTRINGS, CBS_NOINTEGRALHEIGHT, CB_ADDSTRING, CB_GETCURSEL, CB_GETLBTEXT,
+    CB_GETLBTEXTLEN, CB_SETCURSEL, CREATESTRUCTW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
+    ES_WANTRETURN, GWLP_USERDATA, IDCANCEL, IDC_ARROW, IDOK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
+    LB_ADDSTRING, LB_GETCURSEL, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, WM_CLOSE,
+    WM_COMMAND, WM_CREATE, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WNDCLASSEXW, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::win;
@@ -44,12 +46,27 @@ pub fn last_focused_field() -> Option<usize> {
     LAST_FIELD.with(|last| last.get())
 }
 
+/// How a field takes its input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Input {
+    /// Single-line or multiline edit box.
+    Edit,
+    /// Drop-down list; the value is the selected entry.
+    Dropdown,
+    /// List box; the value is the selected index, or empty when nothing is
+    /// selected.
+    List,
+}
+
 /// One labelled input.
 pub struct Field {
     pub label: String,
     pub value: String,
     /// Height in text lines (1 = single-line edit).
     pub lines: i32,
+    pub input: Input,
+    /// Entries of a drop-down list or list box.
+    pub items: Vec<String>,
 }
 
 impl Field {
@@ -58,6 +75,8 @@ impl Field {
             label: label.to_owned(),
             value: value.into(),
             lines: 1,
+            input: Input::Edit,
+            items: Vec::new(),
         }
     }
 
@@ -65,6 +84,32 @@ impl Field {
         Self {
             lines: lines.max(2),
             ..Self::new(label, value)
+        }
+    }
+
+    /// A drop-down list; `selected` is the entry to show (the first when it
+    /// does not match any of them).
+    pub fn dropdown(label: &str, items: &[String], selected: &str) -> Self {
+        let value = items
+            .iter()
+            .find(|item| item.as_str() == selected)
+            .or_else(|| items.first())
+            .cloned()
+            .unwrap_or_default();
+        Self {
+            input: Input::Dropdown,
+            items: items.to_vec(),
+            ..Self::new(label, value)
+        }
+    }
+
+    /// A list box of `lines` visible entries; the value is the selected index.
+    pub fn list(label: &str, items: &[String], lines: i32) -> Self {
+        Self {
+            input: Input::List,
+            lines: lines.max(2),
+            items: items.to_vec(),
+            ..Self::new(label, "")
         }
     }
 }
@@ -156,6 +201,8 @@ impl Form {
 struct State {
     form: Form,
     edits: Vec<HWND>,
+    combos: Vec<HWND>,
+    lists: Vec<HWND>,
     checks: Vec<HWND>,
     font: HFONT,
     result: Option<Vec<String>>,
@@ -230,12 +277,13 @@ fn form_note_lines(form: &Form) -> i32 {
 
 fn content_height(form: &Form) -> i32 {
     let note = form_note_lines(form);
+    let inner = inner_width(form);
     let mut height = MARGIN;
     if note > 0 {
         height += note * LINE_H + 8;
     }
     for field in &form.fields {
-        height += field_height(field) + 8;
+        height += field_row_height(field, inner) + 8;
     }
     height += form.checkboxes.len() as i32 * ROW_H;
     if buttons_wrap(form) {
@@ -244,11 +292,49 @@ fn content_height(form: &Form) -> i32 {
     height + BUTTON_H + MARGIN
 }
 
-fn field_height(field: &Field) -> i32 {
+/// Lines `text` wraps to inside a column `width` 96-DPI units wide. The form
+/// uses the 9 pt system font, of which about 70 characters fit in 440 units.
+fn wrap_lines(text: &str, width: i32) -> i32 {
+    let per_line = (width * 70 / (LABEL_W + EDIT_W)).max(8);
+    text.lines()
+        .map(|line| {
+            let count = line.chars().count() as i32;
+            // Round up: a line of exactly `per_line` characters still fits.
+            if count == 0 {
+                1
+            } else {
+                (count + per_line - 1) / per_line
+            }
+        })
+        .sum()
+}
+
+/// Room a field's label needs, in 96-DPI units: a label longer than the label
+/// column wraps, and the control used to be one line tall, so at 150% (a
+/// larger font in the same box) the second line — and the bottom of the first —
+/// were cut off.
+fn label_height(label: &str) -> i32 {
+    wrap_lines(label, LABEL_W - 8) * LINE_H + 4
+}
+
+/// Height of the input control itself.
+fn input_height(field: &Field) -> i32 {
     if field.lines <= 1 {
         ROW_H
     } else {
         field.lines * LINE_H + 8
+    }
+}
+
+/// Total vertical space a field takes. The label and the input share a row
+/// ("Trigger: [edit]") — except for a list box, whose label goes above it, so
+/// the long entries get the form's whole width.
+fn field_row_height(field: &Field, inner_w: i32) -> i32 {
+    if field.input == Input::List {
+        let label = wrap_lines(&field.label, inner_w) * LINE_H + 4;
+        label + 4 + input_height(field)
+    } else {
+        input_height(field).max(label_height(&field.label))
     }
 }
 
@@ -269,6 +355,8 @@ unsafe fn run(owner: HWND, form: Form) -> (Option<Vec<String>>, Option<i32>) {
     let state = Box::into_raw(Box::new(State {
         form,
         edits: Vec::new(),
+        combos: Vec::new(),
+        lists: Vec::new(),
         checks: Vec::new(),
         font: ptr::null_mut(),
         result: None,
@@ -339,8 +427,14 @@ unsafe fn make_font(dpi: i32) -> HFONT {
         0,
     );
     let mut font = metrics.lfMessageFont;
-    font.lfHeight = scale(font.lfHeight, dpi);
+    font.lfHeight = scale_dpi(font.lfHeight, dpi);
     CreateFontIndirectW(&font)
+}
+
+/// Scales a font height taken from `SPI_GETNONCLIENTMETRICS` (which is already
+/// in the system DPI) to the DPI of the window the form is opening on.
+fn scale_dpi(height: i32, dpi: i32) -> i32 {
+    crate::win::mul_div(height, dpi, crate::win::system_dpi())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -390,13 +484,146 @@ unsafe fn read(edit: HWND) -> String {
 }
 
 unsafe fn values(state: &State) -> Vec<String> {
-    let mut values: Vec<String> = state.edits.iter().map(|edit| read(*edit)).collect();
+    let mut values = Vec::with_capacity(state.form.fields.len() + state.checks.len());
+    let mut edits = state.edits.iter();
+    let mut combos = state.combos.iter();
+    let mut lists = state.lists.iter();
+    for field in &state.form.fields {
+        values.push(match field.input {
+            Input::Edit => edits.next().map_or_else(String::new, |edit| read(*edit)),
+            Input::Dropdown => combos
+                .next()
+                .map_or_else(String::new, |combo| combo_value(*combo)),
+            Input::List => lists
+                .next()
+                .map_or_else(String::new, |list| list_value(*list)),
+        });
+    }
     for check in &state.checks {
         // SAFETY: BM_GETCHECK only reads the button's state.
         let checked = SendMessageW(*check, BM_GETCHECK, 0, 0) as usize == BST_CHECKED;
         values.push(if checked { "1" } else { "0" }.to_owned());
     }
     values
+}
+
+/// Text of the entry selected in a drop-down list (empty when none is).
+unsafe fn combo_value(combo: HWND) -> String {
+    let selected = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    if selected < 0 {
+        return String::new();
+    }
+    let length = SendMessageW(combo, CB_GETLBTEXTLEN, selected as usize, 0).max(0) as usize;
+    let mut buffer = vec![0u16; length + 1];
+    let copied = SendMessageW(
+        combo,
+        CB_GETLBTEXT,
+        selected as usize,
+        buffer.as_mut_ptr() as isize,
+    );
+    String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+}
+
+/// Index selected in a list box, as a string (empty when nothing is selected).
+unsafe fn list_value(list: HWND) -> String {
+    let selected = SendMessageW(list, LB_GETCURSEL, 0, 0);
+    if selected < 0 {
+        String::new()
+    } else {
+        selected.to_string()
+    }
+}
+
+/// A drop-down list, created the same way as the format bar's combos: the
+/// height asked for at creation is the height of the *dropped* list, so
+/// `CBS_NOINTEGRALHEIGHT` is needed to keep it at the small size we want (a
+/// plain combo always shows at least `CB_SETMINVISIBLE`, thirty entries).
+unsafe fn combo_box(
+    parent: HWND,
+    id: i32,
+    items: &[String],
+    selected: &str,
+    rect: (i32, i32, i32, i32),
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    let list_height = items.len().clamp(1, 8) as i32 * (LINE_H + 4) + 6;
+    let class = win::wide("ComboBox");
+    let handle = CreateWindowExW(
+        0,
+        class.as_ptr(),
+        ptr::null(),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WS_VSCROLL
+            | CBS_DROPDOWNLIST as u32
+            | CBS_HASSTRINGS as u32
+            | CBS_NOINTEGRALHEIGHT as u32,
+        scale(rect.0, dpi),
+        scale(rect.1, dpi),
+        scale(rect.2, dpi),
+        scale(list_height, dpi),
+        parent,
+        id as isize as _,
+        GetModuleHandleW(ptr::null()),
+        ptr::null(),
+    );
+    if handle.is_null() {
+        return handle;
+    }
+    if !font.is_null() {
+        SendMessageW(handle, WM_SETFONT, font as usize, 1);
+    }
+    for item in items {
+        let text = win::wide(item);
+        SendMessageW(handle, CB_ADDSTRING, 0, text.as_ptr() as isize);
+    }
+    let index = items.iter().position(|item| item == selected).unwrap_or(0);
+    SendMessageW(handle, CB_SETCURSEL, index, 0);
+    handle
+}
+
+/// A list box with a border, one entry per line.
+unsafe fn list_box(
+    parent: HWND,
+    id: i32,
+    items: &[String],
+    rect: (i32, i32, i32, i32),
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    let class = win::wide("ListBox");
+    let handle = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        class.as_ptr(),
+        ptr::null(),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WS_VSCROLL
+            | LBS_NOTIFY as u32
+            | LBS_NOINTEGRALHEIGHT as u32,
+        scale(rect.0, dpi),
+        scale(rect.1, dpi),
+        scale(rect.2, dpi),
+        scale(rect.3, dpi),
+        parent,
+        id as isize as _,
+        GetModuleHandleW(ptr::null()),
+        ptr::null(),
+    );
+    if handle.is_null() {
+        return handle;
+    }
+    if !font.is_null() {
+        SendMessageW(handle, WM_SETFONT, font as usize, 1);
+    }
+    for item in items {
+        let text = win::wide(item);
+        SendMessageW(handle, LB_ADDSTRING, 0, text.as_ptr() as isize);
+    }
+    handle
 }
 
 unsafe fn build(hwnd: HWND, state: &mut State) {
@@ -420,33 +647,78 @@ unsafe fn build(hwnd: HWND, state: &mut State) {
         y += lines * LINE_H + 8;
     }
     for (index, field) in state.form.fields.iter().enumerate() {
-        let height = field_height(field);
+        let height = input_height(field);
+        // A wide form uses its whole width for the input instead of the
+        // default column, which left a band of empty space on the right.
+        let input_w = (inner_w - LABEL_W).max(80);
+        let id = FIRST_FIELD_ID + index as i32;
+        match field.input {
+            Input::List => {
+                // The label goes above the list, which then spans the form.
+                let label = wrap_lines(&field.label, inner_w) * LINE_H + 4;
+                control(
+                    hwnd,
+                    "Static",
+                    &field.label,
+                    0,
+                    -1,
+                    (MARGIN, y, inner_w, label),
+                    dpi,
+                    font,
+                );
+                let list = list_box(
+                    hwnd,
+                    id,
+                    &field.items,
+                    (MARGIN, y + label + 4, inner_w, height),
+                    dpi,
+                    font,
+                );
+                state.lists.push(list);
+                y += field_row_height(field, inner_w) + 8;
+                continue;
+            }
+            Input::Dropdown => {
+                let combo = combo_box(
+                    hwnd,
+                    id,
+                    &field.items,
+                    &field.value,
+                    (MARGIN + LABEL_W, y, input_w, height),
+                    dpi,
+                    font,
+                );
+                state.combos.push(combo);
+            }
+            Input::Edit => {
+                let mut style = WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32;
+                if field.lines > 1 {
+                    style |= (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) as u32 | WS_VSCROLL;
+                }
+                let value = field.value.replace("\r\n", "\n").replace('\n', "\r\n");
+                let edit = control(
+                    hwnd,
+                    "Edit",
+                    &value,
+                    style,
+                    id,
+                    (MARGIN + LABEL_W, y, input_w, height),
+                    dpi,
+                    font,
+                );
+                state.edits.push(edit);
+            }
+        }
         control(
             hwnd,
             "Static",
             &field.label,
             0,
             -1,
-            (MARGIN, y + 4, LABEL_W - 8, LINE_H),
+            (MARGIN, y + 4, LABEL_W - 8, label_height(&field.label)),
             dpi,
             font,
         );
-        let mut style = WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32;
-        if field.lines > 1 {
-            style |= (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) as u32 | WS_VSCROLL;
-        }
-        let value = field.value.replace("\r\n", "\n").replace('\n', "\r\n");
-        let edit = control(
-            hwnd,
-            "Edit",
-            &value,
-            style,
-            FIRST_FIELD_ID + index as i32,
-            (MARGIN + LABEL_W, y, EDIT_W, height),
-            dpi,
-            font,
-        );
-        state.edits.push(edit);
         y += height + 8;
     }
 
