@@ -961,6 +961,17 @@ fn paste_special(editor: HWND, frame: HWND, plain: bool) -> bool {
         }
     }
     if !image::clipboard_is_image_only() {
+        // Inside a code (or output) block a paste is always literal: converting
+        // Markdown or HTML there changed the font of parts of the code, joined
+        // the pasted lines into one paragraph and underlined addresses that are
+        // only text.
+        if format::in_code(editor) {
+            if let Some(text) = image::clipboard_text(frame) {
+                let text = text.replace("\r\n", "\r").replace('\n', "\r");
+                editor::replace_selection(editor, &text, true);
+                return true;
+            }
+        }
         // Rich Text Format wins: Rich Edit pastes it natively, unchanged.
         if !image::clipboard_has_rtf() {
             if let Some(html) = image::clipboard_html(frame) {

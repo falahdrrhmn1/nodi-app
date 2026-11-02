@@ -2304,6 +2304,29 @@ Test-Case 'BW' 'a table below a code block stays a separate table' {
     ''
 }
 
+Test-Case 'BY' 'paste: a paste inside a code block stays plain text' {
+    $data = New-DataDir 'BY'
+    $nodi = Start-Nodi $data
+    $fence = [string]::new([char]96, 3)
+    Invoke-Nodi $nodi 'cmd 205' | Out-Null                 # Insert > Code Block
+    $pasted = "**tebal** dan $fence$fence kode $fence$fence`r`n| a | b |`r`n| --- | --- |"
+    Set-Clipboard -Value $pasted
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null                 # Paste
+    $rows = Count-Unit $nodi 'FFF9'
+    $text = Invoke-Nodi $nodi 'text'
+    $markdown = Invoke-Nodi $nodi 'markdown'
+    Stop-Nodi $nodi
+    $shown = $text -replace "`r", '|'
+    $paragraphs = @($text -split "`r" | Where-Object { $_.Trim() }).Count
+    Assert ($rows -eq 2) "the paste built a table inside the block: $rows rows"
+    # header + the three pasted lines: joined they would be one paragraph.
+    Assert ($paragraphs -eq 4) "the lines were joined: $shown"
+    Assert ($text.Contains('**tebal**')) "the asterisks were eaten: $shown"
+    Assert ($text.Contains("$fence$fence kode $fence$fence")) "the backticks were eaten: $shown"
+    Assert ($markdown.Contains('**tebal**')) "the code block does not export the text:`n$markdown"
+    ''
+}
+
 # --------------------------------------------------------------------- report
 $failed = 0
 foreach ($entry in $results.GetEnumerator()) {
