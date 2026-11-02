@@ -2304,6 +2304,30 @@ Test-Case 'BW' 'a table below a code block stays a separate table' {
     ''
 }
 
+Test-Case 'BX' 'paste: a command with continuation backticks keeps every line' {
+    $data = New-DataDir 'BX'
+    $nodi = Start-Nodi $data
+    $tick = [string][char]96
+    # Copied from Notepad++: shell continuation, so every line but the last ends
+    # with a single backtick. That used to count as Markdown, join the lines into
+    # one paragraph and set the backticked spans in the code font.
+    $command = "ssh -N $tick`r`n    -o ExitOnForwardFailure=yes $tick`r`n-L 3005:127.0.0.1:3005 $tick`r`nperforma@192.168.10.12"
+    Set-Clipboard -Value $command
+    Invoke-Nodi $nodi 'cmd 114' | Out-Null                 # Paste
+    $text = Invoke-Nodi $nodi 'text'
+    $caret = Invoke-Nodi $nodi 'caretpart'
+    $rtf = Invoke-Nodi $nodi 'rtf'
+    Stop-Nodi $nodi
+    $shown = $text -replace "`r", '|'
+    Assert (($text -split "`r").Count -eq 4) "the lines were joined: $shown"
+    Assert ($caret -match '^Ln 4,') "the paste is not four paragraphs: $caret"
+    Assert ($text.Contains("ssh -N $tick")) "the continuation backtick was eaten: $shown"
+    # The note font is the body font: a Markdown inline-code span would add
+    # Consolas to the font table.
+    Assert (-not $rtf.Contains('Consolas')) 'part of the paste is in the code font'
+    ''
+}
+
 Test-Case 'BY' 'paste: a paste inside a code block stays plain text' {
     $data = New-DataDir 'BY'
     $nodi = Start-Nodi $data

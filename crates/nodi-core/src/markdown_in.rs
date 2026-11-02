@@ -283,10 +283,17 @@ pub fn looks_like_markdown(text: &str) -> bool {
         if heading(line).is_some() || list_marker(line).is_some() || line.starts_with('>') {
             signals += 1;
         }
-        for marker in ["**", "](", "~~", "`"] {
+        for marker in ["**", "](", "~~"] {
             if line.contains(marker) {
                 signals += 1;
             }
+        }
+        // A backtick is only a signal when it is closed on the same line: a
+        // shell continuation (`ssh -N \``) or one stray backtick in a pasted
+        // command must not turn the whole paste into Markdown, which would join
+        // its lines into one paragraph and set parts of it in the code font.
+        if line.matches('`').count() >= 2 {
+            signals += 1;
         }
         if line.matches('|').count() >= 2 && line.ends_with('|') {
             signals += 1;
