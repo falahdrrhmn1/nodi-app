@@ -219,7 +219,9 @@ Visual editing is the source of truth. Markdown is generated on demand
 (View > Markdown Source, File > Export Note as Markdown, the AI mirror) and
 never written back into the note, so nothing is lost silently. Features
 Markdown cannot express are listed in the export dialog. Markdown → RTF
-(`markdown_in`, `html_in`) is used for pasting from ChatGPT and web pages.
+(`markdown_in`, `html_in`) is used for pasting from ChatGPT and web pages. A
+paste inside a code (or output) block skips those converters: the block is
+literal text, so pasted code keeps its own lines and font whatever it contains.
 
 ## Android later
 

@@ -263,25 +263,41 @@ the release build; each fix is its own commit.
   so it follows Preferences > Default font in every theme.
 - **Code blocks**: the Copy link moved to the left of the block, where a long
   code line cannot push it out of sight, and the word-wrap toggle is an ↩ icon
-  instead of the word "Wrap". `editor::plain_text` no longer carries a field's
-  instruction text, so `HYPERLINK "nodi-copy:"Copy` cannot leak into the plain
-  text, the search index or an automatic title.
+  instead of the word "Wrap". A code block pasted from Markdown builds the same
+  header, so Copy is never at the far edge either. `editor::plain_text` no longer
+  carries a field's instruction text, so `HYPERLINK "nodi-copy:"Copy` cannot leak
+  into the plain text, the search index or an automatic title.
+- **Paste into a code block**: the block is literal text, so a paste there no
+  longer runs the Markdown, HTML or drawn-table converters. Code that happens to
+  contain asterisks, a pipe row or a fence kept them as text instead of coming
+  back formatted in the code font, joined into one paragraph or rebuilt as a
+  table inside the cell.
+- **Paste with one backtick per line**: a pasted text counted any backtick as a
+  Markdown signal, so a shell command copied from Notepad++ (every continued line
+  ends with a lone backtick) was parsed as Markdown: its lines were joined into
+  one paragraph and the backticked spans came back in the code font. A backtick
+  now counts only when it is closed on the same line.
 - **Text Shortcuts**: the dialog lists every existing shortcut with its place
   (`[page: <title>]`, `[folder: <name>]`, `[all notes]`), the scope is a
   drop-down that names the real page or folder, and an entry can be deleted.
 
 Verification: `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and
-`cargo test` clean; `scripts\e2e.ps1` **70 passed, 0 failed**; the shipped
+`cargo test` clean; `scripts\e2e.ps1` **72 passed, 0 failed**; the shipped
 `dist\Nodi\nodi.exe` also passes the code-block Copy, line-number, default-font,
 text-shortcut and table-below-code cases. The line-number font was checked with
 a probe that writes `body_font: "Courier New"` into `settings.json` before
 startup, the tooltip colours with `TTM_GETTIP*` on the bars' own tooltip
-windows.
+windows; the two paste cases were checked to fail on the previous build.
 
 ### Not done yet / limitations
 - **Colour emoji**: Windows' Rich Edit control draws emoji in colour only in
   its Direct2D mode, which a normal (windowed) control cannot switch on; every
   `EM_SETEDITSTYLEEX` flag was tried. Emoji show as Segoe UI Emoji outlines.
+- **A web or e-mail address inside a code block** is still drawn blue and
+  underlined: Windows' Rich Edit detects addresses in the whole control and the
+  detection cannot be switched off for one cell or table row. The text keeps the
+  block's font and copies as plain code; turning detection off altogether would
+  also stop a typed address outside a code block from becoming a link.
 - An animated GIF is pasted / dropped as a still picture (its first frame).
 - Pictures of pasted web pages are fetched only from public internet
   addresses (never from the LAN, `localhost` or `\\server\share`, which
