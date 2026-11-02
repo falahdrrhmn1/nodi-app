@@ -965,6 +965,7 @@ fn main() {}
 '@
     Set-Clipboard -Value $markdown
     Invoke-Nodi $nodi 'cmd 114' | Out-Null          # Edit > Paste
+    $rtf = Invoke-Nodi $nodi 'rtf'
     Assert ((Wait-State $nodi 'Saved' 4000) -ge 0) 'never Saved'
     Stop-Nodi $nodi
     $nodi = Start-Nodi $data
@@ -979,6 +980,10 @@ fn main() {}
     Assert ($out.Contains('```rust')) "fence language lost:`n$out"
     Assert ($out.Contains('| Nama | Nilai |') -and $out.Contains('| A | 92% |')) "table lost:`n$out"
     Assert ($out.Contains('[Lihat](https://example.com)')) "link lost:`n$out"
+    # A pasted block's header is the same shape as Insert > Code Block: the label
+    # in a narrow left cell and Copy at the start of the rest. Right-aligned,
+    # Copy sat at the block's far edge where a long code line hid it.
+    Assert ($rtf -match '\\cellx1500') 'pasted code block: no narrow label cell'
     ''
 }
 

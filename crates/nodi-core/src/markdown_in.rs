@@ -1014,11 +1014,12 @@ fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
         other => other,
     };
     let border = "\\brdrs\\brdrw10\\brdrcf2";
-    // Header row: two cells (label, Copy) so Copy stays inside the block at any
-    // window width or wrap state. Text is automatic so it follows the theme;
-    // the cell colours are retinted by `table::retheme` after insertion.
-    let copy_cell = 1400.min((width / 2).max(600));
-    let label_cell = (width - copy_cell).max(600);
+    // Header row: the label in a narrow left cell, the Copy link at the start of
+    // the rest -- the same shape `Insert > Code Block` uses, so Copy stays in
+    // reach instead of sitting at the far right, behind a long code line. Text
+    // is automatic so it follows the theme; the cell colours are retinted by
+    // `table::retheme` after insertion.
+    let label_cell = 1500.min((width / 3).max(600));
     out.push_str(&format!(
         "\\trowd\\trgaph108\\trleft0\\clcbpat3\\clbrdrt{border}\\clbrdrl{border}\
          \\clbrdrb{border}\\clbrdrr{border}\\cellx{label_cell}\
@@ -1027,7 +1028,7 @@ fn push_code(out: &mut String, language: &str, code: &str, width: i32) {
          \\pard\\intbl\\f0\\fs16{{\\cf0 "
     ));
     escape(out, label);
-    out.push_str("}\\cell\\pard\\intbl\\qr\\f0\\fs16{\\cf0{\\field{\\*\\fldinst{HYPERLINK \"");
+    out.push_str("}\\cell\\pard\\intbl\\ql\\f0\\fs16{\\cf0{\\field{\\*\\fldinst{HYPERLINK \"");
     out.push_str(&links::format_copy_link());
     out.push_str("\"}}{\\fldrslt{\\ul Copy}}}}\\cell\\row");
 
